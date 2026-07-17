@@ -96,6 +96,23 @@ describe('Coordinator', () => {
     expect(second.listClaims().some((claim) => claim.path === 'docs')).toBe(false);
   });
 
+  it('rejects nested recursive claims in both acquisition orders', () => {
+    const { open } = setup();
+    const first = open('first');
+    const second = open('second');
+    first.acquireClaims([{ path: 'src', kind: 'tree' }]);
+
+    expect(() => second.acquireClaims([{ path: 'src/api', kind: 'tree' }])).toThrowError(
+      expect.objectContaining({ code: 'CLAIM_CONFLICT' }),
+    );
+
+    first.releaseClaims({ all: true });
+    second.acquireClaims([{ path: 'src/api', kind: 'tree' }]);
+    expect(() => first.acquireClaims([{ path: 'src', kind: 'tree' }])).toThrowError(
+      expect.objectContaining({ code: 'CLAIM_CONFLICT' }),
+    );
+  });
+
   it('prevents claims through different aliases of the same directory', () => {
     const { repository, open } = setup();
     mkdirSync(path.join(repository.root, 'real'));
@@ -154,13 +171,13 @@ describe('Coordinator', () => {
     const task = author.createTask({ title: 'Implement parser' });
     author.claimTask(task.id);
     author.acquireClaims([{ path: 'src', kind: 'tree' }]);
-    const [exact] = author.acquireClaims([{ path: 'src/parser.ts' }]);
-    if (!exact) throw new Error('Expected an exact claim.');
+    const [nested] = author.acquireClaims([{ path: 'src/parser', kind: 'tree' }]);
+    if (!nested) throw new Error('Expected a nested tree claim.');
     const offer = author.offerHandoff({
       taskId: task.id,
       to: 'reviewer',
       summary: 'Transfer only one overlapping claim.',
-      claimIds: [exact.id],
+      claimIds: [nested.id],
     });
 
     expect(() => reviewer.respondToHandoff(offer.id, true)).toThrowError(
