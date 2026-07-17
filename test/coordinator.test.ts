@@ -48,6 +48,36 @@ describe('Coordinator', () => {
     );
   });
 
+  it('preserves ready assignments and requires a claim before updates', () => {
+    const { open } = setup();
+    const author = open('author');
+    const reviewer = open('reviewer');
+    const assigned = author.createTask({ title: 'Assigned work', assignee: 'author' });
+    const unassigned = author.createTask({ title: 'Unassigned work' });
+
+    expect(() => reviewer.claimTask(assigned.id)).toThrowError(
+      expect.objectContaining({ code: 'TASK_UNAVAILABLE' }),
+    );
+    expect(() =>
+      reviewer.updateTask(unassigned.id, { description: 'Taken without a claim' }),
+    ).toThrowError(expect.objectContaining({ code: 'NOT_ASSIGNED' }));
+  });
+
+  it('checks dependencies on every transition into progress', () => {
+    const { open } = setup();
+    const author = open('author');
+    const prerequisite = author.createTask({ title: 'Prerequisite' });
+    const assigned = author.createTask({
+      title: 'Assigned dependent work',
+      assignee: 'author',
+      dependencies: [prerequisite.id],
+    });
+
+    expect(() => author.updateTask(assigned.id, { status: 'in_progress' })).toThrowError(
+      expect.objectContaining({ code: 'TASK_BLOCKED' }),
+    );
+  });
+
   it('acquires claim batches atomically', () => {
     const { open } = setup();
     const first = open('first');
@@ -101,6 +131,48 @@ describe('Coordinator', () => {
     expect(reviewer.listClaims().find((item) => item.id === claim.id)?.agentName).toBe('reviewer');
   });
 
+  it('rejects partial transfers that would create cross-agent claim overlap', () => {
+    const { open } = setup();
+    const author = open('author');
+    const reviewer = open('reviewer');
+    const task = author.createTask({ title: 'Implement parser' });
+    author.claimTask(task.id);
+    author.acquireClaims([{ path: 'src', kind: 'tree' }]);
+    const [exact] = author.acquireClaims([{ path: 'src/parser.ts' }]);
+    if (!exact) throw new Error('Expected an exact claim.');
+    const offer = author.offerHandoff({
+      taskId: task.id,
+      to: 'reviewer',
+      summary: 'Transfer only one overlapping claim.',
+      claimIds: [exact.id],
+    });
+
+    expect(() => reviewer.respondToHandoff(offer.id, true)).toThrowError(
+      expect.objectContaining({ code: 'HANDOFF_CONFLICT' }),
+    );
+    expect(author.listTasks().find((item) => item.id === task.id)?.assignee).toBe('author');
+  });
+
+  it('keeps pending handoffs valid when the source session closes', () => {
+    const { open } = setup();
+    const author = open('author');
+    const reviewer = open('reviewer');
+    const task = author.createTask({ title: 'Implement parser' });
+    author.claimTask(task.id);
+    const [claim] = author.acquireClaims([{ path: 'src/parser.ts' }]);
+    if (!claim) throw new Error('Expected an acquired claim.');
+    const offer = author.offerHandoff({
+      taskId: task.id,
+      to: 'reviewer',
+      summary: 'Continue after I exit.',
+      claimIds: [claim.id],
+    });
+
+    author.close();
+
+    expect(reviewer.respondToHandoff(offer.id, true).status).toBe('accepted');
+  });
+
   it('rejects a handoff when its task revision becomes stale', () => {
     const { open } = setup();
     const author = open('author');
@@ -117,6 +189,49 @@ describe('Coordinator', () => {
     expect(() => reviewer.respondToHandoff(offer.id, true)).toThrowError(
       expect.objectContaining({ code: 'HANDOFF_CONFLICT' }),
     );
+  });
+
+  it('does not offer terminal tasks for handoff', () => {
+    const { open } = setup();
+    const author = open('author');
+    open('reviewer');
+    const task = author.createTask({ title: 'Completed work' });
+    author.claimTask(task.id);
+    author.updateTask(task.id, { status: 'done' });
+
+    expect(() =>
+      author.offerHandoff({ taskId: task.id, to: 'reviewer', summary: 'Resurrect this task.' }),
+    ).toThrowError(expect.objectContaining({ code: 'TASK_UNAVAILABLE' }));
+  });
+
+  it('does not renew an expired session or its task lease', () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    let now = 1_000_000;
+    const author = Coordinator.open({ cwd: repository.root, agent: 'author', clock: () => now });
+    coordinators.push(author);
+    const task = author.createTask({ title: 'Expiring work' });
+    const originalLease = author.claimTask(task.id).leaseExpiresAt;
+    now += 91_000;
+
+    expect(() => author.heartbeat()).toThrowError(
+      expect.objectContaining({ code: 'TASK_UNAVAILABLE' }),
+    );
+    expect(author.listTasks().find((item) => item.id === task.id)?.leaseExpiresAt).toBe(
+      originalLease,
+    );
+  });
+
+  it('does not deliver historical broadcasts to future agents', () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const author = Coordinator.open({ cwd: repository.root, agent: 'author', clock: () => 1_000 });
+    coordinators.push(author);
+    author.sendMessage({ subject: 'Before registration', body: 'Historical announcement.' });
+    const future = Coordinator.open({ cwd: repository.root, agent: 'future', clock: () => 2_000 });
+    coordinators.push(future);
+
+    expect(future.inbox()).toEqual([]);
   });
 
   it('ties policy acknowledgements to exact content hashes', () => {
