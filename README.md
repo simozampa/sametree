@@ -168,6 +168,8 @@ sametree claim release --all
 
 Successful command results and domain errors are JSON so agents and scripts can consume the interface reliably. Help and version output remain conventional command-line text.
 
+CLI processes do not stay alive to heartbeat. The default task and path leases last 15 minutes. During longer CLI-only work, rerun `task claim <task-id>` and `claim acquire <paths...>` before expiry; use `claim acquire --ttl <seconds>` to request a path lease of up to 24 hours. MCP sessions renew their leases automatically.
+
 ## MCP Tools
 
 | Tool | Purpose |
