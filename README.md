@@ -47,13 +47,7 @@ SameTree does not support state databases on NFS, SMB, cloud-synced folders, or 
 
 ## Install
 
-Install directly from GitHub:
-
-```bash
-npm install --global github:simozampa/sametree
-```
-
-For development:
+Install from source:
 
 ```bash
 git clone https://github.com/simozampa/sametree.git
@@ -62,6 +56,8 @@ npm ci
 npm run build
 npm link
 ```
+
+`npm link` exposes `sametree` and `sametree-mcp` on your current Node.js toolchain. SameTree is not yet published to the npm registry.
 
 ## Quick Start
 
