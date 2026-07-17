@@ -6,54 +6,29 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node.js 22+](https://img.shields.io/badge/node-%3E%3D22.12-339933.svg)](package.json)
 
-SameTree gives already-running Claude Code, OpenCode, and other MCP-capable agents a shared task board, inbox, path-claim registry, handoff protocol, and versioned collaboration policy. It runs locally, works in an existing dirty working tree, and needs no daemon, Docker container, PostgreSQL server, cloud account, or per-agent branch.
+SameTree lets Claude Code, OpenCode, and other MCP agents coordinate inside one Git working tree. Agents share tasks, path claims, messages, handoffs, and repository policy without a daemon or cloud service.
 
 <p align="center">
   <img src="docs/demo.svg" alt="SameTree setup, task and path ownership, conflict prevention, and agent messaging" width="100%">
 </p>
 
-> [!WARNING]
-> SameTree is alpha software. Its claims are cooperative leases, not operating-system locks. Back up important work and read the [operating boundaries](#operating-boundaries) before using it.
+## What It Does
 
-## Why SameTree?
-
-Parallel coding agents usually solve conflicts by isolating every worker in a branch or worktree. That is useful for independent tasks, but it gets in the way when two agents need to inspect the same uncommitted state, alternate edits, or review work before it is committed.
-
-SameTree is deliberately for the other case:
-
-- Two to ten agents run on one machine.
-- Every agent sees the same working tree, including uncommitted changes.
-- Agents need durable context across Claude Code and OpenCode sessions.
-- Coordination should not require a server process or external database.
-- Repository policy should be shared once and acknowledged by every agent.
-- Checkable Git rules should be enforced mechanically, not left only in a prompt.
-
-## Features
-
-- **Cross-harness MCP server** with structured tools for Claude Code, OpenCode, and other MCP clients.
-- **One-command project setup** that safely merges Claude Code and OpenCode integration.
-- **Structured CLI** for humans, shell scripts, hooks, and agents without MCP.
-- **Durable tasks** with dependencies, priorities, revision checks, assignments, expiring execution leases, and explicit stale-work takeover.
-- **Atomic path claims** for exact files or recursive directories. A claim batch either succeeds completely or writes nothing.
-- **Direct messages and broadcasts** with threads, task links, unread state, and acknowledgements.
-- **Structured handoffs** that reject stale task revisions and can transfer selected path claims on acceptance.
-- **Versioned policy and role files** under `.sametree/`, with content-hash acknowledgements.
-- **Optional Git hooks** for conflicting staged paths, oversized diffs, Conventional Commits, and forbidden `Co-authored-by` trailers.
-- **Transactional audit events** with a sequence cursor for polling and diagnostics.
-- **Human-readable live watch** for following tasks, claims, messages, and handoffs.
-- **Worktree-local SQLite WAL state** stored under Git's private directory instead of committed into the repository.
+- Gives agents a shared task board and inbox.
+- Prevents agents from unknowingly editing the same paths.
+- Transfers work through structured handoffs.
+- Shares coordination rules through versioned repository files.
+- Stores all live state locally in the Git worktree.
 
 ## Requirements
 
 - Node.js 22.12 or newer
 - Git
-- A local filesystem with working file locks
+- A local filesystem
 
 SameTree does not support state databases on NFS, SMB, cloud-synced folders, or multiple machines.
 
 ## Install
-
-Install from source:
 
 ```bash
 git clone https://github.com/simozampa/sametree.git
@@ -63,113 +38,37 @@ npm run build
 npm link
 ```
 
-`npm link` exposes `sametree` and `sametree-mcp` on your current Node.js toolchain. SameTree is not yet published to the npm registry.
+SameTree is not yet published to npm. `npm link` exposes `sametree` and `sametree-mcp` from the source checkout.
 
 ## Quick Start
-
-Configure both harnesses in the repository where agents will collaborate:
 
 ```bash
 cd /path/to/your/project
 sametree setup --claude --opencode
-SAMETREE_AGENT=human sametree doctor
-opencode
-# Or, in another terminal:
-claude
 ```
 
-Setup initializes the versioned policy, safely merges `opencode.json` or `opencode.jsonc`, updates `AGENTS.md` and `CLAUDE.md`, and registers SameTree with Claude Code at local project scope. Existing configuration and comments are preserved; conflicting entries are refused rather than overwritten. After setup, start agents normally in separate terminals. SameTree assigns each MCP process a unique identity automatically.
-
-SameTree's generated coordination directory is fully versioned:
-
-```text
-.sametree/
-├── config.json
-├── coordination.md
-├── policy.md
-└── roles/
-    ├── implementer.md
-    └── reviewer.md
-```
-
-Live state is created on first use inside Git's worktree-specific private directory. It is normally `.git/sametree/state.sqlite3` and is never committed.
-
-### Manual Claude Code Configuration
-
-From the target project, add SameTree as a local-scoped stdio MCP server:
-
-```bash
-claude mcp add --scope local --transport stdio sametree \
-  --env SAMETREE_HARNESS=claude-code -- sametree-mcp
-```
-
-Reference the generated coordination guide from the project's `CLAUDE.md`:
-
-```markdown
-@.sametree/coordination.md
-```
-
-Start Claude Code normally. Each instance receives a unique automatic identity:
-
-```bash
-claude
-```
-
-Set an explicit identity only when you need a stable named role:
-
-```bash
-SAMETREE_AGENT=claude-reviewer SAMETREE_ROLE=reviewer claude
-```
-
-Claude Code passes its stable project directory to SameTree automatically.
-
-### Manual OpenCode Configuration
-
-Add this to the target project's `opencode.json`:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "sametree": {
-      "type": "local",
-      "command": ["sametree-mcp"],
-      "environment": {
-        "SAMETREE_HARNESS": "opencode"
-      },
-      "enabled": true
-    }
-  }
-}
-```
-
-Tell OpenCode to read `.sametree/coordination.md` from the project's `AGENTS.md`, then start it normally. Each instance receives a unique automatic identity:
+Setup is required once per project. It configures the requested harnesses and writes shared instructions under `.sametree/`. After that, start agents normally in separate terminals:
 
 ```bash
 opencode
 ```
 
-Set an explicit identity only when you need a stable named role:
-
 ```bash
-SAMETREE_AGENT=opencode-reviewer SAMETREE_ROLE=reviewer opencode
+claude
 ```
 
-Explicit names are inherited by the MCP process. Do not hard-code one shared name in the MCP configuration when running more than one instance.
+Every instance gets a unique identity automatically and joins the agents in that worktree. Different projects and Git worktrees use separate state. Avoid switching branches while agents are active because every process in that worktree sees the same checkout.
 
 ## Coordination Loop
 
-An agent should follow this loop at natural work boundaries:
+The generated agent instructions tell each agent to:
 
-1. Call `sametree_status` and `sametree_policy_get` at session start.
-2. Acknowledge the current policy hash with `sametree_policy_ack`.
-3. Read `sametree_inbox` and pending handoffs.
-4. Claim a ready task, then atomically claim the smallest required paths.
-5. Send messages when ownership or implementation decisions overlap.
-6. Check the inbox before commits and after each task.
-7. Update the task and release claims, or offer a structured handoff.
+1. Check current tasks, claims, messages, and policy.
+2. Claim a task and the smallest paths it needs.
+3. Coordinate conflicts instead of overwriting another agent.
+4. Update or hand off work and release claims when finished.
 
-Example with the CLI:
+Agents normally use the MCP tools directly. The CLI provides the same coordination surface for humans and scripts:
 
 ```bash
 export SAMETREE_AGENT=opencode-1
@@ -179,80 +78,21 @@ sametree status
 sametree task create --title "Add request validation" --priority high
 sametree task claim task_...
 sametree claim acquire src/http/request.ts test/http/request.test.ts
-sametree message send --to claude-reviewer \
-  --subject "Validation ready" \
-  --body "Please review task task_... at commit abc123" \
-  --task task_...
 sametree task update task_... --status done
 sametree claim release --all
-```
-
-Regular command results and domain errors are JSON so agents and scripts can consume the interface reliably. Help, version output, and the default live watch remain conventional command-line text; `watch --json` emits JSON Lines.
-
-CLI processes do not stay alive to heartbeat. The default task and path leases last 15 minutes. During longer CLI-only work, rerun `task claim <task-id>` and `claim acquire <paths...>` before expiry; use `claim acquire --ttl <seconds>` to request a path lease of up to 24 hours. MCP sessions renew their leases automatically.
-
-## Watch Activity
-
-Follow coordination from a fifth terminal:
-
-```bash
 SAMETREE_AGENT=observer sametree watch --tail
 ```
 
-Replay history and continue following by omitting `--tail`. Use `--once` to print available events and exit, or `--json` for JSON Lines suitable for scripts.
-
-See the [four-agent review loop](examples/review-loop/) for launch commands and copy-paste worker and reviewer prompts.
-
-## MCP Tools
-
-| Tool | Purpose |
-| --- | --- |
-| `sametree_status` | Read the full coordination snapshot |
-| `sametree_heartbeat` | Renew the current session and its leases |
-| `sametree_task_create` | Create durable work and dependencies |
-| `sametree_task_list` | List or filter tasks |
-| `sametree_task_claim` | Claim ready work or take over an expired lease |
-| `sametree_task_update` | Change assigned work with an optional revision check |
-| `sametree_claim_acquire` | Atomically claim exact paths or directory trees |
-| `sametree_claim_list` | Inspect active path claims |
-| `sametree_claim_release` | Release selected or all owned claims |
-| `sametree_message_send` | Send a direct message or broadcast |
-| `sametree_inbox` | Poll direct and broadcast messages |
-| `sametree_message_ack` | Mark a message read |
-| `sametree_handoff_offer` | Offer task context and selected claims |
-| `sametree_handoff_list` | Read incoming and outgoing handoffs |
-| `sametree_handoff_respond` | Accept or reject a handoff |
-| `sametree_policy_get` | Read the current policy and acknowledgement state |
-| `sametree_policy_ack` | Acknowledge an exact policy hash |
-| `sametree_events` | Poll the append-only audit stream |
-
-The server also exposes `sametree://snapshot` and `sametree://policy/current` as read-only MCP resources.
-
-## Git Safety Rails
-
-Install optional hooks after reviewing them:
+Optional Git hooks can reject commits that overlap active claims or violate repository policy:
 
 ```bash
 export SAMETREE_AGENT=human
 sametree hooks install
 ```
 
-Keep `SAMETREE_AGENT` set when committing from that shell. Agent-launched Git commands inherit the identity used to start their harness.
-
-SameTree writes `pre-commit` and `commit-msg` only when those hook slots are empty or already managed by SameTree. Existing user hooks are reported and preserved, never overwritten.
-
-The default policy checks:
-
-- Staged paths must not overlap another agent's active claim.
-- A staged diff must not exceed 400 changed lines.
-- Commit subjects must follow Conventional Commits.
-- Commit messages must not contain `Co-authored-by` trailers.
-
-Configure these rules in `.sametree/config.json`. Hooks are safety rails, not a security boundary: Git permits `--no-verify`, and processes sharing an operating-system account can modify hooks.
-
 ## How It Works
 
-Every MCP client starts its own short-lived SameTree process. CLI commands are short-lived processes too. They all open one SQLite database directly:
+Each MCP client starts a local SameTree process. All clients in one worktree open the same SQLite database under Git's private worktree directory:
 
 ```text
 Claude Code ─┐
@@ -261,18 +101,17 @@ OpenCode ────┤                                  └─ Git working tre
 OpenCode ────┘
 ```
 
-SQLite `BEGIN IMMEDIATE` transactions serialize small mutations before conflict checks. Current state and its audit event commit together. WAL mode allows readers to continue while one process writes. No server needs to remain running.
+There is no server to run. State stays local and is never committed.
 
-Read [Architecture](docs/architecture.md) for storage and concurrency decisions, [Protocol](docs/protocol.md) for state transitions and invariants, and [Landscape](docs/landscape.md) for the alternatives reviewed before building SameTree.
+SameTree is designed for trusted agents on one machine. It coordinates edits but does not merge simultaneous changes or sandbox processes.
 
-## Operating Boundaries
+## Documentation
 
-- Claims coordinate cooperative agents; they cannot prevent a process from writing directly to a file.
-- SameTree is for one local host and one working tree. It is not a distributed coordination service.
-- Agents sharing an operating-system account are not mutually isolated or untrusted tenants.
-- Same-file work must be serialized by message and claim transfer. SameTree does not merge simultaneous edits.
-- Stdio MCP has no cross-process push channel here. Agents poll inboxes and events at natural boundaries.
-- The database is operational state, not project history. Important decisions should also appear in commits, task descriptions, or durable documentation.
+- [Architecture](docs/architecture.md): storage and concurrency decisions
+- [Protocol](docs/protocol.md): tools, state transitions, and invariants
+- [Four-agent review loop](examples/review-loop/): worker and reviewer example
+- [Contributing](CONTRIBUTING.md): development and demo generation
+- [Security](SECURITY.md): vulnerability reporting
 
 ## Development
 
@@ -281,10 +120,6 @@ npm ci
 npm run check
 npm pack --dry-run
 ```
-
-The test suite covers domain state transitions, path traversal and symlink escapes, task and claim conflicts, policy hooks, two-process SQLite contention, and a real MCP stdio handshake.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request and [SECURITY.md](SECURITY.md) for private vulnerability reports.
 
 ## License
 
