@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 
 import Database, { type Database as DatabaseType } from 'better-sqlite3';
@@ -7,6 +7,16 @@ import { SameTreeError } from './errors.js';
 import type { RepositoryContext } from './git.js';
 
 const MINIMUM_SQLITE_VERSION = '3.51.3';
+
+function isSymbolicLink(target: string): boolean {
+  try {
+    return lstatSync(target).isSymbolicLink();
+  } catch (error) {
+    const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+    if (code === 'ENOENT') return false;
+    throw error;
+  }
+}
 
 const INITIAL_SCHEMA = `
   CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -168,9 +178,18 @@ export function openDatabase(
 ): DatabaseType {
   const databasePath = options.databasePath ?? repository.databasePath;
   const stateDirectory = path.dirname(databasePath);
+  if (isSymbolicLink(stateDirectory)) {
+    throw new SameTreeError(
+      'DATABASE_ERROR',
+      'Refusing to use a symlinked SameTree state directory.',
+      {
+        stateDirectory,
+      },
+    );
+  }
   mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
 
-  if (existsSync(databasePath) && lstatSync(databasePath).isSymbolicLink()) {
+  if (isSymbolicLink(databasePath)) {
     throw new SameTreeError('DATABASE_ERROR', 'Refusing to open a symlinked SameTree database.', {
       databasePath,
     });
