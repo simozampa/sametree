@@ -159,9 +159,13 @@ export function claimsOverlap(
   left: Pick<NormalizedClaim, 'comparisonPath' | 'kind'>,
   right: Pick<NormalizedClaim, 'comparisonPath' | 'kind'>,
 ): boolean {
-  if (left.kind === 'exact' && right.kind === 'exact') {
-    return left.comparisonPath === right.comparisonPath;
+  if (left.kind === 'tree' && treeContains(left.comparisonPath, right.comparisonPath)) {
+    return true;
   }
-  if (left.kind === 'tree') return treeContains(left.comparisonPath, right.comparisonPath);
-  return treeContains(right.comparisonPath, left.comparisonPath);
+  if (right.kind === 'tree' && treeContains(right.comparisonPath, left.comparisonPath)) {
+    return true;
+  }
+  return (
+    left.kind === 'exact' && right.kind === 'exact' && left.comparisonPath === right.comparisonPath
+  );
 }
