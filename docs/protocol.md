@@ -87,6 +87,8 @@ An offer captures:
 - Optional path-claim IDs to transfer.
 - Expiry.
 
+Structured context, including the selected claim IDs, is limited to 100,000 serialized UTF-8 bytes.
+
 Acceptance is one transaction. It verifies that the offer is active and that the task revision still matches, then transfers assignment, starts a destination execution lease, and transfers every still-valid selected claim. A selected claim cannot overlap a source claim left behind because that would create conflicting ownership after transfer. If the task or claims changed after the offer, acceptance fails with `HANDOFF_CONFLICT` and the agents must create a fresh offer.
 
 Rejection records a terminal handoff state without changing task ownership.
