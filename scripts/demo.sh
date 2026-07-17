@@ -18,58 +18,41 @@ prompt() {
 git init --quiet --initial-branch=main "$DEMO"
 cd "$DEMO"
 
-printf '\033[1;35mSameTree: four agents, one working tree\033[0m\n\n'
+printf '\033[1;35mSameTree: coordinate agents before they edit\033[0m\n\n'
 
 prompt 'sametree setup --opencode'
-"${CLI[@]}" setup --opencode | jq -c '{created: .initialization.created, opencode}'
+"${CLI[@]}" setup --opencode | jq -r '"ready: launch " + (.restartCommands | join(" or "))'
 
-SAMETREE_AGENT=claude-reviewer SAMETREE_HARNESS=claude-code \
+SAMETREE_AGENT=agent-b SAMETREE_HARNESS=opencode \
   "${CLI[@]}" status >/dev/null
 
-prompt 'opencode-worker creates and claims a task'
-task_json="$(SAMETREE_AGENT=opencode-worker SAMETREE_HARNESS=opencode \
+prompt 'agent-a claims a task and its file'
+task_json="$(SAMETREE_AGENT=agent-a SAMETREE_HARNESS=opencode \
   "${CLI[@]}" task create --title 'Add request validation' --priority high)"
 task_id="$(jq -r '.id' <<<"$task_json")"
-jq -c '{id, title, status, priority}' <<<"$task_json"
-SAMETREE_AGENT=opencode-worker "${CLI[@]}" task claim "$task_id" \
-  | jq -c '{id, status, assignee}'
+SAMETREE_AGENT=agent-a "${CLI[@]}" task claim "$task_id" >/dev/null
+claim_json="$(SAMETREE_AGENT=agent-a "${CLI[@]}" claim acquire src/api.ts --ttl 3600)"
+printf 'task:  %s (in progress)\n' "$(jq -r '.title' <<<"$task_json")"
+printf 'file:  %s claimed by %s\n' \
+  "$(jq -r '.[0].path' <<<"$claim_json")" "$(jq -r '.[0].agentName' <<<"$claim_json")"
 
-prompt 'opencode-worker claims src/ recursively'
-claim_json="$(SAMETREE_AGENT=opencode-worker \
-  "${CLI[@]}" claim acquire --tree src --ttl 3600)"
-claim_id="$(jq -r '.[0].id' <<<"$claim_json")"
-jq -c '.[] | {path, kind, agentName}' <<<"$claim_json"
-
-prompt 'claude-reviewer tries to claim src/api/'
-if conflict="$(SAMETREE_AGENT=claude-reviewer \
-  "${CLI[@]}" claim acquire --tree src/api 2>&1)"; then
-  printf 'expected nested claim to fail\n' >&2
+prompt 'agent-b tries to claim the same file'
+if conflict="$(SAMETREE_AGENT=agent-b "${CLI[@]}" claim acquire src/api.ts 2>&1)"; then
+  printf 'expected duplicate claim to fail\n' >&2
   exit 1
 fi
 if [[ "$(jq -r '.error.code' <<<"$conflict")" != 'CLAIM_CONFLICT' ]]; then
-  printf 'nested claim failed with an unexpected error\n' >&2
+  printf 'duplicate claim failed with an unexpected error\n' >&2
   exit 1
 fi
-jq -c '.error | {code, message}' <<<"$conflict"
+jq -r '.error.code + ": another agent already owns this path"' <<<"$conflict"
 
-prompt 'worker sends context and offers a handoff'
-SAMETREE_AGENT=opencode-worker "${CLI[@]}" message send \
-  --to claude-reviewer --subject 'Ready for review' \
-  --body 'Validation is implemented and checks pass.' --task "$task_id" \
-  | jq -c '{sender, recipient, subject}'
-handoff_json="$(SAMETREE_AGENT=opencode-worker "${CLI[@]}" handoff offer "$task_id" \
-  --to claude-reviewer --summary 'Review and finish validation.' --claim "$claim_id")"
-handoff_id="$(jq -r '.id' <<<"$handoff_json")"
-jq -c '{id, fromAgent, toAgent, status}' <<<"$handoff_json"
+prompt 'agent-a sends context instead of racing'
+SAMETREE_AGENT=agent-a "${CLI[@]}" message send \
+  --to agent-b --subject 'I own src/api.ts' \
+  --body 'I will message you when validation is ready.' --task "$task_id" >/dev/null
+SAMETREE_AGENT=agent-b "${CLI[@]}" message inbox --unread \
+  | jq -r '.[0] | .sender + " -> " + .recipient + ": " + .subject'
 
-prompt 'claude-reviewer accepts task and path ownership'
-SAMETREE_AGENT=claude-reviewer SAMETREE_ROLE=reviewer \
-  "${CLI[@]}" handoff accept "$handoff_id" \
-  | jq -c '{taskId, toAgent, status}'
-
-prompt "sametree watch --once | grep -E 'task|claim|message|handoff'"
-SAMETREE_AGENT=observer "${CLI[@]}" watch --once \
-  | grep -E 'task|claim|message|handoff'
-
-printf '\n\033[1;32mNo daemon. No worktrees. Shared context stays local.\033[0m\n'
+printf '\n\033[1;32mConflicts stop early. Context stays shared and local.\033[0m\n'
 sleep 1

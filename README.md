@@ -9,7 +9,7 @@
 SameTree gives already-running Claude Code, OpenCode, and other MCP-capable agents a shared task board, inbox, path-claim registry, handoff protocol, and versioned collaboration policy. It runs locally, works in an existing dirty working tree, and needs no daemon, Docker container, PostgreSQL server, cloud account, or per-agent branch.
 
 <p align="center">
-  <img src="docs/demo.svg" alt="SameTree setup, path conflict, message, handoff, and live event stream" width="100%">
+  <img src="docs/demo.svg" alt="SameTree setup, task and path ownership, conflict prevention, and agent messaging" width="100%">
 </p>
 
 > [!WARNING]
