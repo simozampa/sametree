@@ -8,15 +8,34 @@ import type { RepositoryContext } from './git.js';
 
 const MINIMUM_SQLITE_VERSION = '3.51.3';
 
-function isSymbolicLink(target: string): boolean {
-  try {
-    return lstatSync(target).isSymbolicLink();
-  } catch (error) {
-    const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
-    if (code === 'ENOENT') return false;
-    throw error;
+function assertNoSymlinkComponents(target: string): void {
+  const absolute = path.resolve(target);
+  const { root } = path.parse(absolute);
+  let current = root;
+  for (const segment of path.relative(root, absolute).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    try {
+      if (lstatSync(current).isSymbolicLink()) {
+        throw new SameTreeError('DATABASE_ERROR', 'Refusing a symlinked database path.', {
+          path: current,
+        });
+      }
+    } catch (error) {
+      if (error instanceof SameTreeError) throw error;
+      const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+      if (code === 'ENOENT') break;
+      throw error;
+    }
   }
 }
+
+const BROADCAST_RECIPIENT_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS broadcast_recipients (
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    agent_name TEXT NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+    PRIMARY KEY (message_id, agent_name)
+  ) STRICT;
+`;
 
 const INITIAL_SCHEMA = `
   CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -92,6 +111,8 @@ const INITIAL_SCHEMA = `
     PRIMARY KEY (message_id, agent_name)
   ) STRICT;
 
+  ${BROADCAST_RECIPIENT_SCHEMA}
+
   CREATE TABLE handoffs (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -153,7 +174,7 @@ function migrate(database: DatabaseType, now: number): void {
       .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
       .get() as { version: number };
 
-    if (current.version > 1) {
+    if (current.version > 2) {
       throw new SameTreeError(
         'DATABASE_ERROR',
         `This database uses unsupported schema version ${current.version}.`,
@@ -163,6 +184,19 @@ function migrate(database: DatabaseType, now: number): void {
       database.exec(INITIAL_SCHEMA);
       database
         .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)')
+        .run(now);
+    }
+    if (current.version < 2) {
+      database.exec(BROADCAST_RECIPIENT_SCHEMA);
+      database.exec(
+        `INSERT OR IGNORE INTO broadcast_recipients (message_id, agent_name)
+         SELECT message.id, agent.name
+         FROM messages message
+         JOIN agents agent ON agent.name <> message.sender
+         WHERE message.recipient IS NULL AND agent.created_at <= message.created_at`,
+      );
+      database
+        .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)')
         .run(now);
     }
     database.exec('COMMIT');
@@ -178,22 +212,9 @@ export function openDatabase(
 ): DatabaseType {
   const databasePath = options.databasePath ?? repository.databasePath;
   const stateDirectory = path.dirname(databasePath);
-  if (isSymbolicLink(stateDirectory)) {
-    throw new SameTreeError(
-      'DATABASE_ERROR',
-      'Refusing to use a symlinked SameTree state directory.',
-      {
-        stateDirectory,
-      },
-    );
-  }
+  assertNoSymlinkComponents(stateDirectory);
   mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
-
-  if (isSymbolicLink(databasePath)) {
-    throw new SameTreeError('DATABASE_ERROR', 'Refusing to open a symlinked SameTree database.', {
-      databasePath,
-    });
-  }
+  assertNoSymlinkComponents(databasePath);
 
   const database = new Database(databasePath, { timeout: 2_500 });
   if (databasePath !== ':memory:') chmodSync(databasePath, 0o600);
