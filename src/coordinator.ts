@@ -169,7 +169,8 @@ function mapMessage(row: Row): Message {
   };
 }
 
-function mapHandoff(row: Row): Handoff {
+function mapHandoff(row: Row, now: number): Handoff {
+  const storedStatus = stringValue(row, 'status') as Handoff['status'];
   return {
     id: stringValue(row, 'id'),
     taskId: stringValue(row, 'task_id'),
@@ -177,7 +178,10 @@ function mapHandoff(row: Row): Handoff {
     toAgent: stringValue(row, 'to_agent'),
     summary: stringValue(row, 'summary'),
     context: parseObject(row.context_json),
-    status: stringValue(row, 'status') as Handoff['status'],
+    status:
+      storedStatus === 'offered' && numberValue(row, 'expires_at') <= now
+        ? 'expired'
+        : storedStatus,
     createdAt: numberValue(row, 'created_at'),
     expiresAt: numberValue(row, 'expires_at'),
     respondedAt: nullableNumber(row, 'responded_at'),
@@ -293,6 +297,19 @@ export class Coordinator {
     return mapTask(row, this.#dependencies(taskId));
   }
 
+  #unfinishedDependencies(taskId: string): string[] {
+    return (
+      this.#database
+        .prepare(
+          `SELECT dependency.id
+           FROM task_dependencies edge
+           JOIN tasks dependency ON dependency.id = edge.depends_on
+           WHERE edge.task_id = ? AND dependency.status <> 'done'`,
+        )
+        .all(taskId) as Row[]
+    ).map((row) => stringValue(row, 'id'));
+  }
+
   heartbeat(): Session {
     const now = this.#clock();
     const sessionExpiry = now + this.config.sessionTtlSeconds * 1_000;
@@ -300,13 +317,16 @@ export class Coordinator {
     const taskExpiry = now + this.config.taskLeaseSeconds * 1_000;
 
     return immediateTransaction(this.#database, () => {
-      this.#database
+      const renewed = this.#database
         .prepare(
           `UPDATE sessions
-           SET last_heartbeat_at = ?, expires_at = ?, status = 'active'
-           WHERE id = ?`,
+           SET last_heartbeat_at = ?, expires_at = ?
+           WHERE id = ? AND status = 'active' AND expires_at > ?`,
         )
-        .run(now, sessionExpiry, this.sessionId);
+        .run(now, sessionExpiry, this.sessionId, now).changes;
+      if (renewed === 0) {
+        throw new SameTreeError('TASK_UNAVAILABLE', 'This session expired and cannot be renewed.');
+      }
       this.#database
         .prepare('UPDATE agents SET last_seen_at = ? WHERE name = ?')
         .run(now, this.agentName);
@@ -315,9 +335,10 @@ export class Coordinator {
         .run(claimExpiry, this.sessionId, now);
       this.#database
         .prepare(
-          'UPDATE tasks SET lease_expires_at = ? WHERE claimed_by_session = ? AND status = ?',
+          `UPDATE tasks SET lease_expires_at = ?
+           WHERE claimed_by_session = ? AND status = 'in_progress' AND lease_expires_at > ?`,
         )
-        .run(taskExpiry, this.sessionId, 'in_progress');
+        .run(taskExpiry, this.sessionId, now);
 
       const row = this.#database.prepare('SELECT * FROM sessions WHERE id = ?').get(this.sessionId);
       return mapSession(row as Row);
@@ -331,7 +352,7 @@ export class Coordinator {
         this.#database.prepare('DELETE FROM path_claims WHERE session_id = ?').run(this.sessionId);
         this.#database
           .prepare(
-            `UPDATE tasks SET claimed_by_session = NULL, lease_expires_at = NULL, revision = revision + 1
+            `UPDATE tasks SET claimed_by_session = NULL, lease_expires_at = NULL
              WHERE claimed_by_session = ? AND status = 'in_progress'`,
           )
           .run(this.sessionId);
@@ -401,18 +422,19 @@ export class Coordinator {
         throw new SameTreeError('TASK_UNAVAILABLE', `Task '${taskId}' is ${task.status}.`);
       }
 
-      const blockers = this.#database
-        .prepare(
-          `SELECT dependency.id
-           FROM task_dependencies edge
-           JOIN tasks dependency ON dependency.id = edge.depends_on
-           WHERE edge.task_id = ? AND dependency.status <> 'done'`,
-        )
-        .all(taskId) as Row[];
+      const blockers = this.#unfinishedDependencies(taskId);
       if (blockers.length > 0) {
         throw new SameTreeError('TASK_BLOCKED', `Task '${taskId}' has unfinished dependencies.`, {
-          dependencies: blockers.map((row) => stringValue(row, 'id')),
+          dependencies: blockers,
         });
+      }
+
+      if (task.status === 'ready' && task.assignee && task.assignee !== this.agentName) {
+        throw new SameTreeError(
+          'TASK_UNAVAILABLE',
+          `Task '${taskId}' is assigned to ${task.assignee}.`,
+          { assignee: task.assignee },
+        );
       }
 
       if (
@@ -463,14 +485,37 @@ export class Coordinator {
           { currentRevision: task.revision },
         );
       }
-      if (task.assignee && task.assignee !== this.agentName) {
+      if (task.assignee !== this.agentName) {
         throw new SameTreeError(
           'NOT_ASSIGNED',
-          `Task '${taskId}' is assigned to ${task.assignee}.`,
+          task.assignee
+            ? `Task '${taskId}' is assigned to ${task.assignee}.`
+            : `Claim task '${taskId}' before updating it.`,
         );
       }
 
       const status = input.status ?? task.status;
+      const transitions: Record<TaskStatus, TaskStatus[]> = {
+        ready: ['ready', 'in_progress', 'blocked', 'cancelled'],
+        in_progress: ['ready', 'in_progress', 'blocked', 'done', 'cancelled'],
+        blocked: ['ready', 'blocked', 'cancelled'],
+        done: ['done'],
+        cancelled: ['cancelled'],
+      };
+      if (!transitions[task.status].includes(status)) {
+        throw new SameTreeError(
+          'TASK_UNAVAILABLE',
+          `Task '${taskId}' cannot transition from ${task.status} to ${status}.`,
+        );
+      }
+      if (status === 'in_progress') {
+        const blockers = this.#unfinishedDependencies(taskId);
+        if (blockers.length > 0) {
+          throw new SameTreeError('TASK_BLOCKED', `Task '${taskId}' has unfinished dependencies.`, {
+            dependencies: blockers,
+          });
+        }
+      }
       const description = input.description?.trim() ?? task.description;
       if (description.length > 20_000) {
         throw new SameTreeError(
@@ -482,7 +527,7 @@ export class Coordinator {
       this.#database
         .prepare(
           `UPDATE tasks SET
-             status = ?, description = ?, priority = ?, assignee = COALESCE(assignee, ?),
+             status = ?, description = ?, priority = ?,
              claimed_by_session = ?, lease_expires_at = ?, revision = revision + 1, updated_at = ?
            WHERE id = ?`,
         )
@@ -490,7 +535,6 @@ export class Coordinator {
           status,
           description,
           input.priority ?? task.priority,
-          this.agentName,
           active ? this.sessionId : null,
           active ? this.#clock() + this.config.taskLeaseSeconds * 1_000 : null,
           this.#clock(),
@@ -701,12 +745,16 @@ export class Coordinator {
            FROM messages message
            LEFT JOIN message_receipts receipt
              ON receipt.message_id = message.id AND receipt.agent_name = ?
-           WHERE (message.recipient = ? OR (message.recipient IS NULL AND message.sender <> ?))
+           WHERE (message.recipient = ? OR (
+             message.recipient IS NULL
+             AND message.sender <> ?
+             AND message.created_at >= (SELECT created_at FROM agents WHERE name = ?)
+           ))
              ${unread}
            ORDER BY message.created_at DESC
            LIMIT ?`,
         )
-        .all(this.agentName, this.agentName, this.agentName, limit) as Row[]
+        .all(this.agentName, this.agentName, this.agentName, this.agentName, limit) as Row[]
     ).map(mapMessage);
   }
 
@@ -765,6 +813,12 @@ export class Coordinator {
       if (task.assignee !== this.agentName) {
         throw new SameTreeError('NOT_ASSIGNED', `Task '${input.taskId}' is not assigned to you.`);
       }
+      if (task.status !== 'in_progress') {
+        throw new SameTreeError(
+          'TASK_UNAVAILABLE',
+          `Only in-progress work can be handed off; task '${input.taskId}' is ${task.status}.`,
+        );
+      }
       for (const claimId of claimIds) {
         const owned = this.#database
           .prepare('SELECT 1 FROM path_claims WHERE id = ? AND agent_name = ? AND expires_at > ?')
@@ -801,35 +855,28 @@ export class Coordinator {
         to: input.to,
       });
       const row = this.#database.prepare('SELECT * FROM handoffs WHERE id = ?').get(id);
-      return mapHandoff(row as Row);
+      return mapHandoff(row as Row, now);
     });
   }
 
   listHandoffs(options: { pendingOnly?: boolean } = {}): Handoff[] {
     const now = this.#clock();
-    return immediateTransaction(this.#database, () => {
-      this.#database
-        .prepare(
-          "UPDATE handoffs SET status = 'expired' WHERE status = 'offered' AND expires_at <= ?",
-        )
-        .run(now);
-      const rows = options.pendingOnly
-        ? (this.#database
-            .prepare(
-              `SELECT * FROM handoffs
-               WHERE to_agent = ? AND status = 'offered'
-               ORDER BY created_at DESC`,
-            )
-            .all(this.agentName) as Row[])
-        : (this.#database
-            .prepare(
-              `SELECT * FROM handoffs
-               WHERE to_agent = ? OR from_agent = ?
-               ORDER BY created_at DESC`,
-            )
-            .all(this.agentName, this.agentName) as Row[]);
-      return rows.map(mapHandoff);
-    });
+    const rows = options.pendingOnly
+      ? (this.#database
+          .prepare(
+            `SELECT * FROM handoffs
+             WHERE to_agent = ? AND status = 'offered' AND expires_at > ?
+             ORDER BY created_at DESC`,
+          )
+          .all(this.agentName, now) as Row[])
+      : (this.#database
+          .prepare(
+            `SELECT * FROM handoffs
+             WHERE to_agent = ? OR from_agent = ?
+             ORDER BY created_at DESC`,
+          )
+          .all(this.agentName, this.agentName) as Row[]);
+    return rows.map((row) => mapHandoff(row, now));
   }
 
   respondToHandoff(handoffId: string, accept: boolean): Handoff {
@@ -857,6 +904,24 @@ export class Coordinator {
           { currentRevision: task.revision, offeredRevision: numberValue(row, 'task_revision') },
         );
       }
+      if (accept && task.status !== 'in_progress') {
+        throw new SameTreeError(
+          'HANDOFF_CONFLICT',
+          `Task '${task.id}' is ${task.status} and cannot be resumed by this handoff.`,
+        );
+      }
+      if (accept) {
+        const blockers = this.#unfinishedDependencies(task.id);
+        if (blockers.length > 0) {
+          throw new SameTreeError(
+            'TASK_BLOCKED',
+            `Task '${task.id}' has unfinished dependencies.`,
+            {
+              dependencies: blockers,
+            },
+          );
+        }
+      }
 
       const status = accept ? 'accepted' : 'rejected';
       this.#database
@@ -882,6 +947,47 @@ export class Coordinator {
         const claimIds = Array.isArray(context.claimIds)
           ? context.claimIds.filter((value): value is string => typeof value === 'string')
           : [];
+        const selectedClaims = claimIds.map((claimId) => {
+          const claim = this.#database
+            .prepare(
+              `SELECT * FROM path_claims
+               WHERE id = ? AND agent_name = ? AND expires_at > ?`,
+            )
+            .get(claimId, stringValue(row, 'from_agent'), now) as Row | undefined;
+          if (!claim) {
+            throw new SameTreeError(
+              'HANDOFF_CONFLICT',
+              `Claim '${claimId}' is no longer transferable.`,
+            );
+          }
+          return claim;
+        });
+        const sourceClaims = this.#database
+          .prepare('SELECT * FROM path_claims WHERE agent_name = ? AND expires_at > ?')
+          .all(stringValue(row, 'from_agent'), now) as Row[];
+        for (const selected of selectedClaims) {
+          const overlap = sourceClaims.find(
+            (candidate) =>
+              !claimIds.includes(stringValue(candidate, 'id')) &&
+              claimsOverlap(
+                {
+                  comparisonPath: stringValue(selected, 'comparison_path'),
+                  kind: stringValue(selected, 'kind') as ClaimKind,
+                },
+                {
+                  comparisonPath: stringValue(candidate, 'comparison_path'),
+                  kind: stringValue(candidate, 'kind') as ClaimKind,
+                },
+              ),
+          );
+          if (overlap) {
+            throw new SameTreeError(
+              'HANDOFF_CONFLICT',
+              `Claim '${stringValue(selected, 'id')}' overlaps an unselected source claim.`,
+              { overlappingClaim: mapClaim(overlap) },
+            );
+          }
+        }
         const transfer = this.#database.prepare(
           `UPDATE path_claims SET agent_name = ?, session_id = ?, expires_at = ?
            WHERE id = ? AND agent_name = ? AND expires_at > ?`,
@@ -899,7 +1005,7 @@ export class Coordinator {
       }
 
       this.#recordEvent(`handoff.${status}`, 'handoff', handoffId, { taskId: task.id });
-      return mapHandoff({ ...row, status, responded_at: now });
+      return mapHandoff({ ...row, status, responded_at: now }, now);
     });
   }
 
@@ -969,42 +1075,47 @@ export class Coordinator {
   }
 
   snapshot(): CoordinationSnapshot {
-    const agentRow = this.#database
-      .prepare('SELECT * FROM agents WHERE name = ?')
-      .get(this.agentName);
-    const sessionRow = this.#database
-      .prepare('SELECT * FROM sessions WHERE id = ?')
-      .get(this.sessionId);
-    const unread = this.#database
-      .prepare(
-        `SELECT COUNT(*) AS count
-         FROM messages message
-         LEFT JOIN message_receipts receipt
-           ON receipt.message_id = message.id AND receipt.agent_name = ?
-         WHERE (message.recipient = ? OR (message.recipient IS NULL AND message.sender <> ?))
-           AND receipt.read_at IS NULL`,
-      )
-      .get(this.agentName, this.agentName, this.agentName) as Row;
-    const handoffs = this.#database
-      .prepare(
-        `SELECT COUNT(*) AS count FROM handoffs
-         WHERE to_agent = ? AND status = 'offered' AND expires_at > ?`,
-      )
-      .get(this.agentName, this.#clock()) as Row;
-    const lastEvent = this.#database
-      .prepare('SELECT MAX(sequence) AS sequence FROM events')
-      .get() as Row;
+    return this.#database.transaction(() => {
+      const agentRow = this.#database
+        .prepare('SELECT * FROM agents WHERE name = ?')
+        .get(this.agentName);
+      const sessionRow = this.#database
+        .prepare('SELECT * FROM sessions WHERE id = ?')
+        .get(this.sessionId);
+      const unread = this.#database
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM messages message
+           LEFT JOIN message_receipts receipt
+             ON receipt.message_id = message.id AND receipt.agent_name = ?
+           WHERE (message.recipient = ? OR (
+             message.recipient IS NULL
+             AND message.sender <> ?
+             AND message.created_at >= (SELECT created_at FROM agents WHERE name = ?)
+           )) AND receipt.read_at IS NULL`,
+        )
+        .get(this.agentName, this.agentName, this.agentName, this.agentName) as Row;
+      const handoffs = this.#database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM handoffs
+           WHERE to_agent = ? AND status = 'offered' AND expires_at > ?`,
+        )
+        .get(this.agentName, this.#clock()) as Row;
+      const lastEvent = this.#database
+        .prepare('SELECT MAX(sequence) AS sequence FROM events')
+        .get() as Row;
 
-    return {
-      agent: mapAgent(agentRow as Row),
-      session: mapSession(sessionRow as Row),
-      agents: this.listAgents(),
-      tasks: this.listTasks(),
-      claims: this.listClaims(),
-      unreadMessages: numberValue(unread, 'count'),
-      pendingHandoffs: numberValue(handoffs, 'count'),
-      lastEventSequence: nullableNumber(lastEvent, 'sequence') ?? 0,
-    };
+      return {
+        agent: mapAgent(agentRow as Row),
+        session: mapSession(sessionRow as Row),
+        agents: this.listAgents(),
+        tasks: this.listTasks(),
+        claims: this.listClaims(),
+        unreadMessages: numberValue(unread, 'count'),
+        pendingHandoffs: numberValue(handoffs, 'count'),
+        lastEventSequence: nullableNumber(lastEvent, 'sequence') ?? 0,
+      };
+    })();
   }
 
   doctor(): DoctorReport {
