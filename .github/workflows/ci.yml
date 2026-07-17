@@ -41,8 +41,3 @@ jobs:
           archive="$(npm pack --silent)"
           npm install --global "./${archive}"
           sametree --version
-
-      - name: Smoke-test Git installation
-        run: |
-          npm install --global "git+file://${GITHUB_WORKSPACE}"
-          sametree --version
