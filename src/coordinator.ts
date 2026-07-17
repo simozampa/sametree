@@ -583,6 +583,7 @@ export class Coordinator {
         .prepare('SELECT * FROM path_claims WHERE expires_at > ?')
         .all(now) as Row[];
 
+      // One agent may intentionally hold a broad claim plus narrower claims for handoff.
       for (const claim of unique) {
         const conflict = active.find(
           (row) =>
