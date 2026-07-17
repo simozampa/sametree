@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { CONFIG_DIRECTORY, CONFIG_FILE, DEFAULT_CONFIG, POLICY_FILE } from './config.js';
 import { resolveRepository } from './git.js';
+import { assertSafeWritePath } from './paths.js';
 import {
   configTemplate,
   IMPLEMENTER_ROLE_TEMPLATE,
@@ -24,7 +25,7 @@ function writeProjectFile(
   force: boolean,
   result: InitializationResult,
 ): void {
-  const target = path.join(repositoryRoot, relativePath);
+  const target = assertSafeWritePath(repositoryRoot, relativePath);
   try {
     if (!force) {
       readFileSync(target);
@@ -52,6 +53,7 @@ export function initializeProject(
     preserved: [],
   };
 
+  assertSafeWritePath(repository.root, CONFIG_DIRECTORY);
   mkdirSync(path.join(repository.root, CONFIG_DIRECTORY, 'roles'), {
     recursive: true,
     mode: 0o755,
