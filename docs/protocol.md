@@ -50,6 +50,8 @@ A claim has one of two kinds:
 - `exact`: one repository-relative path, such as `src/api.ts`.
 - `tree`: a path and every descendant, such as `src/auth`.
 
+Recursive claims must name the real directory path; a final symbolic link is rejected to avoid giving the link entry and its target different ownership identities.
+
 Two claims overlap when:
 
 - Both are exact and their normalized paths are equal.
