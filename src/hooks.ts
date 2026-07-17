@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { loadConfig } from './config.js';
@@ -8,6 +8,16 @@ import { claimsOverlap, normalizeClaim } from './paths.js';
 import type { PathClaim } from './types.js';
 
 const HOOK_MARKER = '# managed-by-sametree';
+
+function isSymbolicLink(target: string): boolean {
+  try {
+    return lstatSync(target).isSymbolicLink();
+  } catch (error) {
+    const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+    if (code === 'ENOENT') return false;
+    throw error;
+  }
+}
 
 const PRE_COMMIT_HOOK = `#!/bin/sh
 ${HOOK_MARKER}
@@ -43,7 +53,10 @@ export function installHooks(cwd = process.cwd()): HookInstallationResult {
     ['commit-msg', COMMIT_MESSAGE_HOOK],
   ] as const) {
     const target = path.join(repository.hooksPath, name);
-    if (existsSync(target) && !readFileSync(target, 'utf8').includes(HOOK_MARKER)) {
+    if (
+      isSymbolicLink(target) ||
+      (existsSync(target) && !readFileSync(target, 'utf8').includes(HOOK_MARKER))
+    ) {
       result.preserved.push(target);
       continue;
     }
