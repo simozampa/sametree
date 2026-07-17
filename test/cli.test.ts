@@ -62,4 +62,15 @@ describe('CLI', () => {
     const failure = results.find((result) => result.code !== 0);
     expect(failure?.stderr).toContain('CLAIM_CONFLICT');
   });
+
+  it('returns one structured error for invalid commands', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const result = await runCli(repository.root, 'cli-agent', ['--unknown']);
+    const error = JSON.parse(result.stderr) as { error: { code: string } };
+
+    expect(result.code).not.toBe(0);
+    expect(error.error.code).toBe('INTERNAL_ERROR');
+  });
 });
