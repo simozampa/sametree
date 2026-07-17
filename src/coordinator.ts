@@ -27,6 +27,7 @@ import type {
 } from './types.js';
 
 type Row = Record<string, unknown>;
+const MAX_HANDOFF_CONTEXT_BYTES = 100_000;
 
 export interface CoordinatorOptions {
   agent: string;
@@ -148,6 +149,7 @@ function mapClaim(row: Row): PathClaim {
   return {
     id: stringValue(row, 'id'),
     path: stringValue(row, 'path'),
+    comparisonPath: stringValue(row, 'comparison_path'),
     kind: stringValue(row, 'kind') as ClaimKind,
     agentName: stringValue(row, 'agent_name'),
     expiresAt: numberValue(row, 'expires_at'),
@@ -635,6 +637,7 @@ export class Coordinator {
         results.push({
           id,
           path: claim.path,
+          comparisonPath: claim.comparisonPath,
           kind: claim.kind,
           agentName: this.agentName,
           expiresAt,
@@ -717,6 +720,14 @@ export class Coordinator {
           input.taskId ?? null,
           now,
         );
+      if (!input.to) {
+        this.#database
+          .prepare(
+            `INSERT INTO broadcast_recipients (message_id, agent_name)
+             SELECT ?, name FROM agents WHERE name <> ?`,
+          )
+          .run(id, this.agentName);
+      }
       this.#recordEvent('message.sent', 'message', id, {
         recipient: input.to ?? null,
         taskId: input.taskId ?? null,
@@ -745,16 +756,15 @@ export class Coordinator {
            FROM messages message
            LEFT JOIN message_receipts receipt
              ON receipt.message_id = message.id AND receipt.agent_name = ?
-           WHERE (message.recipient = ? OR (
-             message.recipient IS NULL
-             AND message.sender <> ?
-             AND message.created_at >= (SELECT created_at FROM agents WHERE name = ?)
+           WHERE (message.recipient = ? OR EXISTS (
+             SELECT 1 FROM broadcast_recipients recipient
+             WHERE recipient.message_id = message.id AND recipient.agent_name = ?
            ))
              ${unread}
            ORDER BY message.created_at DESC
            LIMIT ?`,
         )
-        .all(this.agentName, this.agentName, this.agentName, this.agentName, limit) as Row[]
+        .all(this.agentName, this.agentName, this.agentName, limit) as Row[]
     ).map(mapMessage);
   }
 
@@ -776,6 +786,14 @@ export class Coordinator {
           'NOT_ASSIGNED',
           `Message '${messageId}' is addressed to ${recipient}.`,
         );
+      }
+      if (
+        recipient === null &&
+        !this.#database
+          .prepare('SELECT 1 FROM broadcast_recipients WHERE message_id = ? AND agent_name = ?')
+          .get(messageId, this.agentName)
+      ) {
+        throw new SameTreeError('NOT_ASSIGNED', `Broadcast '${messageId}' was not sent to you.`);
       }
 
       const readAt = this.#clock();
@@ -803,6 +821,18 @@ export class Coordinator {
     const claimIds = [...new Set(input.claimIds ?? [])];
     const now = this.#clock();
     const expiresAt = now + this.config.handoffTtlSeconds * 1_000;
+    let contextJson: string;
+    try {
+      contextJson = JSON.stringify({ ...(input.context ?? {}), claimIds });
+    } catch {
+      throw new SameTreeError('INVALID_INPUT', 'Handoff context must be JSON serializable.');
+    }
+    if (Buffer.byteLength(contextJson, 'utf8') > MAX_HANDOFF_CONTEXT_BYTES) {
+      throw new SameTreeError(
+        'INVALID_INPUT',
+        `Handoff context cannot exceed ${MAX_HANDOFF_CONTEXT_BYTES} bytes.`,
+      );
+    }
 
     return immediateTransaction(this.#database, () => {
       this.#requireAgent(input.to);
@@ -831,7 +861,6 @@ export class Coordinator {
         }
       }
 
-      const context = { ...(input.context ?? {}), claimIds };
       this.#database
         .prepare(
           `INSERT INTO handoffs
@@ -845,7 +874,7 @@ export class Coordinator {
           this.agentName,
           input.to,
           summary,
-          JSON.stringify(context),
+          contextJson,
           task.revision,
           now,
           expiresAt,
@@ -1088,13 +1117,12 @@ export class Coordinator {
            FROM messages message
            LEFT JOIN message_receipts receipt
              ON receipt.message_id = message.id AND receipt.agent_name = ?
-           WHERE (message.recipient = ? OR (
-             message.recipient IS NULL
-             AND message.sender <> ?
-             AND message.created_at >= (SELECT created_at FROM agents WHERE name = ?)
+           WHERE (message.recipient = ? OR EXISTS (
+             SELECT 1 FROM broadcast_recipients recipient
+             WHERE recipient.message_id = message.id AND recipient.agent_name = ?
            )) AND receipt.read_at IS NULL`,
         )
-        .get(this.agentName, this.agentName, this.agentName, this.agentName) as Row;
+        .get(this.agentName, this.agentName, this.agentName) as Row;
       const handoffs = this.#database
         .prepare(
           `SELECT COUNT(*) AS count FROM handoffs
