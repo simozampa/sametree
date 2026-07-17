@@ -35,10 +35,9 @@ export function resolveRepository(cwd = process.cwd()): RepositoryContext {
   }
 
   const root = realpathSync(git(cwd, ['rev-parse', '--show-toplevel']));
-  const databasePath = path.resolve(
-    git(root, ['rev-parse', '--path-format=absolute', '--git-path', 'sametree/state.sqlite3']),
-  );
-  const configuredHooksPath = gitConfig(root, 'core.hooksPath');
+  const privateGitDirectory = path.resolve(git(root, ['rev-parse', '--absolute-git-dir']));
+  const databasePath = path.join(privateGitDirectory, 'sametree', 'state.sqlite3');
+  const configuredHooksPath = gitConfig(root, 'core.hooksPath', 'path');
   const hooksPath = configuredHooksPath
     ? path.resolve(root, configuredHooksPath)
     : path.resolve(git(root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']));
@@ -47,13 +46,13 @@ export function resolveRepository(cwd = process.cwd()): RepositoryContext {
     root,
     databasePath,
     hooksPath,
-    ignoreCase: gitConfig(root, 'core.ignorecase') === 'true',
+    ignoreCase: gitConfig(root, 'core.ignorecase', 'bool') === 'true',
   };
 }
 
-export function gitConfig(cwd: string, key: string): string | null {
+export function gitConfig(cwd: string, key: string, type?: 'bool' | 'path'): string | null {
   try {
-    const value = execFileSync('git', ['config', '--get', key], {
+    const value = execFileSync('git', ['config', ...(type ? [`--${type}`] : []), '--get', key], {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -67,7 +66,7 @@ export function gitConfig(cwd: string, key: string): string | null {
 export function stagedFiles(repositoryRoot: string): string[] {
   const output = execFileSync(
     'git',
-    ['diff', '--cached', '--name-only', '-z', '--diff-filter=ACMR'],
+    ['diff', '--cached', '--name-status', '-z', '--diff-filter=ACDMRTUXB'],
     {
       cwd: repositoryRoot,
       encoding: 'utf8',
@@ -75,7 +74,23 @@ export function stagedFiles(repositoryRoot: string): string[] {
     },
   );
 
-  return output.split('\0').filter(Boolean);
+  const tokens = output.split('\0');
+  const files: string[] = [];
+  for (let index = 0; index < tokens.length; ) {
+    const token = tokens[index++];
+    if (!token) continue;
+
+    const tab = token.indexOf('\t');
+    const status = tab === -1 ? token : token.slice(0, tab);
+    const firstPath = tab === -1 ? tokens[index++] : token.slice(tab + 1);
+    if (firstPath) files.push(firstPath);
+
+    if (status.startsWith('R') || status.startsWith('C')) {
+      const secondPath = tokens[index++];
+      if (secondPath) files.push(secondPath);
+    }
+  }
+  return [...new Set(files)];
 }
 
 export function stagedChangedLines(repositoryRoot: string): number {
@@ -86,10 +101,20 @@ export function stagedChangedLines(repositoryRoot: string): number {
   });
 
   let total = 0;
-  for (const entry of output.split('\0').filter(Boolean)) {
-    const [added, removed] = entry.split('\t');
-    total += added === '-' ? 0 : Number(added ?? 0);
-    total += removed === '-' ? 0 : Number(removed ?? 0);
+  const tokens = output.split('\0');
+  for (let index = 0; index < tokens.length; ) {
+    const entry = tokens[index++];
+    if (!entry) continue;
+    const [added, removed, file] = entry.split('\t');
+    const additions = added === '-' ? 0 : Number(added);
+    const deletions = removed === '-' ? 0 : Number(removed);
+    if (!Number.isFinite(additions) || !Number.isFinite(deletions)) {
+      throw new SameTreeError('HOOK_REFUSED', 'Git returned an invalid staged diff summary.');
+    }
+    total += additions + deletions;
+
+    // With -z, renamed files use an empty path followed by old and new path fields.
+    if (file === '') index += 2;
   }
   return total;
 }
