@@ -8,6 +8,10 @@
 
 SameTree gives already-running Claude Code, OpenCode, and other MCP-capable agents a shared task board, inbox, path-claim registry, handoff protocol, and versioned collaboration policy. It runs locally, works in an existing dirty working tree, and needs no daemon, Docker container, PostgreSQL server, cloud account, or per-agent branch.
 
+<p align="center">
+  <img src="docs/demo.svg" alt="SameTree setup, path conflict, message, handoff, and live event stream" width="100%">
+</p>
+
 > [!WARNING]
 > SameTree is alpha software. Its claims are cooperative leases, not operating-system locks. Back up important work and read the [operating boundaries](#operating-boundaries) before using it.
 
@@ -27,7 +31,8 @@ SameTree is deliberately for the other case:
 ## Features
 
 - **Cross-harness MCP server** with structured tools for Claude Code, OpenCode, and other MCP clients.
-- **Deterministic JSON CLI** for humans, shell scripts, hooks, and agents without MCP.
+- **One-command project setup** that safely merges Claude Code and OpenCode integration.
+- **Structured CLI** for humans, shell scripts, hooks, and agents without MCP.
 - **Durable tasks** with dependencies, priorities, revision checks, assignments, expiring execution leases, and explicit stale-work takeover.
 - **Atomic path claims** for exact files or recursive directories. A claim batch either succeeds completely or writes nothing.
 - **Direct messages and broadcasts** with threads, task links, unread state, and acknowledgements.
@@ -35,6 +40,7 @@ SameTree is deliberately for the other case:
 - **Versioned policy and role files** under `.sametree/`, with content-hash acknowledgements.
 - **Optional Git hooks** for conflicting staged paths, oversized diffs, Conventional Commits, and forbidden `Co-authored-by` trailers.
 - **Transactional audit events** with a sequence cursor for polling and diagnostics.
+- **Human-readable live watch** for following tasks, claims, messages, and handoffs.
 - **Worktree-local SQLite WAL state** stored under Git's private directory instead of committed into the repository.
 
 ## Requirements
@@ -61,15 +67,17 @@ npm link
 
 ## Quick Start
 
-Initialize the repository where agents will collaborate:
+Configure both harnesses in the repository where agents will collaborate:
 
 ```bash
 cd /path/to/your/project
-sametree init
-sametree --agent human doctor
+sametree setup --claude --opencode
+SAMETREE_AGENT=human sametree doctor
 ```
 
-This creates only versioned coordination files:
+Setup initializes the versioned policy, safely merges `opencode.json` or `opencode.jsonc`, updates `AGENTS.md` and `CLAUDE.md`, and registers SameTree with Claude Code at local project scope. Existing configuration and comments are preserved; conflicting entries are refused rather than overwritten.
+
+SameTree's generated coordination directory is fully versioned:
 
 ```text
 .sametree/
@@ -83,7 +91,7 @@ This creates only versioned coordination files:
 
 Live state is created on first use inside Git's worktree-specific private directory. It is normally `.git/sametree/state.sqlite3` and is never committed.
 
-### Configure Claude Code
+### Manual Claude Code Configuration
 
 From the target project, add SameTree as a local-scoped stdio MCP server:
 
@@ -107,7 +115,7 @@ SAMETREE_AGENT=claude-reviewer SAMETREE_ROLE=reviewer claude
 
 Claude Code passes its stable project directory to SameTree automatically.
 
-### Configure OpenCode
+### Manual OpenCode Configuration
 
 Add this to the target project's `opencode.json`:
 
@@ -166,9 +174,21 @@ sametree task update task_... --status done
 sametree claim release --all
 ```
 
-Successful command results and domain errors are JSON so agents and scripts can consume the interface reliably. Help and version output remain conventional command-line text.
+Regular command results and domain errors are JSON so agents and scripts can consume the interface reliably. Help, version output, and the default live watch remain conventional command-line text; `watch --json` emits JSON Lines.
 
 CLI processes do not stay alive to heartbeat. The default task and path leases last 15 minutes. During longer CLI-only work, rerun `task claim <task-id>` and `claim acquire <paths...>` before expiry; use `claim acquire --ttl <seconds>` to request a path lease of up to 24 hours. MCP sessions renew their leases automatically.
+
+## Watch Activity
+
+Follow coordination from a fifth terminal:
+
+```bash
+SAMETREE_AGENT=observer sametree watch --tail
+```
+
+Replay history and continue following by omitting `--tail`. Use `--once` to print available events and exit, or `--json` for JSON Lines suitable for scripts.
+
+See the [four-agent review loop](examples/review-loop/) for launch commands and copy-paste worker and reviewer prompts.
 
 ## MCP Tools
 

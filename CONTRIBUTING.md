@@ -41,6 +41,17 @@ Coordination bugs often disappear in single-process tests. Changes to tasks, cla
 
 After crash or contention tests, run SQLite `integrity_check` and verify application invariants such as no overlapping active claims between different agents.
 
+## Regenerating the Demo
+
+The animated SVG is generated from the real CLI flow in `scripts/demo.sh`. After changing that flow, install `asciinema` and `jq`, then run:
+
+```bash
+npm run build
+npx --yes svg-term-cli@2.1.1 --command './scripts/demo.sh' --out docs/demo.svg --window --width 120 --height 30
+```
+
+Run `scripts/demo.sh` directly first when debugging a failed recording. Do not hand-edit `docs/demo.svg`.
+
 ## Code Style
 
 - Prefer the smallest complete implementation.
