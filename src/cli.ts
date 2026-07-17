@@ -58,6 +58,7 @@ function runWithCoordinator<T>(command: Command, operation: (coordinator: Coordi
 
 const program = new Command()
   .name('sametree')
+  .configureOutput({ writeErr: () => undefined })
   .description('Coordinate coding agents that share a Git working tree.')
   .version('0.1.0')
   .option('--agent <name>', 'unique agent name', process.env.SAMETREE_AGENT)
@@ -95,13 +96,6 @@ program
   .description('Check Git, SQLite, policy, and state integrity.')
   .action((_options: unknown, command: Command) => {
     runWithCoordinator(command, (coordinator) => coordinator.doctor());
-  });
-
-program
-  .command('heartbeat')
-  .description('Renew this session and its active leases.')
-  .action((_options: unknown, command: Command) => {
-    runWithCoordinator(command, (coordinator) => coordinator.heartbeat());
   });
 
 const task = program.command('task').description('Create and coordinate durable tasks.');
