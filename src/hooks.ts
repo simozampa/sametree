@@ -98,12 +98,11 @@ export function checkPreCommit(
     const conflicting = claims.find(
       (claim) =>
         claim.agentName !== agentName &&
-        claimsOverlap(staged, {
-          comparisonPath: repository.ignoreCase
-            ? claim.path.toLocaleLowerCase('en-US')
-            : claim.path,
-          kind: claim.kind,
-        }),
+        (staged.path === claim.path ||
+          claimsOverlap(staged, {
+            comparisonPath: claim.comparisonPath,
+            kind: claim.kind,
+          })),
     );
     if (conflicting) {
       throw new SameTreeError(
