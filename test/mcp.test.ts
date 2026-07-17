@@ -46,4 +46,48 @@ describe('MCP server', () => {
       result: { agent: { name: 'mcp-agent', harness: 'opencode' } },
     });
   });
+
+  it('assigns distinct identities when clients do not provide agent names', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const environment: Record<string, string> = {
+      ...getDefaultEnvironment(),
+      SAMETREE_HARNESS: 'opencode',
+    };
+    delete environment.SAMETREE_AGENT;
+    delete environment.OPENCODE_PID;
+
+    const connect = async () => {
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [mcpPath],
+        cwd: repository.root,
+        env: environment,
+        stderr: 'pipe',
+      });
+      const client = new Client({ name: 'sametree-test', version: '1.0.0' });
+      clients.push(client);
+      await client.connect(transport);
+      return client;
+    };
+
+    const first = await connect();
+    const second = await connect();
+    const firstStatus = (
+      await first.callTool({
+        name: 'sametree_status',
+        arguments: {},
+      })
+    ).structuredContent as { result: { agent: { name: string } } };
+    const secondStatus = (
+      await second.callTool({
+        name: 'sametree_status',
+        arguments: {},
+      })
+    ).structuredContent as { result: { agent: { name: string } } };
+
+    expect(firstStatus.result.agent.name).toMatch(/^opencode-\d+$/u);
+    expect(secondStatus.result.agent.name).toMatch(/^opencode-\d+$/u);
+    expect(secondStatus.result.agent.name).not.toBe(firstStatus.result.agent.name);
+  });
 });

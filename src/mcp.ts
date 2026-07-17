@@ -8,8 +8,16 @@ import { Coordinator } from './coordinator.js';
 import { errorResult } from './errors.js';
 import type { Harness, TaskPriority, TaskStatus } from './types.js';
 
-const agent = process.env.SAMETREE_AGENT ?? '';
 const harness = (process.env.SAMETREE_HARNESS ?? 'other') as Harness;
+const nativeSession =
+  harness === 'claude-code'
+    ? process.env.CLAUDE_CODE_SESSION_ID
+    : harness === 'opencode'
+      ? process.env.OPENCODE_PID
+      : undefined;
+const automaticSuffix =
+  nativeSession?.replace(/[^A-Za-z0-9._-]/gu, '-').replace(/^-+|-+$/gu, '') || String(process.pid);
+const agent = process.env.SAMETREE_AGENT || `${harness}-${automaticSuffix}`.slice(0, 80);
 const coordinator = Coordinator.open({
   agent,
   harness,
