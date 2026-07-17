@@ -56,6 +56,21 @@ describe('path claims', () => {
     expect(() => assertSafeWritePath(root, 'link.ts')).toThrow(/symbolic link/u);
   });
 
+  it('canonicalizes parent aliases and rejects external tree symlinks', () => {
+    const root = temporaryDirectory('sametree-alias-');
+    const outside = temporaryDirectory('sametree-external-');
+    mkdirSync(path.join(root, 'real'));
+    symlinkSync('real', path.join(root, 'alias'));
+    symlinkSync(outside, path.join(root, 'external'));
+
+    expect(normalizeClaim(root, 'alias/shared.ts', 'exact', false).comparisonPath).toBe(
+      'real/shared.ts',
+    );
+    expect(() => normalizeClaim(root, 'external', 'tree', false)).toThrow(
+      /outside the repository/u,
+    );
+  });
+
   it('compares exact and recursive claims at component boundaries', () => {
     const exact = { comparisonPath: 'src/api.ts', kind: 'exact' as const };
     const tree = { comparisonPath: 'src', kind: 'tree' as const };
