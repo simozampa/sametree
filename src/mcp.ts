@@ -14,7 +14,7 @@ const coordinator = Coordinator.open({
   agent,
   harness,
   role: process.env.SAMETREE_ROLE ?? 'implementer',
-  cwd: process.env.SAMETREE_CWD ?? process.cwd(),
+  cwd: process.env.SAMETREE_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
 });
 
 const server = new McpServer({ name: 'sametree', version: '0.1.0' });
