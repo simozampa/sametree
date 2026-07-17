@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "sessionTtlSeconds": 90,
+  "claimTtlSeconds": 900,
+  "taskLeaseSeconds": 900,
+  "handoffTtlSeconds": 86400,
+  "maxStagedLines": 400,
+  "requireConventionalCommits": true,
+  "forbidCoAuthoredBy": true
+}
