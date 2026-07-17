@@ -15,8 +15,22 @@ function isInside(root: string, candidate: string): boolean {
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..');
 }
 
-/** Check existing parent components without replacing the repository path's identity. */
-function resolveSafely(repositoryRoot: string, input: string): string {
+function existingMetadata(target: string): ReturnType<typeof lstatSync> | null {
+  try {
+    return lstatSync(target);
+  } catch (error) {
+    const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+    if (code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/** Preserve the display path while resolving parent aliases for conflict comparison. */
+function resolveSafely(
+  repositoryRoot: string,
+  input: string,
+  kind: ClaimKind,
+): { comparison: string; lexical: string } {
   const root = realpathSync(repositoryRoot);
   const absolute = path.resolve(root, input);
   if (!isInside(root, absolute)) {
@@ -25,41 +39,50 @@ function resolveSafely(repositoryRoot: string, input: string): string {
     });
   }
 
-  const segments = path.relative(root, absolute).split(path.sep).filter(Boolean);
-  let current = root;
-  for (const segment of segments.slice(0, -1)) {
-    current = path.join(current, segment);
-    let metadata: ReturnType<typeof lstatSync>;
-    try {
-      metadata = lstatSync(current);
-    } catch (error) {
-      const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
-      if (code === 'ENOENT') break;
-      throw new SameTreeError('INVALID_INPUT', 'A claimed path has an invalid parent.', {
+  const comparisonTarget = kind === 'tree' ? absolute : path.dirname(absolute);
+  let existingAncestor = comparisonTarget;
+  let metadata = existingMetadata(existingAncestor);
+  while (!metadata && existingAncestor !== root) {
+    existingAncestor = path.dirname(existingAncestor);
+    metadata = existingMetadata(existingAncestor);
+  }
+
+  let resolvedAncestor: string;
+  try {
+    resolvedAncestor = realpathSync(existingAncestor);
+  } catch {
+    throw new SameTreeError('INVALID_INPUT', 'A claimed path has a dangling symbolic link.', {
+      path: input,
+    });
+  }
+  if (existingAncestor !== comparisonTarget && !existingMetadata(resolvedAncestor)?.isDirectory()) {
+    throw new SameTreeError('INVALID_INPUT', 'A claimed path has a non-directory parent.', {
+      path: input,
+    });
+  }
+  const resolvedTarget = path.resolve(
+    resolvedAncestor,
+    path.relative(existingAncestor, comparisonTarget),
+  );
+  if (!isInside(root, resolvedTarget)) {
+    throw new SameTreeError('INVALID_INPUT', 'A claimed path resolves outside the repository.', {
+      path: input,
+    });
+  }
+  if (kind === 'tree') {
+    const targetMetadata = existingMetadata(resolvedTarget);
+    if (targetMetadata && !targetMetadata.isDirectory()) {
+      throw new SameTreeError('INVALID_INPUT', 'A tree claim must refer to a directory path.', {
         path: input,
-        cause: error instanceof Error ? error.message : String(error),
       });
     }
-
-    if (metadata.isSymbolicLink()) {
-      try {
-        const resolved = realpathSync(current);
-        if (!isInside(root, resolved)) {
-          throw new SameTreeError(
-            'INVALID_INPUT',
-            'A claimed path resolves outside the repository.',
-            { path: input },
-          );
-        }
-      } catch (error) {
-        if (error instanceof SameTreeError) throw error;
-        throw new SameTreeError('INVALID_INPUT', 'A claimed path has a dangling symbolic link.', {
-          path: input,
-        });
-      }
-    }
   }
-  return absolute;
+
+  return {
+    lexical: absolute,
+    comparison:
+      kind === 'tree' ? resolvedTarget : path.join(resolvedTarget, path.basename(absolute)),
+  };
 }
 
 export function normalizeClaim(
@@ -72,9 +95,12 @@ export function normalizeClaim(
     throw new SameTreeError('INVALID_INPUT', 'A claimed path must be a non-empty path.');
   }
 
-  const resolved = resolveSafely(repositoryRoot, input.normalize('NFC'));
-  const relative = path.relative(realpathSync(repositoryRoot), resolved);
+  const root = realpathSync(repositoryRoot);
+  const resolved = resolveSafely(repositoryRoot, input.normalize('NFC'), kind);
+  const relative = path.relative(root, resolved.lexical);
+  const comparisonRelative = path.relative(root, resolved.comparison);
   const normalized = (relative || '.').split(path.sep).join('/').normalize('NFC');
+  const comparison = (comparisonRelative || '.').split(path.sep).join('/').normalize('NFC');
 
   if (kind === 'exact' && normalized === '.') {
     throw new SameTreeError('INVALID_INPUT', 'The repository root can only be claimed as a tree.');
@@ -82,7 +108,7 @@ export function normalizeClaim(
 
   return {
     path: normalized,
-    comparisonPath: ignoreCase ? normalized.toLocaleLowerCase('en-US') : normalized,
+    comparisonPath: ignoreCase ? comparison.toLocaleLowerCase('en-US') : comparison,
     kind,
   };
 }
