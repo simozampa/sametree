@@ -39,6 +39,7 @@ export interface Task {
 export interface PathClaim {
   id: string;
   path: string;
+  comparisonPath: string;
   kind: ClaimKind;
   agentName: string;
   expiresAt: number;
