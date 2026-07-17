@@ -531,10 +531,7 @@ export function setupProject(
             },
           }
         : {}),
-      restartCommands: [
-        ...(claudePlan ? ['SAMETREE_AGENT=<unique-name> SAMETREE_ROLE=<role> claude'] : []),
-        ...(openCodePlan ? ['SAMETREE_AGENT=<unique-name> SAMETREE_ROLE=<role> opencode'] : []),
-      ],
+      restartCommands: [...(claudePlan ? ['claude'] : []), ...(openCodePlan ? ['opencode'] : [])],
     };
   } catch (error) {
     const rollbackIssues = [

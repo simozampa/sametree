@@ -55,6 +55,7 @@ describe('project setup', () => {
       mcp: 'added',
       instructions: 'added',
     });
+    expect(first.restartCommands).toEqual(['opencode']);
     expect(config.mcp.sametree).toMatchObject({
       command: ['sametree-mcp'],
       environment: { SAMETREE_HARNESS: 'opencode' },
@@ -149,6 +150,7 @@ describe('project setup', () => {
     const add = calls.find((call) => call.args[0] === 'mcp' && call.args[1] === 'add');
 
     expect(result.claude).toEqual({ mcp: 'added', instructions: 'added' });
+    expect(result.restartCommands).toEqual(['claude']);
     expect(add).toEqual({
       cwd: repository.root,
       args: [
