@@ -1,0 +1,1033 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+
+import type { Database as DatabaseType } from 'better-sqlite3';
+
+import { loadConfig, POLICY_FILE, type SameTreeConfig } from './config.js';
+import { immediateTransaction, openDatabase } from './database.js';
+import { SameTreeError } from './errors.js';
+import { type RepositoryContext, resolveRepository } from './git.js';
+import { claimsOverlap, normalizeClaim } from './paths.js';
+import type {
+  Agent,
+  ClaimKind,
+  CoordinationEvent,
+  CoordinationSnapshot,
+  DoctorReport,
+  Handoff,
+  Harness,
+  Message,
+  PathClaim,
+  PolicyDocument,
+  Session,
+  Task,
+  TaskPriority,
+  TaskStatus,
+} from './types.js';
+
+type Row = Record<string, unknown>;
+
+export interface CoordinatorOptions {
+  agent: string;
+  cwd?: string;
+  harness?: Harness;
+  role?: string;
+  databasePath?: string;
+  clock?: () => number;
+}
+
+export interface CreateTaskInput {
+  title: string;
+  description?: string;
+  priority?: TaskPriority;
+  assignee?: string;
+  dependencies?: string[];
+}
+
+export interface UpdateTaskInput {
+  status?: TaskStatus;
+  description?: string;
+  priority?: TaskPriority;
+  expectedRevision?: number;
+}
+
+export interface AcquireClaimInput {
+  path: string;
+  kind?: ClaimKind;
+}
+
+function createId(prefix: string): string {
+  return `${prefix}_${randomUUID()}`;
+}
+
+function requireText(value: string, field: string, maximum: number): string {
+  const normalized = value.trim();
+  if (!normalized || normalized.length > maximum) {
+    throw new SameTreeError(
+      'INVALID_INPUT',
+      `${field} must contain between 1 and ${maximum} characters.`,
+    );
+  }
+  return normalized;
+}
+
+function validateAgentName(name: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u.test(name)) {
+    throw new SameTreeError(
+      'INVALID_INPUT',
+      'Agent names must start with a letter or number and use only letters, numbers, ., _, or -.',
+      { agent: name },
+    );
+  }
+  return name;
+}
+
+function numberValue(row: Row, key: string): number {
+  return Number(row[key]);
+}
+
+function nullableNumber(row: Row, key: string): number | null {
+  return row[key] === null || row[key] === undefined ? null : Number(row[key]);
+}
+
+function stringValue(row: Row, key: string): string {
+  return String(row[key]);
+}
+
+function nullableString(row: Row, key: string): string | null {
+  return row[key] === null || row[key] === undefined ? null : String(row[key]);
+}
+
+function parseObject(value: unknown): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(String(value));
+  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : {};
+}
+
+function mapAgent(row: Row): Agent {
+  return {
+    name: stringValue(row, 'name'),
+    harness: stringValue(row, 'harness') as Harness,
+    role: stringValue(row, 'role'),
+    createdAt: numberValue(row, 'created_at'),
+    lastSeenAt: numberValue(row, 'last_seen_at'),
+  };
+}
+
+function mapSession(row: Row): Session {
+  return {
+    id: stringValue(row, 'id'),
+    agentName: stringValue(row, 'agent_name'),
+    processId: numberValue(row, 'process_id'),
+    startedAt: numberValue(row, 'started_at'),
+    lastHeartbeatAt: numberValue(row, 'last_heartbeat_at'),
+    expiresAt: numberValue(row, 'expires_at'),
+    status: stringValue(row, 'status') as Session['status'],
+  };
+}
+
+function mapTask(row: Row, dependencies: string[]): Task {
+  return {
+    id: stringValue(row, 'id'),
+    title: stringValue(row, 'title'),
+    description: stringValue(row, 'description'),
+    status: stringValue(row, 'status') as TaskStatus,
+    priority: stringValue(row, 'priority') as TaskPriority,
+    assignee: nullableString(row, 'assignee'),
+    leaseExpiresAt: nullableNumber(row, 'lease_expires_at'),
+    revision: numberValue(row, 'revision'),
+    createdAt: numberValue(row, 'created_at'),
+    updatedAt: numberValue(row, 'updated_at'),
+    dependencies,
+  };
+}
+
+function mapClaim(row: Row): PathClaim {
+  return {
+    id: stringValue(row, 'id'),
+    path: stringValue(row, 'path'),
+    kind: stringValue(row, 'kind') as ClaimKind,
+    agentName: stringValue(row, 'agent_name'),
+    expiresAt: numberValue(row, 'expires_at'),
+    createdAt: numberValue(row, 'created_at'),
+  };
+}
+
+function mapMessage(row: Row): Message {
+  return {
+    id: stringValue(row, 'id'),
+    sender: stringValue(row, 'sender'),
+    recipient: nullableString(row, 'recipient'),
+    subject: stringValue(row, 'subject'),
+    body: stringValue(row, 'body'),
+    threadId: stringValue(row, 'thread_id'),
+    taskId: nullableString(row, 'task_id'),
+    createdAt: numberValue(row, 'created_at'),
+    readAt: nullableNumber(row, 'read_at'),
+  };
+}
+
+function mapHandoff(row: Row): Handoff {
+  return {
+    id: stringValue(row, 'id'),
+    taskId: stringValue(row, 'task_id'),
+    fromAgent: stringValue(row, 'from_agent'),
+    toAgent: stringValue(row, 'to_agent'),
+    summary: stringValue(row, 'summary'),
+    context: parseObject(row.context_json),
+    status: stringValue(row, 'status') as Handoff['status'],
+    createdAt: numberValue(row, 'created_at'),
+    expiresAt: numberValue(row, 'expires_at'),
+    respondedAt: nullableNumber(row, 'responded_at'),
+  };
+}
+
+/** Shared domain API used by both the CLI and MCP adapters. */
+export class Coordinator {
+  readonly repository: RepositoryContext;
+  readonly config: SameTreeConfig;
+  readonly agentName: string;
+  readonly sessionId: string;
+
+  readonly #database: DatabaseType;
+  readonly #clock: () => number;
+  #closed = false;
+
+  private constructor(options: CoordinatorOptions) {
+    this.repository = resolveRepository(options.cwd);
+    this.config = loadConfig(this.repository.root);
+    this.agentName = validateAgentName(options.agent);
+    this.#clock = options.clock ?? Date.now;
+    this.#database = openDatabase(this.repository, {
+      ...(options.databasePath ? { databasePath: options.databasePath } : {}),
+      now: this.#clock(),
+    });
+    this.sessionId = createId('session');
+
+    const now = this.#clock();
+    immediateTransaction(this.#database, () => {
+      this.#database
+        .prepare(
+          `INSERT INTO agents (name, harness, role, created_at, last_seen_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(name) DO UPDATE SET
+             harness = excluded.harness,
+             role = excluded.role,
+             last_seen_at = excluded.last_seen_at`,
+        )
+        .run(this.agentName, options.harness ?? 'other', options.role ?? 'implementer', now, now);
+      this.#database
+        .prepare(
+          `INSERT INTO sessions
+            (id, agent_name, process_id, started_at, last_heartbeat_at, expires_at, status)
+           VALUES (?, ?, ?, ?, ?, ?, 'active')`,
+        )
+        .run(
+          this.sessionId,
+          this.agentName,
+          process.pid,
+          now,
+          now,
+          now + this.config.sessionTtlSeconds * 1_000,
+        );
+      this.#recordEvent('session.started', 'session', this.sessionId, {
+        harness: options.harness ?? 'other',
+        role: options.role ?? 'implementer',
+      });
+    });
+  }
+
+  static open(options: CoordinatorOptions): Coordinator {
+    if (!options.agent) {
+      throw new SameTreeError(
+        'AGENT_REQUIRED',
+        'Provide a unique agent name with --agent or SAMETREE_AGENT.',
+      );
+    }
+    return new Coordinator(options);
+  }
+
+  #recordEvent(
+    kind: string,
+    entityType: string,
+    entityId: string,
+    payload: Record<string, unknown> = {},
+  ): void {
+    this.#database
+      .prepare(
+        `INSERT INTO events
+          (id, kind, actor, entity_type, entity_id, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        createId('event'),
+        kind,
+        this.agentName,
+        entityType,
+        entityId,
+        JSON.stringify(payload),
+        this.#clock(),
+      );
+  }
+
+  #requireAgent(name: string): void {
+    const found = this.#database.prepare('SELECT 1 FROM agents WHERE name = ?').get(name);
+    if (!found) throw new SameTreeError('NOT_FOUND', `Agent '${name}' is not registered.`);
+  }
+
+  #dependencies(taskId: string): string[] {
+    return (
+      this.#database
+        .prepare('SELECT depends_on FROM task_dependencies WHERE task_id = ? ORDER BY depends_on')
+        .all(taskId) as Row[]
+    ).map((row) => stringValue(row, 'depends_on'));
+  }
+
+  #task(taskId: string): Task {
+    const row = this.#database.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as
+      | Row
+      | undefined;
+    if (!row) throw new SameTreeError('NOT_FOUND', `Task '${taskId}' does not exist.`);
+    return mapTask(row, this.#dependencies(taskId));
+  }
+
+  heartbeat(): Session {
+    const now = this.#clock();
+    const sessionExpiry = now + this.config.sessionTtlSeconds * 1_000;
+    const claimExpiry = now + this.config.claimTtlSeconds * 1_000;
+    const taskExpiry = now + this.config.taskLeaseSeconds * 1_000;
+
+    return immediateTransaction(this.#database, () => {
+      this.#database
+        .prepare(
+          `UPDATE sessions
+           SET last_heartbeat_at = ?, expires_at = ?, status = 'active'
+           WHERE id = ?`,
+        )
+        .run(now, sessionExpiry, this.sessionId);
+      this.#database
+        .prepare('UPDATE agents SET last_seen_at = ? WHERE name = ?')
+        .run(now, this.agentName);
+      this.#database
+        .prepare('UPDATE path_claims SET expires_at = ? WHERE session_id = ? AND expires_at > ?')
+        .run(claimExpiry, this.sessionId, now);
+      this.#database
+        .prepare(
+          'UPDATE tasks SET lease_expires_at = ? WHERE claimed_by_session = ? AND status = ?',
+        )
+        .run(taskExpiry, this.sessionId, 'in_progress');
+
+      const row = this.#database.prepare('SELECT * FROM sessions WHERE id = ?').get(this.sessionId);
+      return mapSession(row as Row);
+    });
+  }
+
+  close(options: { releaseClaims?: boolean } = {}): void {
+    if (this.#closed) return;
+    immediateTransaction(this.#database, () => {
+      if (options.releaseClaims) {
+        this.#database.prepare('DELETE FROM path_claims WHERE session_id = ?').run(this.sessionId);
+        this.#database
+          .prepare(
+            `UPDATE tasks SET claimed_by_session = NULL, lease_expires_at = NULL, revision = revision + 1
+             WHERE claimed_by_session = ? AND status = 'in_progress'`,
+          )
+          .run(this.sessionId);
+      }
+      this.#database
+        .prepare("UPDATE sessions SET status = 'closed', expires_at = ? WHERE id = ?")
+        .run(this.#clock(), this.sessionId);
+      this.#recordEvent('session.closed', 'session', this.sessionId, {
+        releasedClaims: options.releaseClaims ?? false,
+      });
+    });
+    this.#database.close();
+    this.#closed = true;
+  }
+
+  listAgents(): Agent[] {
+    return (
+      this.#database.prepare('SELECT * FROM agents ORDER BY last_seen_at DESC, name').all() as Row[]
+    ).map(mapAgent);
+  }
+
+  createTask(input: CreateTaskInput): Task {
+    const id = createId('task');
+    const title = requireText(input.title, 'Task title', 200);
+    const description = input.description?.trim() ?? '';
+    if (description.length > 20_000) {
+      throw new SameTreeError('INVALID_INPUT', 'Task descriptions cannot exceed 20000 characters.');
+    }
+    const priority = input.priority ?? 'normal';
+    const dependencies = [...new Set(input.dependencies ?? [])];
+    const now = this.#clock();
+
+    return immediateTransaction(this.#database, () => {
+      if (input.assignee) this.#requireAgent(input.assignee);
+      for (const dependency of dependencies) this.#task(dependency);
+
+      this.#database
+        .prepare(
+          `INSERT INTO tasks
+            (id, title, description, status, priority, assignee, created_at, updated_at)
+           VALUES (?, ?, ?, 'ready', ?, ?, ?, ?)`,
+        )
+        .run(id, title, description, priority, input.assignee ?? null, now, now);
+      const addDependency = this.#database.prepare(
+        'INSERT INTO task_dependencies (task_id, depends_on) VALUES (?, ?)',
+      );
+      for (const dependency of dependencies) addDependency.run(id, dependency);
+      this.#recordEvent('task.created', 'task', id, { dependencies, priority });
+      return this.#task(id);
+    });
+  }
+
+  listTasks(options: { status?: TaskStatus } = {}): Task[] {
+    const rows = options.status
+      ? (this.#database
+          .prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at')
+          .all(options.status) as Row[])
+      : (this.#database.prepare('SELECT * FROM tasks ORDER BY created_at').all() as Row[]);
+    return rows.map((row) => mapTask(row, this.#dependencies(stringValue(row, 'id'))));
+  }
+
+  claimTask(taskId: string): Task {
+    const now = this.#clock();
+    return immediateTransaction(this.#database, () => {
+      const task = this.#task(taskId);
+      if (task.status === 'done' || task.status === 'cancelled' || task.status === 'blocked') {
+        throw new SameTreeError('TASK_UNAVAILABLE', `Task '${taskId}' is ${task.status}.`);
+      }
+
+      const blockers = this.#database
+        .prepare(
+          `SELECT dependency.id
+           FROM task_dependencies edge
+           JOIN tasks dependency ON dependency.id = edge.depends_on
+           WHERE edge.task_id = ? AND dependency.status <> 'done'`,
+        )
+        .all(taskId) as Row[];
+      if (blockers.length > 0) {
+        throw new SameTreeError('TASK_BLOCKED', `Task '${taskId}' has unfinished dependencies.`, {
+          dependencies: blockers.map((row) => stringValue(row, 'id')),
+        });
+      }
+
+      if (
+        task.status === 'in_progress' &&
+        task.leaseExpiresAt !== null &&
+        task.leaseExpiresAt > now &&
+        task.assignee !== this.agentName
+      ) {
+        throw new SameTreeError(
+          'TASK_UNAVAILABLE',
+          `Task '${taskId}' is leased by ${task.assignee}.`,
+          {
+            assignee: task.assignee,
+            leaseExpiresAt: task.leaseExpiresAt,
+          },
+        );
+      }
+
+      const takeover = task.status === 'in_progress' && task.assignee !== this.agentName;
+      this.#database
+        .prepare(
+          `UPDATE tasks SET
+             status = 'in_progress', assignee = ?, claimed_by_session = ?, lease_expires_at = ?,
+             revision = revision + 1, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          this.agentName,
+          this.sessionId,
+          now + this.config.taskLeaseSeconds * 1_000,
+          now,
+          taskId,
+        );
+      this.#recordEvent(takeover ? 'task.taken_over' : 'task.claimed', 'task', taskId, {
+        previousAssignee: task.assignee,
+      });
+      return this.#task(taskId);
+    });
+  }
+
+  updateTask(taskId: string, input: UpdateTaskInput): Task {
+    return immediateTransaction(this.#database, () => {
+      const task = this.#task(taskId);
+      if (input.expectedRevision !== undefined && input.expectedRevision !== task.revision) {
+        throw new SameTreeError(
+          'TASK_UNAVAILABLE',
+          `Task '${taskId}' changed from revision ${input.expectedRevision} to ${task.revision}.`,
+          { currentRevision: task.revision },
+        );
+      }
+      if (task.assignee && task.assignee !== this.agentName) {
+        throw new SameTreeError(
+          'NOT_ASSIGNED',
+          `Task '${taskId}' is assigned to ${task.assignee}.`,
+        );
+      }
+
+      const status = input.status ?? task.status;
+      const description = input.description?.trim() ?? task.description;
+      if (description.length > 20_000) {
+        throw new SameTreeError(
+          'INVALID_INPUT',
+          'Task descriptions cannot exceed 20000 characters.',
+        );
+      }
+      const active = status === 'in_progress';
+      this.#database
+        .prepare(
+          `UPDATE tasks SET
+             status = ?, description = ?, priority = ?, assignee = COALESCE(assignee, ?),
+             claimed_by_session = ?, lease_expires_at = ?, revision = revision + 1, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          status,
+          description,
+          input.priority ?? task.priority,
+          this.agentName,
+          active ? this.sessionId : null,
+          active ? this.#clock() + this.config.taskLeaseSeconds * 1_000 : null,
+          this.#clock(),
+          taskId,
+        );
+      this.#recordEvent('task.updated', 'task', taskId, {
+        fromStatus: task.status,
+        toStatus: status,
+      });
+      return this.#task(taskId);
+    });
+  }
+
+  acquireClaims(inputs: AcquireClaimInput[], ttlSeconds?: number): PathClaim[] {
+    if (inputs.length === 0 || inputs.length > 100) {
+      throw new SameTreeError('INVALID_INPUT', 'Acquire between 1 and 100 paths at once.');
+    }
+    const ttl = ttlSeconds ?? this.config.claimTtlSeconds;
+    if (!Number.isInteger(ttl) || ttl < 30 || ttl > 86_400) {
+      throw new SameTreeError('INVALID_INPUT', 'Claim TTL must be between 30 and 86400 seconds.');
+    }
+
+    const requested = inputs.map((input) =>
+      normalizeClaim(
+        this.repository.root,
+        input.path,
+        input.kind ?? (input.path.endsWith('/') ? 'tree' : 'exact'),
+        this.repository.ignoreCase,
+      ),
+    );
+    const unique = requested.filter(
+      (claim, index, all) =>
+        all.findIndex(
+          (candidate) =>
+            candidate.comparisonPath === claim.comparisonPath && candidate.kind === claim.kind,
+        ) === index,
+    );
+    const now = this.#clock();
+    const expiresAt = now + ttl * 1_000;
+
+    return immediateTransaction(this.#database, () => {
+      this.#database.prepare('DELETE FROM path_claims WHERE expires_at <= ?').run(now);
+      const active = this.#database
+        .prepare('SELECT * FROM path_claims WHERE expires_at > ?')
+        .all(now) as Row[];
+
+      for (const claim of unique) {
+        const conflict = active.find(
+          (row) =>
+            stringValue(row, 'agent_name') !== this.agentName &&
+            claimsOverlap(claim, {
+              comparisonPath: stringValue(row, 'comparison_path'),
+              kind: stringValue(row, 'kind') as ClaimKind,
+            }),
+        );
+        if (conflict) {
+          throw new SameTreeError(
+            'CLAIM_CONFLICT',
+            `${claim.path} overlaps ${stringValue(conflict, 'agent_name')}'s active claim.`,
+            { conflictingClaim: mapClaim(conflict) },
+          );
+        }
+      }
+
+      const results: PathClaim[] = [];
+      for (const claim of unique) {
+        const own = active.find(
+          (row) =>
+            stringValue(row, 'agent_name') === this.agentName &&
+            stringValue(row, 'comparison_path') === claim.comparisonPath &&
+            stringValue(row, 'kind') === claim.kind,
+        );
+        if (own) {
+          this.#database
+            .prepare('UPDATE path_claims SET session_id = ?, expires_at = ? WHERE id = ?')
+            .run(this.sessionId, expiresAt, stringValue(own, 'id'));
+          results.push({ ...mapClaim(own), expiresAt });
+          continue;
+        }
+
+        const id = createId('claim');
+        this.#database
+          .prepare(
+            `INSERT INTO path_claims
+              (id, path, comparison_path, kind, agent_name, session_id, expires_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            id,
+            claim.path,
+            claim.comparisonPath,
+            claim.kind,
+            this.agentName,
+            this.sessionId,
+            expiresAt,
+            now,
+          );
+        results.push({
+          id,
+          path: claim.path,
+          kind: claim.kind,
+          agentName: this.agentName,
+          expiresAt,
+          createdAt: now,
+        });
+      }
+      this.#recordEvent('claim.acquired', 'claim', results.map((claim) => claim.id).join(','), {
+        paths: results.map((claim) => claim.path),
+        expiresAt,
+      });
+      return results;
+    });
+  }
+
+  listClaims(options: { includeExpired?: boolean } = {}): PathClaim[] {
+    const rows = options.includeExpired
+      ? (this.#database
+          .prepare('SELECT * FROM path_claims ORDER BY path, created_at')
+          .all() as Row[])
+      : (this.#database
+          .prepare('SELECT * FROM path_claims WHERE expires_at > ? ORDER BY path, created_at')
+          .all(this.#clock()) as Row[]);
+    return rows.map(mapClaim);
+  }
+
+  releaseClaims(input: { ids?: string[]; all?: boolean } = {}): { released: number } {
+    const ids = [...new Set(input.ids ?? [])];
+    if (!input.all && ids.length === 0) {
+      throw new SameTreeError(
+        'INVALID_INPUT',
+        'Provide claim IDs or request release of all claims.',
+      );
+    }
+
+    return immediateTransaction(this.#database, () => {
+      let released = 0;
+      if (input.all) {
+        released = this.#database
+          .prepare('DELETE FROM path_claims WHERE agent_name = ?')
+          .run(this.agentName).changes;
+      } else {
+        const remove = this.#database.prepare(
+          'DELETE FROM path_claims WHERE id = ? AND agent_name = ?',
+        );
+        for (const id of ids) released += remove.run(id, this.agentName).changes;
+      }
+      this.#recordEvent('claim.released', 'claim', ids.join(',') || '*', { released });
+      return { released };
+    });
+  }
+
+  sendMessage(input: {
+    to?: string;
+    subject: string;
+    body: string;
+    threadId?: string;
+    taskId?: string;
+  }): Message {
+    const id = createId('message');
+    const subject = requireText(input.subject, 'Message subject', 200);
+    const body = requireText(input.body, 'Message body', 50_000);
+    const now = this.#clock();
+
+    return immediateTransaction(this.#database, () => {
+      if (input.to) this.#requireAgent(input.to);
+      if (input.taskId) this.#task(input.taskId);
+      this.#database
+        .prepare(
+          `INSERT INTO messages
+            (id, sender, recipient, subject, body, thread_id, task_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          this.agentName,
+          input.to ?? null,
+          subject,
+          body,
+          input.threadId ?? id,
+          input.taskId ?? null,
+          now,
+        );
+      this.#recordEvent('message.sent', 'message', id, {
+        recipient: input.to ?? null,
+        taskId: input.taskId ?? null,
+      });
+      return {
+        id,
+        sender: this.agentName,
+        recipient: input.to ?? null,
+        subject,
+        body,
+        threadId: input.threadId ?? id,
+        taskId: input.taskId ?? null,
+        createdAt: now,
+        readAt: null,
+      };
+    });
+  }
+
+  inbox(options: { unreadOnly?: boolean; limit?: number } = {}): Message[] {
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 500);
+    const unread = options.unreadOnly ? 'AND receipt.read_at IS NULL' : '';
+    return (
+      this.#database
+        .prepare(
+          `SELECT message.*, receipt.read_at
+           FROM messages message
+           LEFT JOIN message_receipts receipt
+             ON receipt.message_id = message.id AND receipt.agent_name = ?
+           WHERE (message.recipient = ? OR (message.recipient IS NULL AND message.sender <> ?))
+             ${unread}
+           ORDER BY message.created_at DESC
+           LIMIT ?`,
+        )
+        .all(this.agentName, this.agentName, this.agentName, limit) as Row[]
+    ).map(mapMessage);
+  }
+
+  acknowledgeMessage(messageId: string): Message {
+    return immediateTransaction(this.#database, () => {
+      const row = this.#database
+        .prepare(
+          `SELECT message.*, receipt.read_at
+           FROM messages message
+           LEFT JOIN message_receipts receipt
+             ON receipt.message_id = message.id AND receipt.agent_name = ?
+           WHERE message.id = ?`,
+        )
+        .get(this.agentName, messageId) as Row | undefined;
+      if (!row) throw new SameTreeError('NOT_FOUND', `Message '${messageId}' does not exist.`);
+      const recipient = nullableString(row, 'recipient');
+      if (recipient !== null && recipient !== this.agentName) {
+        throw new SameTreeError(
+          'NOT_ASSIGNED',
+          `Message '${messageId}' is addressed to ${recipient}.`,
+        );
+      }
+
+      const readAt = this.#clock();
+      this.#database
+        .prepare(
+          `INSERT INTO message_receipts (message_id, agent_name, read_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(message_id, agent_name) DO UPDATE SET read_at = excluded.read_at`,
+        )
+        .run(messageId, this.agentName, readAt);
+      this.#recordEvent('message.acknowledged', 'message', messageId);
+      return { ...mapMessage(row), readAt };
+    });
+  }
+
+  offerHandoff(input: {
+    taskId: string;
+    to: string;
+    summary: string;
+    context?: Record<string, unknown>;
+    claimIds?: string[];
+  }): Handoff {
+    const id = createId('handoff');
+    const summary = requireText(input.summary, 'Handoff summary', 20_000);
+    const claimIds = [...new Set(input.claimIds ?? [])];
+    const now = this.#clock();
+    const expiresAt = now + this.config.handoffTtlSeconds * 1_000;
+
+    return immediateTransaction(this.#database, () => {
+      this.#requireAgent(input.to);
+      if (input.to === this.agentName) {
+        throw new SameTreeError('INVALID_INPUT', 'A handoff recipient must be another agent.');
+      }
+      const task = this.#task(input.taskId);
+      if (task.assignee !== this.agentName) {
+        throw new SameTreeError('NOT_ASSIGNED', `Task '${input.taskId}' is not assigned to you.`);
+      }
+      for (const claimId of claimIds) {
+        const owned = this.#database
+          .prepare('SELECT 1 FROM path_claims WHERE id = ? AND agent_name = ? AND expires_at > ?')
+          .get(claimId, this.agentName, now);
+        if (!owned) {
+          throw new SameTreeError(
+            'NOT_ASSIGNED',
+            `Claim '${claimId}' is not active and owned by you.`,
+          );
+        }
+      }
+
+      const context = { ...(input.context ?? {}), claimIds };
+      this.#database
+        .prepare(
+          `INSERT INTO handoffs
+            (id, task_id, from_agent, to_agent, summary, context_json, task_revision,
+             status, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'offered', ?, ?)`,
+        )
+        .run(
+          id,
+          input.taskId,
+          this.agentName,
+          input.to,
+          summary,
+          JSON.stringify(context),
+          task.revision,
+          now,
+          expiresAt,
+        );
+      this.#recordEvent('handoff.offered', 'handoff', id, {
+        taskId: input.taskId,
+        to: input.to,
+      });
+      const row = this.#database.prepare('SELECT * FROM handoffs WHERE id = ?').get(id);
+      return mapHandoff(row as Row);
+    });
+  }
+
+  listHandoffs(options: { pendingOnly?: boolean } = {}): Handoff[] {
+    const now = this.#clock();
+    return immediateTransaction(this.#database, () => {
+      this.#database
+        .prepare(
+          "UPDATE handoffs SET status = 'expired' WHERE status = 'offered' AND expires_at <= ?",
+        )
+        .run(now);
+      const rows = options.pendingOnly
+        ? (this.#database
+            .prepare(
+              `SELECT * FROM handoffs
+               WHERE to_agent = ? AND status = 'offered'
+               ORDER BY created_at DESC`,
+            )
+            .all(this.agentName) as Row[])
+        : (this.#database
+            .prepare(
+              `SELECT * FROM handoffs
+               WHERE to_agent = ? OR from_agent = ?
+               ORDER BY created_at DESC`,
+            )
+            .all(this.agentName, this.agentName) as Row[]);
+      return rows.map(mapHandoff);
+    });
+  }
+
+  respondToHandoff(handoffId: string, accept: boolean): Handoff {
+    const now = this.#clock();
+    return immediateTransaction(this.#database, () => {
+      const row = this.#database.prepare('SELECT * FROM handoffs WHERE id = ?').get(handoffId) as
+        | Row
+        | undefined;
+      if (!row) throw new SameTreeError('NOT_FOUND', `Handoff '${handoffId}' does not exist.`);
+      if (stringValue(row, 'to_agent') !== this.agentName) {
+        throw new SameTreeError(
+          'NOT_ASSIGNED',
+          `Handoff '${handoffId}' is addressed to another agent.`,
+        );
+      }
+      if (stringValue(row, 'status') !== 'offered' || numberValue(row, 'expires_at') <= now) {
+        throw new SameTreeError('HANDOFF_CONFLICT', `Handoff '${handoffId}' is no longer active.`);
+      }
+
+      const task = this.#task(stringValue(row, 'task_id'));
+      if (accept && task.revision !== numberValue(row, 'task_revision')) {
+        throw new SameTreeError(
+          'HANDOFF_CONFLICT',
+          `Task '${task.id}' changed after this handoff was offered.`,
+          { currentRevision: task.revision, offeredRevision: numberValue(row, 'task_revision') },
+        );
+      }
+
+      const status = accept ? 'accepted' : 'rejected';
+      this.#database
+        .prepare('UPDATE handoffs SET status = ?, responded_at = ? WHERE id = ?')
+        .run(status, now, handoffId);
+
+      if (accept) {
+        this.#database
+          .prepare(
+            `UPDATE tasks SET assignee = ?, claimed_by_session = ?, lease_expires_at = ?,
+               status = 'in_progress', revision = revision + 1, updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(
+            this.agentName,
+            this.sessionId,
+            now + this.config.taskLeaseSeconds * 1_000,
+            now,
+            task.id,
+          );
+
+        const context = parseObject(row.context_json);
+        const claimIds = Array.isArray(context.claimIds)
+          ? context.claimIds.filter((value): value is string => typeof value === 'string')
+          : [];
+        const transfer = this.#database.prepare(
+          `UPDATE path_claims SET agent_name = ?, session_id = ?, expires_at = ?
+           WHERE id = ? AND agent_name = ? AND expires_at > ?`,
+        );
+        for (const claimId of claimIds) {
+          transfer.run(
+            this.agentName,
+            this.sessionId,
+            now + this.config.claimTtlSeconds * 1_000,
+            claimId,
+            stringValue(row, 'from_agent'),
+            now,
+          );
+        }
+      }
+
+      this.#recordEvent(`handoff.${status}`, 'handoff', handoffId, { taskId: task.id });
+      return mapHandoff({ ...row, status, responded_at: now });
+    });
+  }
+
+  getPolicy(): PolicyDocument {
+    const policyPath = path.join(this.repository.root, POLICY_FILE);
+    if (!existsSync(policyPath)) {
+      throw new SameTreeError(
+        'POLICY_NOT_FOUND',
+        `No policy exists at ${policyPath}; run 'sametree init'.`,
+      );
+    }
+    const content = readFileSync(policyPath, 'utf8');
+    const hash = createHash('sha256').update(content).digest('hex');
+    const ack = this.#database
+      .prepare('SELECT acknowledged_at FROM policy_acks WHERE policy_hash = ? AND agent_name = ?')
+      .get(hash, this.agentName) as Row | undefined;
+    return {
+      content,
+      hash,
+      path: policyPath,
+      acknowledgedAt: ack ? numberValue(ack, 'acknowledged_at') : null,
+    };
+  }
+
+  acknowledgePolicy(hash: string): PolicyDocument {
+    const policy = this.getPolicy();
+    if (policy.hash !== hash) {
+      throw new SameTreeError(
+        'INVALID_INPUT',
+        'The policy changed; read and acknowledge the new hash.',
+        {
+          currentHash: policy.hash,
+        },
+      );
+    }
+    const acknowledgedAt = this.#clock();
+    immediateTransaction(this.#database, () => {
+      this.#database
+        .prepare(
+          `INSERT INTO policy_acks (policy_hash, agent_name, acknowledged_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(policy_hash, agent_name) DO UPDATE
+             SET acknowledged_at = excluded.acknowledged_at`,
+        )
+        .run(hash, this.agentName, acknowledgedAt);
+      this.#recordEvent('policy.acknowledged', 'policy', hash);
+    });
+    return { ...policy, acknowledgedAt };
+  }
+
+  events(options: { after?: number; limit?: number } = {}): CoordinationEvent[] {
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 1_000);
+    return (
+      this.#database
+        .prepare('SELECT * FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?')
+        .all(options.after ?? 0, limit) as Row[]
+    ).map((row) => ({
+      sequence: numberValue(row, 'sequence'),
+      id: stringValue(row, 'id'),
+      kind: stringValue(row, 'kind'),
+      actor: stringValue(row, 'actor'),
+      entityType: stringValue(row, 'entity_type'),
+      entityId: stringValue(row, 'entity_id'),
+      payload: parseObject(row.payload_json),
+      createdAt: numberValue(row, 'created_at'),
+    }));
+  }
+
+  snapshot(): CoordinationSnapshot {
+    const agentRow = this.#database
+      .prepare('SELECT * FROM agents WHERE name = ?')
+      .get(this.agentName);
+    const sessionRow = this.#database
+      .prepare('SELECT * FROM sessions WHERE id = ?')
+      .get(this.sessionId);
+    const unread = this.#database
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM messages message
+         LEFT JOIN message_receipts receipt
+           ON receipt.message_id = message.id AND receipt.agent_name = ?
+         WHERE (message.recipient = ? OR (message.recipient IS NULL AND message.sender <> ?))
+           AND receipt.read_at IS NULL`,
+      )
+      .get(this.agentName, this.agentName, this.agentName) as Row;
+    const handoffs = this.#database
+      .prepare(
+        `SELECT COUNT(*) AS count FROM handoffs
+         WHERE to_agent = ? AND status = 'offered' AND expires_at > ?`,
+      )
+      .get(this.agentName, this.#clock()) as Row;
+    const lastEvent = this.#database
+      .prepare('SELECT MAX(sequence) AS sequence FROM events')
+      .get() as Row;
+
+    return {
+      agent: mapAgent(agentRow as Row),
+      session: mapSession(sessionRow as Row),
+      agents: this.listAgents(),
+      tasks: this.listTasks(),
+      claims: this.listClaims(),
+      unreadMessages: numberValue(unread, 'count'),
+      pendingHandoffs: numberValue(handoffs, 'count'),
+      lastEventSequence: nullableNumber(lastEvent, 'sequence') ?? 0,
+    };
+  }
+
+  doctor(): DoctorReport {
+    const sqlite = this.#database.prepare('SELECT sqlite_version() AS version').get() as Row;
+    const integrity = this.#database.pragma('integrity_check', { simple: true }) as string;
+    const foreignKeys = this.#database.pragma('foreign_key_check') as Row[];
+    const journalMode = this.#database.pragma('journal_mode', { simple: true }) as string;
+    const warnings: string[] = [];
+    if (journalMode.toLowerCase() !== 'wal') warnings.push('SQLite journal mode is not WAL.');
+    if (!existsSync(path.join(this.repository.root, POLICY_FILE))) {
+      warnings.push(`Missing ${POLICY_FILE}; run 'sametree init'.`);
+    }
+
+    return {
+      ok: integrity === 'ok' && foreignKeys.length === 0 && warnings.length === 0,
+      repositoryRoot: this.repository.root,
+      databasePath: this.repository.databasePath,
+      sqliteVersion: stringValue(sqlite, 'version'),
+      journalMode,
+      integrity,
+      foreignKeyViolations: foreignKeys.length,
+      policyPresent: existsSync(path.join(this.repository.root, POLICY_FILE)),
+      warnings,
+    };
+  }
+}
