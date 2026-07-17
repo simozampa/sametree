@@ -40,7 +40,21 @@ describe('generated state paths', () => {
     symlinkSync(outsideDirectory(), path.join(repository.root, '.git', 'sametree'));
 
     expect(() => Coordinator.open({ cwd: repository.root, agent: 'agent' })).toThrow(
-      /symlinked SameTree state/u,
+      /symlinked database path/u,
     );
+  });
+
+  it('refuses symlink ancestors in explicit database paths', () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    symlinkSync(outsideDirectory(), path.join(repository.root, 'redirect'));
+
+    expect(() =>
+      Coordinator.open({
+        cwd: repository.root,
+        agent: 'agent',
+        databasePath: path.join(repository.root, 'redirect', 'nested', 'state.sqlite3'),
+      }),
+    ).toThrow(/symlinked database path/u);
   });
 });
