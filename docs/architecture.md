@@ -63,7 +63,7 @@ SQLite provides:
 - Foreign keys, strict tables, checks, and prepared statements.
 - A single embedded file with no service lifecycle.
 
-JSON remains at the boundaries and inside bounded event/context payloads, not as the writable source of truth.
+JSON remains at the boundaries and inside bounded event/context payloads, not as the writable source of truth. Handoff context is limited to 100,000 serialized UTF-8 bytes.
 
 ## Connection Settings
 
