@@ -66,9 +66,8 @@ describe('path claims', () => {
     expect(normalizeClaim(root, 'alias/shared.ts', 'exact', false).comparisonPath).toBe(
       'real/shared.ts',
     );
-    expect(() => normalizeClaim(root, 'external', 'tree', false)).toThrow(
-      /outside the repository/u,
-    );
+    expect(() => normalizeClaim(root, 'alias', 'tree', false)).toThrow(/symbolic link/u);
+    expect(() => normalizeClaim(root, 'external', 'tree', false)).toThrow(/symbolic link/u);
   });
 
   it('compares exact and recursive claims at component boundaries', () => {
