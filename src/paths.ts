@@ -47,6 +47,14 @@ function resolveSafely(
     metadata = existingMetadata(existingAncestor);
   }
 
+  if (kind === 'tree' && existingAncestor === comparisonTarget && metadata?.isSymbolicLink()) {
+    throw new SameTreeError(
+      'INVALID_INPUT',
+      'A tree claim cannot target a symbolic link; claim the real directory path.',
+      { path: input },
+    );
+  }
+
   let resolvedAncestor: string;
   try {
     resolvedAncestor = realpathSync(existingAncestor);
