@@ -89,6 +89,7 @@ const INITIAL_SCHEMA = `
     to_agent TEXT NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
     summary TEXT NOT NULL CHECK(length(summary) BETWEEN 1 AND 20000),
     context_json TEXT NOT NULL CHECK(json_valid(context_json)),
+    task_revision INTEGER NOT NULL CHECK(task_revision > 0),
     status TEXT NOT NULL CHECK(status IN ('offered', 'accepted', 'rejected', 'cancelled', 'expired')),
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
