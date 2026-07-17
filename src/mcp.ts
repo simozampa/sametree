@@ -376,22 +376,35 @@ const heartbeat = setInterval(() => {
 heartbeat.unref();
 
 let closing = false;
+function closeCoordinator(): void {
+  try {
+    coordinator.close();
+  } catch (error) {
+    // Leases expire naturally if contention prevents recording a clean shutdown.
+    process.stderr.write(`SameTree session close failed: ${String(error)}\n`);
+  }
+}
+
 async function shutdown(): Promise<void> {
   if (closing) return;
   closing = true;
   clearInterval(heartbeat);
-  coordinator.close();
-  await server.close();
+  closeCoordinator();
+  try {
+    await server.close();
+  } catch (error) {
+    process.stderr.write(`SameTree transport close failed: ${String(error)}\n`);
+  }
 }
 
 process.once('SIGINT', () => void shutdown());
 process.once('SIGTERM', () => void shutdown());
-process.once('beforeExit', () => coordinator.close());
+process.once('beforeExit', closeCoordinator);
 
 try {
   await server.connect(new StdioServerTransport());
 } catch (error) {
-  coordinator.close();
+  closeCoordinator();
   process.stderr.write(`${JSON.stringify(errorResult(error), null, 2)}\n`);
   process.exitCode = 1;
 }
