@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import { SameTreeError } from './errors.js';
@@ -15,10 +15,7 @@ function isInside(root: string, candidate: string): boolean {
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..');
 }
 
-/**
- * Resolve through the deepest existing ancestor. This catches a claim for a
- * not-yet-created file below a symlink that escapes the repository.
- */
+/** Check existing parent components without replacing the repository path's identity. */
 function resolveSafely(repositoryRoot: string, input: string): string {
   const root = realpathSync(repositoryRoot);
   const absolute = path.resolve(root, input);
@@ -28,20 +25,41 @@ function resolveSafely(repositoryRoot: string, input: string): string {
     });
   }
 
-  let ancestor = absolute;
-  while (!existsSync(ancestor)) {
-    const parent = path.dirname(ancestor);
-    if (parent === ancestor) break;
-    ancestor = parent;
-  }
+  const segments = path.relative(root, absolute).split(path.sep).filter(Boolean);
+  let current = root;
+  for (const segment of segments.slice(0, -1)) {
+    current = path.join(current, segment);
+    let metadata: ReturnType<typeof lstatSync>;
+    try {
+      metadata = lstatSync(current);
+    } catch (error) {
+      const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+      if (code === 'ENOENT') break;
+      throw new SameTreeError('INVALID_INPUT', 'A claimed path has an invalid parent.', {
+        path: input,
+        cause: error instanceof Error ? error.message : String(error),
+      });
+    }
 
-  const resolved = path.resolve(realpathSync(ancestor), path.relative(ancestor, absolute));
-  if (!isInside(root, resolved)) {
-    throw new SameTreeError('INVALID_INPUT', 'A claimed path resolves outside the repository.', {
-      path: input,
-    });
+    if (metadata.isSymbolicLink()) {
+      try {
+        const resolved = realpathSync(current);
+        if (!isInside(root, resolved)) {
+          throw new SameTreeError(
+            'INVALID_INPUT',
+            'A claimed path resolves outside the repository.',
+            { path: input },
+          );
+        }
+      } catch (error) {
+        if (error instanceof SameTreeError) throw error;
+        throw new SameTreeError('INVALID_INPUT', 'A claimed path has a dangling symbolic link.', {
+          path: input,
+        });
+      }
+    }
   }
-  return resolved;
+  return absolute;
 }
 
 export function normalizeClaim(
@@ -67,6 +85,36 @@ export function normalizeClaim(
     comparisonPath: ignoreCase ? normalized.toLocaleLowerCase('en-US') : normalized,
     kind,
   };
+}
+
+/** Refuse writes through symlinks, even when the resolved target remains inside the repository. */
+export function assertSafeWritePath(repositoryRoot: string, target: string): string {
+  const root = realpathSync(repositoryRoot);
+  const absolute = path.resolve(root, target);
+  if (!isInside(root, absolute)) {
+    throw new SameTreeError('INVALID_INPUT', 'A generated path cannot leave the repository.', {
+      path: target,
+    });
+  }
+
+  const segments = path.relative(root, absolute).split(path.sep).filter(Boolean);
+  let current = root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    try {
+      if (lstatSync(current).isSymbolicLink()) {
+        throw new SameTreeError('INVALID_INPUT', 'Refusing to write through a symbolic link.', {
+          path: current,
+        });
+      }
+    } catch (error) {
+      if (error instanceof SameTreeError) throw error;
+      const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+      if (code === 'ENOENT') break;
+      throw error;
+    }
+  }
+  return absolute;
 }
 
 function treeContains(tree: string, candidate: string): boolean {
