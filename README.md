@@ -73,9 +73,12 @@ Configure both harnesses in the repository where agents will collaborate:
 cd /path/to/your/project
 sametree setup --claude --opencode
 SAMETREE_AGENT=human sametree doctor
+opencode
+# Or, in another terminal:
+claude
 ```
 
-Setup initializes the versioned policy, safely merges `opencode.json` or `opencode.jsonc`, updates `AGENTS.md` and `CLAUDE.md`, and registers SameTree with Claude Code at local project scope. Existing configuration and comments are preserved; conflicting entries are refused rather than overwritten.
+Setup initializes the versioned policy, safely merges `opencode.json` or `opencode.jsonc`, updates `AGENTS.md` and `CLAUDE.md`, and registers SameTree with Claude Code at local project scope. Existing configuration and comments are preserved; conflicting entries are refused rather than overwritten. After setup, start agents normally in separate terminals. SameTree assigns each MCP process a unique identity automatically.
 
 SameTree's generated coordination directory is fully versioned:
 
@@ -106,10 +109,15 @@ Reference the generated coordination guide from the project's `CLAUDE.md`:
 @.sametree/coordination.md
 ```
 
-Start each Claude Code instance with a distinct name:
+Start Claude Code normally. Each instance receives a unique automatic identity:
 
 ```bash
-SAMETREE_AGENT=claude-1 claude
+claude
+```
+
+Set an explicit identity only when you need a stable named role:
+
+```bash
 SAMETREE_AGENT=claude-reviewer SAMETREE_ROLE=reviewer claude
 ```
 
@@ -135,14 +143,19 @@ Add this to the target project's `opencode.json`:
 }
 ```
 
-Tell OpenCode to read `.sametree/coordination.md` from the project's `AGENTS.md`, then launch each instance with a distinct name:
+Tell OpenCode to read `.sametree/coordination.md` from the project's `AGENTS.md`, then start it normally. Each instance receives a unique automatic identity:
 
 ```bash
-SAMETREE_AGENT=opencode-1 opencode
+opencode
+```
+
+Set an explicit identity only when you need a stable named role:
+
+```bash
 SAMETREE_AGENT=opencode-reviewer SAMETREE_ROLE=reviewer opencode
 ```
 
-The name is inherited by the MCP process. Do not hard-code one shared name in the MCP configuration when running more than one instance.
+Explicit names are inherited by the MCP process. Do not hard-code one shared name in the MCP configuration when running more than one instance.
 
 ## Coordination Loop
 

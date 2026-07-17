@@ -4,7 +4,7 @@ This document defines the behavior shared by the CLI and MCP adapters.
 
 ## Identity and Sessions
 
-An agent name is a stable human-readable identity such as `claude-reviewer` or `opencode-1`. Names are unique within one working tree and contain letters, numbers, `.`, `_`, or `-`.
+An agent name is unique within one working tree and contains letters, numbers, `.`, `_`, or `-`. MCP adapters generate a process-scoped name from the harness's native session identifier, falling back to the MCP process ID. Set `SAMETREE_AGENT` when a durable human-readable identity such as `claude-reviewer` or `opencode-1` is required.
 
 A session represents one process lifetime. Starting a CLI command or MCP server creates a new session for its agent. An MCP heartbeat renews:
 
