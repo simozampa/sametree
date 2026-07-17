@@ -47,10 +47,10 @@ The animated SVG is generated from the real CLI flow in `scripts/demo.sh`. After
 
 ```bash
 npm run build
-npx --yes svg-term-cli@2.1.1 --command './scripts/demo.sh' --out docs/demo.svg --window --width 100 --height 20
+node scripts/render-demo.mjs
 ```
 
-Run `scripts/demo.sh` directly first when debugging a failed recording. Do not hand-edit `docs/demo.svg`.
+The renderer records the real CLI flow, makes the animation play once, and holds its final frame. Run `scripts/demo.sh` directly first when debugging a failed recording. Do not hand-edit `docs/demo.svg`.
 
 ## Code Style
 
