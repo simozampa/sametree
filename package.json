@@ -22,8 +22,12 @@
   "type": "module",
   "files": [
     "dist",
+    "docs",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "SECURITY.md"
   ],
   "bin": {
     "sametree": "dist/cli.js",
