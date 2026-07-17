@@ -70,19 +70,24 @@ describe('path claims', () => {
     expect(() => normalizeClaim(root, 'external', 'tree', false)).toThrow(/symbolic link/u);
   });
 
-  it('compares exact and recursive claims at component boundaries', () => {
-    const exact = { comparisonPath: 'src/api.ts', kind: 'exact' as const };
-    const tree = { comparisonPath: 'src', kind: 'tree' as const };
-    const sibling = { comparisonPath: 'src-old/api.ts', kind: 'exact' as const };
+  it('compares every claim combination symmetrically at component boundaries', () => {
+    const exact = (comparisonPath: string) => ({ comparisonPath, kind: 'exact' as const });
+    const tree = (comparisonPath: string) => ({ comparisonPath, kind: 'tree' as const });
+    const cases = [
+      [exact('src/api.ts'), exact('src/api.ts'), true],
+      [exact('src/api.ts'), exact('src/other.ts'), false],
+      [tree('src'), exact('src/api.ts'), true],
+      [tree('src'), tree('src/api'), true],
+      [tree('src/api'), tree('src'), true],
+      [tree('src'), tree('test'), false],
+      [tree('src'), exact('src-old/api.ts'), false],
+      [tree('.'), exact('README.md'), true],
+    ] as const;
 
-    expect(claimsOverlap(exact, tree)).toBe(true);
-    expect(claimsOverlap(tree, sibling)).toBe(false);
-    expect(
-      claimsOverlap(
-        { comparisonPath: '.', kind: 'tree' },
-        { comparisonPath: 'README.md', kind: 'exact' },
-      ),
-    ).toBe(true);
+    for (const [left, right, expected] of cases) {
+      expect(claimsOverlap(left, right)).toBe(expected);
+      expect(claimsOverlap(right, left)).toBe(expected);
+    }
   });
 
   it('supports case-insensitive repository comparison keys', () => {
