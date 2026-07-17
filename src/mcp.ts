@@ -380,13 +380,13 @@ async function shutdown(): Promise<void> {
   if (closing) return;
   closing = true;
   clearInterval(heartbeat);
-  coordinator.close({ releaseClaims: true });
+  coordinator.close();
   await server.close();
 }
 
 process.once('SIGINT', () => void shutdown());
 process.once('SIGTERM', () => void shutdown());
-process.once('beforeExit', () => coordinator.close({ releaseClaims: true }));
+process.once('beforeExit', () => coordinator.close());
 
 try {
   await server.connect(new StdioServerTransport());
