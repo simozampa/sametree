@@ -1,3 +1,6 @@
+import { mkdirSync, symlinkSync } from 'node:fs';
+import path from 'node:path';
+
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Coordinator } from '../src/coordinator.js';
@@ -91,6 +94,19 @@ describe('Coordinator', () => {
       ]),
     ).toThrowError(expect.objectContaining({ code: 'CLAIM_CONFLICT' }));
     expect(second.listClaims().some((claim) => claim.path === 'docs')).toBe(false);
+  });
+
+  it('prevents claims through different aliases of the same directory', () => {
+    const { repository, open } = setup();
+    mkdirSync(path.join(repository.root, 'real'));
+    symlinkSync('real', path.join(repository.root, 'alias'));
+    const first = open('first');
+    const second = open('second');
+    first.acquireClaims([{ path: 'alias/shared.ts' }]);
+
+    expect(() => second.acquireClaims([{ path: 'real/shared.ts' }])).toThrowError(
+      expect.objectContaining({ code: 'CLAIM_CONFLICT' }),
+    );
   });
 
   it('delivers and acknowledges direct and broadcast messages', () => {
@@ -228,10 +244,27 @@ describe('Coordinator', () => {
     const author = Coordinator.open({ cwd: repository.root, agent: 'author', clock: () => 1_000 });
     coordinators.push(author);
     author.sendMessage({ subject: 'Before registration', body: 'Historical announcement.' });
-    const future = Coordinator.open({ cwd: repository.root, agent: 'future', clock: () => 2_000 });
+    const future = Coordinator.open({ cwd: repository.root, agent: 'future', clock: () => 1_000 });
     coordinators.push(future);
 
     expect(future.inbox()).toEqual([]);
+  });
+
+  it('bounds serialized handoff context', () => {
+    const { open } = setup();
+    const author = open('author');
+    open('reviewer');
+    const task = author.createTask({ title: 'Bounded handoff' });
+    author.claimTask(task.id);
+
+    expect(() =>
+      author.offerHandoff({
+        taskId: task.id,
+        to: 'reviewer',
+        summary: 'Oversized context.',
+        context: { payload: 'x'.repeat(100_000) },
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'INVALID_INPUT' }));
   });
 
   it('ties policy acknowledgements to exact content hashes', () => {
