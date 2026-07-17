@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { claimsOverlap, normalizeClaim } from '../src/paths.js';
+import { assertSafeWritePath, claimsOverlap, normalizeClaim } from '../src/paths.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -42,6 +42,18 @@ describe('path claims', () => {
     expect(() => normalizeClaim(root, 'escaped/new.ts', 'exact', false)).toThrow(
       /outside the repository/u,
     );
+  });
+
+  it('keeps final symlinks lexical and rejects dangling symlink parents', () => {
+    const root = temporaryDirectory('sametree-symlink-');
+    const target = path.join(root, 'target.ts');
+    writeFileSync(target, '');
+    symlinkSync('target.ts', path.join(root, 'link.ts'));
+    symlinkSync('missing', path.join(root, 'dangling'));
+
+    expect(normalizeClaim(root, 'link.ts', 'exact', false).path).toBe('link.ts');
+    expect(() => normalizeClaim(root, 'dangling/new.ts', 'exact', false)).toThrow(/dangling/u);
+    expect(() => assertSafeWritePath(root, 'link.ts')).toThrow(/symbolic link/u);
   });
 
   it('compares exact and recursive claims at component boundaries', () => {
