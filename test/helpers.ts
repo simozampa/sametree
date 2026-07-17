@@ -10,10 +10,10 @@ export interface TestRepository {
   cleanup: () => void;
 }
 
-export function createTestRepository(): TestRepository {
+export function createTestRepository(options: { initialize?: boolean } = {}): TestRepository {
   const root = mkdtempSync(path.join(tmpdir(), 'sametree-test-'));
   execFileSync('git', ['init', '--initial-branch=main'], { cwd: root, stdio: 'ignore' });
-  initializeProject(root);
+  if (options.initialize ?? true) initializeProject(root);
 
   return {
     root,

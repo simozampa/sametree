@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { CONFIG_DIRECTORY, CONFIG_FILE, DEFAULT_CONFIG, POLICY_FILE } from './config.js';
+import { writeTextFileAtomic } from './files.js';
 import { resolveRepository } from './git.js';
 import { assertSafeWritePath } from './paths.js';
 import {
@@ -18,35 +19,59 @@ export interface InitializationResult {
   preserved: string[];
 }
 
+export const PROJECT_FILE_TEMPLATES: ReadonlyArray<{
+  relativePath: string;
+  content: string;
+}> = [
+  { relativePath: CONFIG_FILE, content: configTemplate(DEFAULT_CONFIG) },
+  { relativePath: POLICY_FILE, content: POLICY_TEMPLATE },
+  { relativePath: path.join(CONFIG_DIRECTORY, 'coordination.md'), content: INTEGRATION_TEMPLATE },
+  {
+    relativePath: path.join(CONFIG_DIRECTORY, 'roles', 'implementer.md'),
+    content: IMPLEMENTER_ROLE_TEMPLATE,
+  },
+  {
+    relativePath: path.join(CONFIG_DIRECTORY, 'roles', 'reviewer.md'),
+    content: REVIEWER_ROLE_TEMPLATE,
+  },
+];
+
 function writeProjectFile(
   repositoryRoot: string,
   relativePath: string,
   content: string,
   force: boolean,
   result: InitializationResult,
+  onFileWritten?: (relativePath: string, content: string) => void,
 ): void {
   const target = assertSafeWritePath(repositoryRoot, relativePath);
-  try {
-    if (!force) {
+  if (!force) {
+    try {
+      writeFileSync(target, content, { encoding: 'utf8', mode: 0o644, flag: 'wx' });
+      result.created.push(relativePath);
+      onFileWritten?.(relativePath, content);
+      return;
+    } catch (error) {
+      const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+      if (code !== 'EEXIST') throw error;
+      // Confirm the existing path is a readable file rather than hiding an invalid target.
       readFileSync(target);
       result.preserved.push(relativePath);
       return;
     }
-  } catch {
-    // A missing file is the expected path on first initialization.
   }
 
-  writeFileSync(target, content, { encoding: 'utf8', mode: 0o644 });
+  writeTextFileAtomic(target, content);
   result.created.push(relativePath);
+  onFileWritten?.(relativePath, content);
 }
 
-/** Create versioned policy files without touching existing agent instructions. */
-export function initializeProject(
-  cwd = process.cwd(),
-  options: { force?: boolean } = {},
+function initializeProjectFiles(
+  cwd: string,
+  force: boolean,
+  onFileWritten?: (relativePath: string, content: string) => void,
 ): InitializationResult {
   const repository = resolveRepository(cwd);
-  const force = options.force ?? false;
   const result: InitializationResult = {
     repositoryRoot: repository.root,
     created: [],
@@ -58,28 +83,31 @@ export function initializeProject(
     recursive: true,
     mode: 0o755,
   });
-  writeProjectFile(repository.root, CONFIG_FILE, configTemplate(DEFAULT_CONFIG), force, result);
-  writeProjectFile(repository.root, POLICY_FILE, POLICY_TEMPLATE, force, result);
-  writeProjectFile(
-    repository.root,
-    path.join(CONFIG_DIRECTORY, 'coordination.md'),
-    INTEGRATION_TEMPLATE,
-    force,
-    result,
-  );
-  writeProjectFile(
-    repository.root,
-    path.join(CONFIG_DIRECTORY, 'roles', 'implementer.md'),
-    IMPLEMENTER_ROLE_TEMPLATE,
-    force,
-    result,
-  );
-  writeProjectFile(
-    repository.root,
-    path.join(CONFIG_DIRECTORY, 'roles', 'reviewer.md'),
-    REVIEWER_ROLE_TEMPLATE,
-    force,
-    result,
-  );
+  for (const file of PROJECT_FILE_TEMPLATES) {
+    writeProjectFile(
+      repository.root,
+      file.relativePath,
+      file.content,
+      force,
+      result,
+      onFileWritten,
+    );
+  }
   return result;
+}
+
+/** Create versioned policy files without touching existing agent instructions. */
+export function initializeProject(
+  cwd = process.cwd(),
+  options: { force?: boolean } = {},
+): InitializationResult {
+  return initializeProjectFiles(cwd, options.force ?? false);
+}
+
+/** Track exact writes so setup can safely roll back only its own changes. */
+export function initializeProjectTracked(
+  cwd: string,
+  onFileWritten: (relativePath: string, content: string) => void,
+): InitializationResult {
+  return initializeProjectFiles(cwd, false, onFileWritten);
 }

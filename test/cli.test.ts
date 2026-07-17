@@ -73,4 +73,38 @@ describe('CLI', () => {
     expect(result.code).not.toBe(0);
     expect(error.error.code).toBe('INTERNAL_ERROR');
   });
+
+  it('emits watch events as JSON Lines', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const result = await runCli(repository.root, 'cli-observer', ['watch', '--once', '--json']);
+    const events = result.stdout
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as { kind: string });
+
+    expect(result).toMatchObject({ code: 0, stderr: '' });
+    expect(events).toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: 'session.started' })]),
+    );
+  });
+
+  it('rejects conflicting watch cursors', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const result = await runCli(repository.root, 'cli-observer', [
+      'watch',
+      '--once',
+      '--tail',
+      '--after',
+      '1',
+    ]);
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(
+      "Watch options '--after' and '--tail' cannot be used together.",
+    );
+  });
 });

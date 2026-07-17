@@ -6,7 +6,9 @@ import { Coordinator } from './coordinator.js';
 import { errorResult } from './errors.js';
 import { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 import { initializeProject } from './project.js';
+import { setupProject } from './setup.js';
 import type { Harness, TaskPriority, TaskStatus } from './types.js';
+import { watchEvents } from './watch.js';
 
 interface GlobalOptions {
   agent?: string;
@@ -82,6 +84,21 @@ program
       initialization,
       ...(options.hooks ? { hooks: installHooks(globals.cwd) } : {}),
     });
+  });
+
+program
+  .command('setup')
+  .description('Initialize SameTree and configure project-local harness integrations.')
+  .option('--claude', 'configure Claude Code MCP and CLAUDE.md')
+  .option('--opencode', 'configure OpenCode MCP and AGENTS.md')
+  .action((options: { claude?: boolean; opencode?: boolean }, command: Command) => {
+    const globals = command.optsWithGlobals<GlobalOptions>();
+    print(
+      setupProject(globals.cwd, {
+        claude: options.claude ?? false,
+        opencode: options.opencode ?? false,
+      }),
+    );
   });
 
 program
@@ -340,6 +357,55 @@ program
     runWithCoordinator(command, (coordinator) => coordinator.events(options));
   });
 
+program
+  .command('watch')
+  .description('Follow the coordination event stream.')
+  .addOption(new Option('--after <sequence>', 'event cursor').argParser(integer).default(0))
+  .option('--interval <milliseconds>', 'poll interval', integer, 1_000)
+  .option('--json', 'emit one JSON event per line')
+  .option('--once', 'print available events and exit')
+  .option('--tail', 'start after the current event instead of replaying history')
+  .action(
+    async (
+      options: {
+        after: number;
+        interval: number;
+        json?: boolean;
+        once?: boolean;
+        tail?: boolean;
+      },
+      command: Command,
+    ) => {
+      if (options.tail && command.getOptionValueSource('after') === 'cli') {
+        throw new Error("Watch options '--after' and '--tail' cannot be used together.");
+      }
+      if (options.interval < 100 || options.interval > 60_000) {
+        throw new Error('Watch interval must be between 100 and 60000 milliseconds.');
+      }
+      const coordinator = openCoordinator(command);
+      const controller = new AbortController();
+      const abort = () => {
+        controller.abort();
+        if (!process.stdout.destroyed) process.stdout.destroy();
+      };
+      process.once('SIGINT', abort);
+      process.once('SIGTERM', abort);
+      try {
+        await watchEvents(coordinator, {
+          after: options.tail ? coordinator.snapshot().lastEventSequence : options.after,
+          intervalMs: options.interval,
+          json: options.json ?? false,
+          once: options.once ?? false,
+          signal: controller.signal,
+        });
+      } finally {
+        process.removeListener('SIGINT', abort);
+        process.removeListener('SIGTERM', abort);
+        coordinator.close();
+      }
+    },
+  );
+
 const hooks = program.command('hooks').description('Install optional Git safety rails.');
 hooks.command('install').action((_options: unknown, command: Command) => {
   const globals = command.optsWithGlobals<GlobalOptions>();
@@ -367,7 +433,7 @@ hook
 program.exitOverride();
 
 try {
-  program.parse();
+  await program.parseAsync();
 } catch (error) {
   // Commander uses exceptions for --help and --version when exitOverride is enabled.
   if (error instanceof Error && error.name === 'CommanderError') {

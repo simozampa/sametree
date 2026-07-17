@@ -8,6 +8,12 @@ export {
 export { type ErrorCode, errorResult, isSameTreeError, SameTreeError } from './errors.js';
 export { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 export { type InitializationResult, initializeProject } from './project.js';
+export {
+  type ClaudeCommandRunner,
+  type CommandResult,
+  type SetupResult,
+  setupProject,
+} from './setup.js';
 export type {
   Agent,
   ClaimKind,
@@ -25,3 +31,4 @@ export type {
   TaskPriority,
   TaskStatus,
 } from './types.js';
+export { formatEvent, watchEvents } from './watch.js';
