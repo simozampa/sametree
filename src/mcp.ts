@@ -352,7 +352,8 @@ server.registerTool(
   'sametree_policy_ack',
   {
     title: 'Acknowledge shared policy',
-    description: 'Record that this agent read the exact policy content identified by its hash.',
+    description:
+      'Record that this agent read the exact policy content when sametree_policy_get reports acknowledgedAt as null.',
     inputSchema: { hash: z.string().length(64) },
     outputSchema,
     annotations: { idempotentHint: true },

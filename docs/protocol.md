@@ -121,7 +121,9 @@ Rejection records a terminal handoff state without changing task ownership.
 
 The shared policy is the tracked `.sametree/policy.md` file. SameTree computes its SHA-256 hash and records acknowledgements by agent and hash.
 
-Editing any byte produces a new hash, so previous acknowledgements no longer satisfy the current policy. Clients should read and acknowledge the policy at session start.
+Editing any byte produces a new hash, so previous acknowledgements no longer satisfy the current policy. Clients should read the policy state at session start.
+
+Acknowledgement is idempotent per agent and policy hash: repeating it preserves the original timestamp and does not append another event. Clients should call the acknowledgement operation only when `sametree_policy_get` reports `acknowledgedAt` as `null`.
 
 Prompt policy is backed by optional Git hooks for rules that can be checked mechanically. Hooks remain bypassable safety rails.
 

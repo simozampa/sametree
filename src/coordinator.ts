@@ -1269,19 +1269,21 @@ export class Coordinator {
         },
       );
     }
-    const acknowledgedAt = this.#clock();
-    immediateTransaction(this.#database, () => {
-      this.#database
+    return immediateTransaction(this.#database, () => {
+      const acknowledgedAt = this.#clock();
+      const inserted = this.#database
         .prepare(
           `INSERT INTO policy_acks (policy_hash, agent_name, acknowledged_at)
            VALUES (?, ?, ?)
-           ON CONFLICT(policy_hash, agent_name) DO UPDATE
-             SET acknowledged_at = excluded.acknowledged_at`,
+           ON CONFLICT(policy_hash, agent_name) DO NOTHING`,
         )
-        .run(hash, this.agentName, acknowledgedAt);
-      this.#recordEvent('policy.acknowledged', 'policy', hash);
+        .run(hash, this.agentName, acknowledgedAt).changes;
+      if (inserted === 1) this.#recordEvent('policy.acknowledged', 'policy', hash);
+      const acknowledgement = this.#database
+        .prepare('SELECT acknowledged_at FROM policy_acks WHERE policy_hash = ? AND agent_name = ?')
+        .get(hash, this.agentName) as Row;
+      return { ...policy, acknowledgedAt: numberValue(acknowledgement, 'acknowledged_at') };
     });
-    return { ...policy, acknowledgedAt };
   }
 
   events(options: { after?: number; limit?: number } = {}): CoordinationEvent[] {

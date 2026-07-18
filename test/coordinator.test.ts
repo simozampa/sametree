@@ -1,4 +1,4 @@
-import { mkdirSync, symlinkSync } from 'node:fs';
+import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
@@ -528,7 +528,21 @@ describe('Coordinator', () => {
     const policy = author.getPolicy();
 
     expect(policy.acknowledgedAt).toBeNull();
-    expect(author.acknowledgePolicy(policy.hash).acknowledgedAt).not.toBeNull();
+    const acknowledged = author.acknowledgePolicy(policy.hash);
+    expect(acknowledged.acknowledgedAt).not.toBeNull();
+    expect(author.acknowledgePolicy(policy.hash).acknowledgedAt).toBe(acknowledged.acknowledgedAt);
+    expect(
+      author.events({ after: 0 }).filter((event) => event.kind === 'policy.acknowledged'),
+    ).toHaveLength(1);
+
+    writeFileSync(policy.path, `${policy.content}\nNew policy version.\n`, 'utf8');
+    const changed = author.getPolicy();
+    expect(changed).toMatchObject({ acknowledgedAt: null });
+    expect(changed.hash).not.toBe(policy.hash);
+    author.acknowledgePolicy(changed.hash);
+    expect(
+      author.events({ after: 0 }).filter((event) => event.kind === 'policy.acknowledged'),
+    ).toHaveLength(2);
     expect(() => author.acknowledgePolicy('0'.repeat(64))).toThrow(SameTreeError);
   });
 
