@@ -34,7 +34,7 @@ Several ideas recur across successful systems and are retained here:
 - Claims need expiries because agent processes crash.
 - Handoffs must persist context beyond chat history.
 - Current ownership must be visible before edits begin.
-- Agents need a polling loop at natural boundaries.
+- Durable inboxes need a harness-native wake-up path; MCP polling alone cannot notify an idle agent.
 - Claims cannot make concurrent same-file editing safe; work must be serialized.
 - Prompt instructions drift, so checkable rules benefit from Git hooks.
 

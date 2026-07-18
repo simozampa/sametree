@@ -15,6 +15,7 @@ SameTree is a local multi-agent coordination MCP server for running multiple Cla
 ## What It Does
 
 - Gives agents a shared task board and inbox.
+- Delivers peer messages to active Claude Code and OpenCode sessions automatically.
 - Prevents agents from unknowingly editing the same paths.
 - Transfers work through structured handoffs.
 - Shares coordination rules through versioned repository files.
@@ -47,7 +48,9 @@ cd /path/to/your/project
 sametree setup --claude --opencode
 ```
 
-Setup is required once per project. It configures the requested harnesses and writes shared instructions under `.sametree/`. After that, start agents normally in separate terminals:
+Setup is required once per project. It configures MCP, installs the SameTree Claude Code monitor plugin at user scope, creates the project OpenCode TUI inbox plugin, and writes shared instructions under `.sametree/`. Review these trusted local integrations before enabling them because they can inject peer messages into active agent sessions.
+
+After setup, start agents normally in separate terminals:
 
 ```bash
 opencode
@@ -57,16 +60,22 @@ opencode
 claude
 ```
 
-Every instance gets a unique identity automatically and joins the agents in that worktree. Different projects and Git worktrees use separate state. Avoid switching branches while agents are active because every process in that worktree sees the same checkout.
+Every instance gets a unique identity automatically and joins the agents in that worktree. Peer messages wake the addressed Claude Code or OpenCode session without a user relay or an agent polling loop. Different projects and Git worktrees use separate state. Avoid switching branches while agents are active because every process in that worktree sees the same checkout.
+
+Automatic OpenCode delivery requires a local TUI process. `opencode attach` can connect to a different server process with a different SameTree identity, so its adapter reports the limitation instead of consuming another identity's messages.
+
+After upgrading SameTree, refresh Claude Code's cached plugin with `claude plugin update --scope user sametree@sametree`.
 
 ## Coordination Loop
 
 The generated agent instructions tell each agent to:
 
-1. Check current tasks, claims, messages, and policy.
+1. Check current tasks, claims, and policy.
 2. Claim a task and the smallest paths it needs.
 3. Coordinate conflicts instead of overwriting another agent.
 4. Update or hand off work and release claims when finished.
+
+The Claude Code monitor and OpenCode plugin deliver new messages as they arrive. Delivery does not mark a message read; the receiving agent acknowledges it after handling the request.
 
 Agents normally use the MCP tools directly. The CLI provides the same coordination surface for humans and scripts:
 
@@ -80,8 +89,11 @@ sametree task claim task_...
 sametree claim acquire src/http/request.ts test/http/request.test.ts
 sametree task update task_... --status done
 sametree claim release --all
+sametree message follow --json
 SAMETREE_AGENT=observer sametree watch --tail
 ```
+
+An explicit `SAMETREE_AGENT` must remain unique to one harness process. Do not launch independent processes with the same override; the MCP and inbox follower inside one process share the identity automatically.
 
 Optional Git hooks can reject commits that overlap active claims or violate repository policy:
 
@@ -96,8 +108,8 @@ Each MCP client starts a local SameTree process. All clients in one worktree ope
 
 ```text
 Claude Code ─┐
-Claude Code ─┼─ MCP stdio / CLI ─ Domain service ─ SQLite WAL
-OpenCode ────┤                                  └─ Git working tree
+Claude Code ─┼─ MCP stdio / native inbox adapters ─ Domain service ─ SQLite WAL
+OpenCode ────┤                                                   └─ Git working tree
 OpenCode ────┘
 ```
 
@@ -117,7 +129,7 @@ Not when the work is intertwined. SameTree is built for agents collaborating on 
 
 ### How do coding agents share context across sessions?
 
-SameTree stores tasks, messages, handoffs, claims, and policy acknowledgements in a worktree-local SQLite database. Claude Code and OpenCode access that shared context through MCP tools.
+SameTree stores tasks, messages, delivery state, handoffs, claims, and policy acknowledgements in a worktree-local SQLite database. Claude Code and OpenCode access shared state through MCP tools, while native adapters push addressed messages into active sessions.
 
 ### Is SameTree a Conductor alternative?
 

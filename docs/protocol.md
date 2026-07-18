@@ -74,7 +74,13 @@ A message is immutable and contains:
 
 Omitting the recipient broadcasts to every other registered agent. Read receipts are per agent, so one recipient acknowledging a broadcast does not hide it from others.
 
-Polling is the delivery mechanism. Agents should read their inbox at session start, after finishing a task, and before commits or unrelated work.
+Message delivery and message acknowledgement are separate. A live follower atomically reserves the oldest unread, undelivered message for its agent identity. SameTree records delivery only after the harness adapter accepts the message, but leaves the read receipt empty until the agent explicitly acknowledges it.
+
+Claude Code receives messages through the SameTree plugin monitor. OpenCode receives them through a project TUI plugin that reads the live selected route, injects an asynchronous prompt into its root session, verifies persistence with stable OpenCode message IDs, and confirms acceptance over the follower's stdin. Reservations are released on graceful shutdown and can be recovered after an expired follower session, so another process can retry without concurrent duplicate delivery.
+
+OpenCode attach mode is excluded from automatic delivery because the local TUI process and attached server have different process-derived SameTree identities. The adapter refuses to consume that mismatched inbox.
+
+`sametree message follow` exposes the same durable stream for other adapters. `--json` emits JSON Lines, `--once` drains currently available messages, and `--ack-stdin` requires each emitted message ID on stdin before recording delivery.
 
 ## Handoffs
 

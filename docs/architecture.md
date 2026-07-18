@@ -16,9 +16,11 @@ SameTree is a local-first coordination layer for a small number of cooperative c
 ```text
 ┌────────────────────┐    stdio     ┌────────────────────┐
 │ Claude Code client │─────────────▶│ SameTree MCP child │──┐
+│ + monitor          │◀── messages ─│ SameTree follower  │──┤
 └────────────────────┘              └────────────────────┘  │
 ┌────────────────────┐    stdio     ┌────────────────────┐  │
 │ OpenCode client    │─────────────▶│ SameTree MCP child │──┤
+│ + project plugin   │◀── messages ─│ SameTree follower  │──┤
 └────────────────────┘              └────────────────────┘  │
 ┌────────────────────┐              ┌────────────────────┐  │
 │ Human or hook      │─────────────▶│ SameTree CLI       │──┤
@@ -36,6 +38,8 @@ SameTree is a local-first coordination layer for a small number of cooperative c
 Each MCP client owns one server child process and one SameTree session. A heartbeat every 20 seconds renews the session, tasks, and path claims held by that process. CLI commands open their own sessions and leave acquired leases alive until explicit release or expiry; a later CLI process cannot renew an earlier process's session.
 
 The CLI and MCP server call the same `Coordinator` domain service. Neither adapter contains coordination rules.
+
+Each harness also owns a message follower with the same generated agent identity as its MCP child. The follower reserves one eligible message at a time. Claude Code treats each monitor line as accepted delivery. OpenCode writes the message ID back only after `promptAsync` accepts the injected prompt. Delivery records deduplicate adapter restarts without changing inbox read receipts.
 
 ## State Location
 
@@ -130,7 +134,7 @@ SameTree is not fully event-sourced. Normalized tables hold current state, while
 - A bounded JSON payload.
 - Millisecond timestamp.
 
-Clients poll after a sequence cursor. Resource subscriptions are intentionally omitted because independent stdio processes still need shared polling to observe one another.
+Audit consumers poll after a sequence cursor. Resource subscriptions remain unnecessary because the audit stream is for context refresh and debugging; addressed messages use the separate durable follower and native harness adapters.
 
 ## Security Model
 
