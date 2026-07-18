@@ -1,0 +1,16 @@
+{
+  "name": "sametree",
+  "displayName": "SameTree",
+  "version": "0.1.0",
+  "description": "Automatic SameTree coordination and peer message delivery",
+  "author": {
+    "name": "SameTree maintainers"
+  },
+  "homepage": "https://github.com/simozampa/sametree",
+  "repository": "https://github.com/simozampa/sametree",
+  "license": "MIT",
+  "keywords": ["multi-agent", "coordination", "mcp"],
+  "experimental": {
+    "monitors": "./monitors/monitors.json"
+  }
+}

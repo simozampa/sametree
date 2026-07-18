@@ -1,0 +1,14 @@
+{
+  "name": "sametree",
+  "owner": {
+    "name": "SameTree maintainers"
+  },
+  "description": "SameTree coordination integrations for coding agents",
+  "plugins": [
+    {
+      "name": "sametree",
+      "source": "./plugins/sametree",
+      "description": "Automatic SameTree coordination and peer message delivery for Claude Code"
+    }
+  ]
+}

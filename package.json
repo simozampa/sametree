@@ -25,6 +25,8 @@
     "docs",
     "examples",
     "scripts",
+    ".claude-plugin",
+    "plugins",
     "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "LICENSE",
