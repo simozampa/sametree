@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -25,6 +25,17 @@ afterEach(() => {
 });
 
 describe('generated state paths', () => {
+  it('generates conditional policy acknowledgement guidance', () => {
+    const repository = createTestRepository({ initialize: false });
+    repositories.push(repository);
+
+    initializeProject(repository.root);
+
+    expect(
+      readFileSync(path.join(repository.root, '.sametree', 'coordination.md'), 'utf8'),
+    ).toContain('acknowledge the returned hash only when `acknowledgedAt` is null');
+  });
+
   it('refuses to initialize through a symlinked policy directory', () => {
     const repository = createTestRepository();
     repositories.push(repository);

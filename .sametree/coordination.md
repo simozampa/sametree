@@ -5,7 +5,7 @@ This repository uses SameTree for coordination between coding agents sharing one
 At session start:
 
 1. Read `.sametree/policy.md` and your role file under `.sametree/roles/`.
-2. Call `sametree_status`, then `sametree_policy_get` and acknowledge the current policy.
+2. Call `sametree_status` and `sametree_policy_get`; acknowledge the returned hash only when `acknowledgedAt` is null.
 3. Read your inbox and pending handoffs before choosing work.
 
 During work:

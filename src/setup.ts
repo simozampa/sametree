@@ -36,7 +36,7 @@ const AGENT_INSTRUCTIONS = `<!-- sametree:coordination -->
 
 Read and follow \`.sametree/coordination.md\`, \`.sametree/policy.md\`, and the role matching your task under \`.sametree/roles/\`.
 
-Use SameTree before editing: check status and inbox, acknowledge the current policy, claim the task and required paths, and release or hand off ownership when finished.
+Use SameTree before editing: check status, inbox, and policy state; acknowledge the policy only when \`acknowledgedAt\` is null, claim the task and required paths, and release or hand off ownership when finished.
 `;
 
 const INITIALIZATION_FILES = PROJECT_FILE_TEMPLATES.map((file) => file.relativePath);
@@ -477,7 +477,7 @@ function preflightOpenCode(repositoryRoot: string): OpenCodePlan {
       'AGENTS.md',
       AGENT_INSTRUCTIONS,
       'append',
-      (text) => markdownOutsideFences(text).includes(AGENT_INSTRUCTIONS.trim()),
+      (text) => markdownOutsideFences(text).includes('<!-- sametree:coordination -->'),
     ),
     plugin: {
       relativePath: OPENCODE_PLUGIN_PATH,
