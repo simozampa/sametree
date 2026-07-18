@@ -43,6 +43,22 @@ Task invariants:
 
 Assignments are durable agent ownership. Execution leases identify the active session. Keeping these separate makes crashed work visible instead of silently re-queuing it.
 
+### Forced Takeover
+
+Normal task claiming never bypasses another agent's active execution lease. When the user explicitly reassigns live work, `sametree_task_force_takeover` or `sametree task force-takeover` may transfer it without waiting for expiry.
+
+A forced takeover requires:
+
+- An assigned `in_progress` task with an unexpired execution lease owned by another agent.
+- The exact current task revision.
+- A non-empty audit reason.
+- An explicit `userAuthorized: true` assertion or `--user-authorized` flag.
+- Optional IDs for at most 100 active claims owned by the previous assignee.
+
+The task and selected claims transfer in one immediate transaction. Each selected claim must still belong to the previous assignee and cannot overlap a claim left with that assignee. Any stale revision or invalid claim rolls back the entire operation. Success starts a new execution lease, increments the task revision, and records `task.force_taken_over` with the previous assignee, previous lease expiry, reason, and transferred claim IDs.
+
+Expired work uses normal task claiming instead. The authorization field is an auditable cooperative assertion, not authentication; SameTree remains unsuitable across hostile trust boundaries.
+
 ## Path Claims
 
 A claim has one of two kinds:

@@ -57,7 +57,7 @@ Versioned policy and role documents remain under the tracked `.sametree/` direct
 
 ## Why SQLite Instead of JSONL?
 
-Append-only JSONL is inspectable, but compound operations still need cross-process locking. Examples include claiming a task only if its dependencies are complete, acquiring several paths all-or-nothing, or accepting a handoff only if its task revision is unchanged.
+Append-only JSONL is inspectable, but compound operations still need cross-process locking. Examples include claiming a task only if its dependencies are complete, acquiring several paths all-or-nothing, accepting a handoff only if its task revision is unchanged, or atomically moving live task and path ownership after an explicit user-authorized takeover.
 
 SQLite provides:
 
@@ -120,7 +120,9 @@ Batch acquisition is atomic. An overlap with another agent rejects the entire ba
 
 Sessions, task execution, claims, and handoffs use wall-clock expiries. A daemonless design cannot provide a shared persistent monotonic clock.
 
-Graceful MCP shutdown closes the session but leaves its claims and execution lease visible until explicit release or expiry. This preserves pending handoffs across normal client shutdown. Expired in-progress work is not silently marked ready; another agent performs an explicit takeover, producing an audit event.
+Graceful MCP shutdown closes the session but leaves its claims and execution lease visible until explicit release or expiry. This preserves pending handoffs across normal client shutdown. Expired in-progress work is not silently marked ready; another agent claims it explicitly, producing an audit event.
+
+Normal claims cannot bypass a live lease. A separate forced-takeover operation exists for a direct user reassignment: it requires the current task revision, an audit reason, explicit user authorization, and selected claim IDs. The task and claims move in one immediate transaction, or none move. This is a cooperative recovery mechanism rather than an authorization boundary.
 
 Leases cannot fence direct filesystem writes. They are coordination state for cooperative agents, not mandatory locks.
 

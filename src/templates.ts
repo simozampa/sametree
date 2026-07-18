@@ -69,6 +69,7 @@ During work:
 2. Act on delivered peer messages. Coordinate conflicts instead of overwriting another agent.
 3. Make small atomic commits without co-author trailers.
 4. Release claims and update the task when finished; create a handoff when another agent must continue.
+5. Never force takeover a live task unless the user explicitly instructs you to; include the current revision, reason, and only the claims they want transferred.
 
 SameTree claims are cooperative. They do not prevent direct writes, so following this protocol is required.
 Harness adapters deliver new messages automatically; do not start a manual inbox polling loop.

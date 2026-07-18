@@ -93,6 +93,18 @@ sametree message follow --json
 SAMETREE_AGENT=observer sametree watch --tail
 ```
 
+Normal task claiming respects an active execution lease and can take over only after that lease expires. If the user explicitly reassigns live work, use the current task revision and select any claims that must move with it:
+
+```bash
+sametree task force-takeover task_... \
+  --revision 3 \
+  --reason "User reassigned this task to opencode-1" \
+  --user-authorized \
+  --claim claim_...
+```
+
+The equivalent MCP tool is `sametree_task_force_takeover`. SameTree atomically reassigns the task and selected claims, and records the old owner, new owner, reason, and claim IDs in the audit stream. It rejects stale revisions and unsafe partial transfers. This is a cooperative recovery control, not an authentication boundary; agents must not invoke it without a direct user instruction.
+
 An explicit `SAMETREE_AGENT` must remain unique to one harness process. Do not launch independent processes with the same override; the MCP and inbox follower inside one process share the identity automatically.
 
 Optional Git hooks can reject commits that overlap active claims or violate repository policy:
