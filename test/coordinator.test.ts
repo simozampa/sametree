@@ -1,10 +1,12 @@
 import { mkdirSync, symlinkSync } from 'node:fs';
 import path from 'node:path';
 
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Coordinator } from '../src/coordinator.js';
 import { SameTreeError } from '../src/errors.js';
+import { resolveRepository } from '../src/git.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
@@ -140,6 +142,105 @@ describe('Coordinator', () => {
     expect(author.inbox({ unreadOnly: true })).toHaveLength(2);
     expect(author.acknowledgeMessage(direct.id).readAt).not.toBeNull();
     expect(author.inbox({ unreadOnly: true })).toHaveLength(1);
+  });
+
+  it('reserves each unread message for only one live follower without acknowledging it', () => {
+    const { open } = setup();
+    const sender = open('sender');
+    const first = open('recipient');
+    const second = open('recipient');
+    const message = sender.sendMessage({
+      to: 'recipient',
+      subject: 'Reserved work',
+      body: 'Only one follower should inject this.',
+    });
+
+    expect(first.reserveNextMessageDelivery()?.id).toBe(message.id);
+    expect(second.reserveNextMessageDelivery()).toBeNull();
+    first.completeMessageDelivery(message.id);
+
+    expect(second.reserveNextMessageDelivery()).toBeNull();
+    expect(first.inbox({ unreadOnly: true }).map((item) => item.id)).toContain(message.id);
+  });
+
+  it('releases pending message reservations when a follower closes', () => {
+    const { open } = setup();
+    const sender = open('sender');
+    const first = open('recipient');
+    const second = open('recipient');
+    const message = sender.sendMessage({
+      to: 'recipient',
+      subject: 'Retry delivery',
+      body: 'Another follower can continue after shutdown.',
+    });
+
+    const original = first.reserveNextMessageDelivery();
+    expect(original?.id).toBe(message.id);
+    first.close();
+
+    const recovered = second.reserveNextMessageDelivery();
+    expect(recovered?.id).toBe(message.id);
+  });
+
+  it('allows a current session to recover an expired message reservation', () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    let now = 1_000;
+    const sender = Coordinator.open({ cwd: repository.root, agent: 'sender', clock: () => now });
+    const expired = Coordinator.open({
+      cwd: repository.root,
+      agent: 'recipient',
+      clock: () => now,
+    });
+    coordinators.push(sender, expired);
+    const message = sender.sendMessage({
+      to: 'recipient',
+      subject: 'Recover delivery',
+      body: 'The original follower stopped heartbeating.',
+    });
+    expect(expired.reserveNextMessageDelivery()?.id).toBe(message.id);
+
+    now += 91_000;
+    const replacement = Coordinator.open({
+      cwd: repository.root,
+      agent: 'recipient',
+      clock: () => now,
+    });
+    coordinators.push(replacement);
+
+    expect(replacement.reserveNextMessageDelivery()?.id).toBe(message.id);
+    expect(() => expired.completeMessageDelivery(message.id)).toThrowError(
+      expect.objectContaining({ code: 'NOT_ASSIGNED' }),
+    );
+  });
+
+  it('migrates a version 2 database without losing unread messages', () => {
+    const { repository, open } = setup();
+    const sender = open('sender');
+    const recipient = open('recipient');
+    const message = sender.sendMessage({
+      to: 'recipient',
+      subject: 'Survive migration',
+      body: 'This message predates delivery tracking.',
+    });
+    sender.close();
+    recipient.close();
+
+    const database = new Database(resolveRepository(repository.root).databasePath);
+    database.exec(
+      'DROP TABLE message_deliveries; DELETE FROM schema_migrations WHERE version = 3;',
+    );
+    database.close();
+
+    const migrated = open('recipient');
+    expect(migrated.reserveNextMessageDelivery()?.id).toBe(message.id);
+    const verification = new Database(resolveRepository(repository.root).databasePath, {
+      readonly: true,
+    });
+    expect(
+      verification.prepare('SELECT MAX(version) AS version FROM schema_migrations').get(),
+    ).toEqual({ version: 3 });
+    verification.close();
   });
 
   it('transfers task ownership and selected claims through a handoff', () => {

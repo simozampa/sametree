@@ -312,6 +312,34 @@ export class Coordinator {
     ).map((row) => stringValue(row, 'id'));
   }
 
+  #nextDeliverableMessage(now: number): Row | undefined {
+    return this.#database
+      .prepare(
+        `SELECT message.*, receipt.read_at
+         FROM messages message
+         LEFT JOIN message_receipts receipt
+           ON receipt.message_id = message.id AND receipt.agent_name = ?
+         LEFT JOIN message_deliveries delivery
+           ON delivery.message_id = message.id AND delivery.agent_name = ?
+         LEFT JOIN sessions reservation ON reservation.id = delivery.reserved_by_session
+         WHERE (message.recipient = ? OR EXISTS (
+           SELECT 1 FROM broadcast_recipients recipient
+           WHERE recipient.message_id = message.id AND recipient.agent_name = ?
+         ))
+           AND receipt.read_at IS NULL
+           AND (
+             delivery.message_id IS NULL OR (
+               delivery.delivered_at IS NULL AND (
+                 reservation.id IS NULL OR reservation.status <> 'active' OR reservation.expires_at <= ?
+               )
+             )
+           )
+         ORDER BY message.created_at ASC, message.id ASC
+         LIMIT 1`,
+      )
+      .get(this.agentName, this.agentName, this.agentName, this.agentName, now) as Row | undefined;
+  }
+
   heartbeat(): Session {
     const now = this.#clock();
     const sessionExpiry = now + this.config.sessionTtlSeconds * 1_000;
@@ -350,6 +378,11 @@ export class Coordinator {
   close(options: { releaseClaims?: boolean } = {}): void {
     if (this.#closed) return;
     immediateTransaction(this.#database, () => {
+      this.#database
+        .prepare(
+          'DELETE FROM message_deliveries WHERE reserved_by_session = ? AND delivered_at IS NULL',
+        )
+        .run(this.sessionId);
       if (options.releaseClaims) {
         this.#database.prepare('DELETE FROM path_claims WHERE session_id = ?').run(this.sessionId);
         this.#database
@@ -767,6 +800,66 @@ export class Coordinator {
         )
         .all(this.agentName, this.agentName, this.agentName, limit) as Row[]
     ).map(mapMessage);
+  }
+
+  reserveNextMessageDelivery(): Message | null {
+    const now = this.#clock();
+    if (!this.#nextDeliverableMessage(now)) return null;
+
+    return immediateTransaction(this.#database, () => {
+      const candidate = this.#nextDeliverableMessage(now);
+      if (!candidate) return null;
+      const active = this.#database
+        .prepare("SELECT 1 FROM sessions WHERE id = ? AND status = 'active' AND expires_at > ?")
+        .get(this.sessionId, now);
+      if (!active) {
+        throw new SameTreeError(
+          'TASK_UNAVAILABLE',
+          'This session expired and cannot deliver messages.',
+        );
+      }
+
+      const messageId = stringValue(candidate, 'id');
+      const reserved = this.#database
+        .prepare(
+          `INSERT INTO message_deliveries
+             (message_id, agent_name, reserved_by_session, reserved_at, delivered_at)
+           VALUES (?, ?, ?, ?, NULL)
+           ON CONFLICT(message_id, agent_name) DO UPDATE SET
+             reserved_by_session = excluded.reserved_by_session,
+             reserved_at = excluded.reserved_at,
+             delivered_at = NULL
+           WHERE message_deliveries.delivered_at IS NULL`,
+        )
+        .run(messageId, this.agentName, this.sessionId, now).changes;
+      return reserved === 1 ? mapMessage(candidate) : null;
+    });
+  }
+
+  completeMessageDelivery(messageId: string): void {
+    const completed = this.#database
+      .prepare(
+        `UPDATE message_deliveries SET delivered_at = ?
+         WHERE message_id = ? AND agent_name = ? AND reserved_by_session = ?
+           AND delivered_at IS NULL`,
+      )
+      .run(this.#clock(), messageId, this.agentName, this.sessionId).changes;
+    if (completed !== 1) {
+      throw new SameTreeError(
+        'NOT_ASSIGNED',
+        `Message '${messageId}' is not reserved by this session.`,
+      );
+    }
+  }
+
+  releaseMessageDelivery(messageId: string): void {
+    this.#database
+      .prepare(
+        `DELETE FROM message_deliveries
+         WHERE message_id = ? AND agent_name = ? AND reserved_by_session = ?
+           AND delivered_at IS NULL`,
+      )
+      .run(messageId, this.agentName, this.sessionId);
   }
 
   acknowledgeMessage(messageId: string): Message {

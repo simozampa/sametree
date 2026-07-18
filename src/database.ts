@@ -37,6 +37,22 @@ const BROADCAST_RECIPIENT_SCHEMA = `
   ) STRICT;
 `;
 
+const MESSAGE_DELIVERY_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS message_deliveries (
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    agent_name TEXT NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+    reserved_by_session TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    reserved_at INTEGER NOT NULL,
+    delivered_at INTEGER,
+    PRIMARY KEY (message_id, agent_name),
+    CHECK(delivered_at IS NULL OR delivered_at >= reserved_at)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS message_deliveries_pending_session_idx
+    ON message_deliveries(reserved_by_session)
+    WHERE delivered_at IS NULL;
+`;
+
 const INITIAL_SCHEMA = `
   CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -113,6 +129,8 @@ const INITIAL_SCHEMA = `
 
   ${BROADCAST_RECIPIENT_SCHEMA}
 
+  ${MESSAGE_DELIVERY_SCHEMA}
+
   CREATE TABLE handoffs (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -174,7 +192,7 @@ function migrate(database: DatabaseType, now: number): void {
       .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
       .get() as { version: number };
 
-    if (current.version > 2) {
+    if (current.version > 3) {
       throw new SameTreeError(
         'DATABASE_ERROR',
         `This database uses unsupported schema version ${current.version}.`,
@@ -197,6 +215,12 @@ function migrate(database: DatabaseType, now: number): void {
       );
       database
         .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)')
+        .run(now);
+    }
+    if (current.version < 3) {
+      database.exec(MESSAGE_DELIVERY_SCHEMA);
+      database
+        .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)')
         .run(now);
     }
     database.exec('COMMIT');
