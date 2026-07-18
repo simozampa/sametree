@@ -11,8 +11,9 @@ At session start:
 During work:
 
 1. Claim a task and the smallest required file paths before editing.
-2. Poll the inbox at natural boundaries. Coordinate conflicts instead of overwriting another agent.
+2. Act on delivered peer messages. Coordinate conflicts instead of overwriting another agent.
 3. Make small atomic commits without co-author trailers.
 4. Release claims and update the task when finished; create a handoff when another agent must continue.
 
 SameTree claims are cooperative. They do not prevent direct writes, so following this protocol is required.
+Harness adapters deliver new messages automatically; do not start a manual inbox polling loop.

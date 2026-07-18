@@ -4,11 +4,11 @@ This repository is edited by multiple coding agents in one working tree. Treat e
 
 ## Coordination
 
-- Start every session by reading this policy, checking SameTree status, and reading your inbox.
+- Start every session by reading this policy and checking SameTree status.
 - Use a unique, stable agent name. Include your harness and role when you register.
 - Claim exact files or the smallest practical directory before editing. Claims are cooperative leases, not filesystem locks.
 - Do not edit a path claimed by another agent. Send a message and agree on an order instead.
-- Check your inbox after completing a task, before a commit, and before beginning unrelated work.
+- Act on automatically delivered peer messages and reply through SameTree when appropriate.
 - Record decisions and unfinished context in a handoff rather than relying on chat history.
 
 ## Git Discipline
