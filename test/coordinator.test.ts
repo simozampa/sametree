@@ -33,6 +33,34 @@ afterEach(() => {
 });
 
 describe('Coordinator', () => {
+  it('can omit lifecycle events while retaining a durable closed session', () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const coordinator = Coordinator.open({
+      cwd: repository.root,
+      agent: 'quiet-session',
+      recordSessionLifecycleEvents: false,
+    });
+    coordinators.push(coordinator);
+    const sessionId = coordinator.sessionId;
+
+    expect(coordinator.events({ after: 0 })).toEqual([]);
+    coordinator.close();
+
+    const database = new Database(resolveRepository(repository.root).databasePath, {
+      readonly: true,
+    });
+    expect(database.prepare('SELECT status FROM sessions WHERE id = ?').get(sessionId)).toEqual({
+      status: 'closed',
+    });
+    expect(
+      database.prepare('SELECT COUNT(*) AS count FROM events WHERE entity_id = ?').get(sessionId),
+    ).toEqual({
+      count: 0,
+    });
+    database.close();
+  });
+
   it('enforces task dependencies and active leases', () => {
     const { open } = setup();
     const author = open('author');

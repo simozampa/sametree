@@ -1,9 +1,11 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Coordinator } from '../src/coordinator.js';
+import { resolveRepository } from '../src/git.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
@@ -49,6 +51,32 @@ describe('CLI', () => {
     expect(result).toMatchObject({ code: 0, stderr: '' });
     expect(output.agent.name).toBe('cli-agent');
     expect(output.claims).toEqual([]);
+  });
+
+  it('omits lifecycle events for one-shot commands but keeps their session rows', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const result = await runCli(repository.root, 'quiet-cli', [
+      'task',
+      'create',
+      '--title',
+      'Quiet command',
+    ]);
+    const database = new Database(resolveRepository(repository.root).databasePath, {
+      readonly: true,
+    });
+    const events = database
+      .prepare('SELECT kind FROM events WHERE actor = ? ORDER BY sequence')
+      .all('quiet-cli') as Array<{ kind: string }>;
+    const sessions = database
+      .prepare('SELECT status FROM sessions WHERE agent_name = ?')
+      .all('quiet-cli');
+    database.close();
+
+    expect(result).toMatchObject({ code: 0, stderr: '' });
+    expect(events).toEqual([{ kind: 'task.created' }]);
+    expect(sessions).toEqual([{ status: 'closed' }]);
   });
 
   it('grants exactly one of two competing process claims', async () => {

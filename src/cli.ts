@@ -40,18 +40,22 @@ function objectJson(value: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-function openCoordinator(command: Command): Coordinator {
+function openCoordinator(
+  command: Command,
+  coordinatorOptions: { recordSessionLifecycleEvents?: boolean } = {},
+): Coordinator {
   const options = command.optsWithGlobals<GlobalOptions>();
   return Coordinator.open({
     agent: options.agent ?? process.env.SAMETREE_AGENT ?? '',
     cwd: options.cwd,
     harness: options.harness,
     role: options.role,
+    ...coordinatorOptions,
   });
 }
 
 function runWithCoordinator<T>(command: Command, operation: (coordinator: Coordinator) => T): void {
-  const coordinator = openCoordinator(command);
+  const coordinator = openCoordinator(command, { recordSessionLifecycleEvents: false });
   try {
     print(operation(coordinator));
   } finally {
@@ -505,14 +509,9 @@ hooks.command('install').action((_options: unknown, command: Command) => {
 
 const hook = program.command('hook', { hidden: true });
 hook.command('pre-commit').action((_options: unknown, command: Command) => {
-  const coordinator = openCoordinator(command);
-  try {
-    print(
-      checkPreCommit(coordinator.listClaims(), coordinator.agentName, coordinator.repository.root),
-    );
-  } finally {
-    coordinator.close();
-  }
+  runWithCoordinator(command, (coordinator) =>
+    checkPreCommit(coordinator.listClaims(), coordinator.agentName, coordinator.repository.root),
+  );
 });
 hook
   .command('commit-msg <message-path>')

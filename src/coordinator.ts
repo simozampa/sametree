@@ -36,6 +36,7 @@ export interface CoordinatorOptions {
   role?: string;
   databasePath?: string;
   clock?: () => number;
+  recordSessionLifecycleEvents?: boolean;
 }
 
 export interface CreateTaskInput {
@@ -206,6 +207,7 @@ export class Coordinator {
 
   readonly #database: DatabaseType;
   readonly #clock: () => number;
+  readonly #recordSessionLifecycleEvents: boolean;
   #closed = false;
 
   private constructor(options: CoordinatorOptions) {
@@ -213,6 +215,7 @@ export class Coordinator {
     this.config = loadConfig(this.repository.root);
     this.agentName = validateAgentName(options.agent);
     this.#clock = options.clock ?? Date.now;
+    this.#recordSessionLifecycleEvents = options.recordSessionLifecycleEvents ?? true;
     this.#database = openDatabase(this.repository, {
       ...(options.databasePath ? { databasePath: options.databasePath } : {}),
       now: this.#clock(),
@@ -245,10 +248,12 @@ export class Coordinator {
           now,
           now + this.config.sessionTtlSeconds * 1_000,
         );
-      this.#recordEvent('session.started', 'session', this.sessionId, {
-        harness: options.harness ?? 'other',
-        role: options.role ?? 'implementer',
-      });
+      if (this.#recordSessionLifecycleEvents) {
+        this.#recordEvent('session.started', 'session', this.sessionId, {
+          harness: options.harness ?? 'other',
+          role: options.role ?? 'implementer',
+        });
+      }
     });
   }
 
@@ -469,9 +474,11 @@ export class Coordinator {
       this.#database
         .prepare("UPDATE sessions SET status = 'closed', expires_at = ? WHERE id = ?")
         .run(this.#clock(), this.sessionId);
-      this.#recordEvent('session.closed', 'session', this.sessionId, {
-        releasedClaims: options.releaseClaims ?? false,
-      });
+      if (this.#recordSessionLifecycleEvents) {
+        this.#recordEvent('session.closed', 'session', this.sessionId, {
+          releasedClaims: options.releaseClaims ?? false,
+        });
+      }
     });
     this.#database.close();
     this.#closed = true;
