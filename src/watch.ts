@@ -1,7 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 
 import type { Coordinator } from './coordinator.js';
-import type { CoordinationEvent } from './types.js';
+import type { CoordinationEvent, Message } from './types.js';
 
 const PAGE_SIZE = 1_000;
 const MAX_HEARTBEAT_INTERVAL_MS = 20_000;
@@ -24,13 +24,55 @@ function terminalSafe(line: string): string {
   }).join('');
 }
 
-function formatJsonEvent(event: CoordinationEvent): string {
-  return Array.from(JSON.stringify(event), (character) => {
+function formatJson(value: unknown): string {
+  return Array.from(JSON.stringify(value), (character) => {
     const codePoint = character.codePointAt(0) ?? 0;
     return unsafeTerminalCodePoint(codePoint)
       ? `\\u${codePoint.toString(16).padStart(4, '0')}`
       : character;
   }).join('');
+}
+
+function liveness(coordinator: Coordinator, signal?: AbortSignal) {
+  const heartbeatIntervalMs = Math.min(
+    MAX_HEARTBEAT_INTERVAL_MS,
+    Math.floor((coordinator.config.sessionTtlSeconds * 1_000) / 3),
+  );
+  let rejectHeartbeat: (error: unknown) => void = () => undefined;
+  const heartbeatFailure = new Promise<never>((_resolve, reject) => {
+    rejectHeartbeat = reject;
+  });
+  void heartbeatFailure.catch(() => undefined);
+  const heartbeat = setInterval(() => {
+    try {
+      coordinator.heartbeat();
+    } catch (error) {
+      clearInterval(heartbeat);
+      rejectHeartbeat(error);
+    }
+  }, heartbeatIntervalMs);
+  heartbeat.unref();
+
+  let removeAbortListener: () => void = () => undefined;
+  const aborted = signal
+    ? new Promise<typeof ABORTED>((resolve) => {
+        const abort = () => resolve(ABORTED);
+        if (signal.aborted) abort();
+        else {
+          signal.addEventListener('abort', abort, { once: true });
+          removeAbortListener = () => signal.removeEventListener('abort', abort);
+        }
+      })
+    : new Promise<never>(() => undefined);
+
+  return {
+    aborted,
+    heartbeatFailure,
+    close: () => {
+      clearInterval(heartbeat);
+      removeAbortListener();
+    },
+  };
 }
 
 function payloadSummary(event: CoordinationEvent): string {
@@ -65,6 +107,18 @@ export function formatEvent(event: CoordinationEvent): string {
   const summary = payloadSummary(event);
   const line = `${time}  ${event.actor.padEnd(20)} ${event.kind.padEnd(21)} ${subject}${summary ? `  ${summary}` : ''}`;
   return terminalSafe(line);
+}
+
+export function formatMessage(message: Message): string {
+  const time = new Date(message.createdAt).toISOString();
+  const recipient = message.recipient ?? 'broadcast';
+  const task = message.taskId ? `; task ${message.taskId}` : '';
+  const header = `${time}  ${message.sender} -> ${recipient}  ${message.subject}  [${message.id}; thread ${message.threadId}${task}]`;
+  const body = message.body
+    .split('\n')
+    .map((line) => `  ${terminalSafe(line)}`)
+    .join('\n');
+  return `${terminalSafe(header)}\n${body}`;
 }
 
 function stdoutLine(line: string): Promise<void> {
@@ -121,40 +175,8 @@ export async function watchEvents(
   if (onceThrough !== null && cursor >= onceThrough) return cursor;
 
   const intervalMs = options.intervalMs ?? 1_000;
-  const heartbeatIntervalMs = Math.min(
-    MAX_HEARTBEAT_INTERVAL_MS,
-    Math.floor((coordinator.config.sessionTtlSeconds * 1_000) / 3),
-  );
   const write = options.write ?? stdoutLine;
-  let rejectHeartbeat: (error: unknown) => void = () => undefined;
-  const heartbeatFailure = new Promise<never>((_resolve, reject) => {
-    rejectHeartbeat = reject;
-  });
-  // A race attaches a rejection handler during each wait; this also covers synchronous work gaps.
-  void heartbeatFailure.catch(() => undefined);
-  const heartbeat = setInterval(() => {
-    try {
-      coordinator.heartbeat();
-    } catch (error) {
-      clearInterval(heartbeat);
-      rejectHeartbeat(error);
-    }
-  }, heartbeatIntervalMs);
-  heartbeat.unref();
-
-  let removeAbortListener: () => void = () => undefined;
-  const aborted = options.signal
-    ? new Promise<typeof ABORTED>((resolve) => {
-        const abort = () => resolve(ABORTED);
-        if (options.signal?.aborted) abort();
-        else {
-          options.signal?.addEventListener('abort', abort, { once: true });
-          removeAbortListener = () => {
-            options.signal?.removeEventListener('abort', abort);
-          };
-        }
-      })
-    : new Promise<never>(() => undefined);
+  const live = liveness(coordinator, options.signal);
 
   try {
     while (!options.signal?.aborted) {
@@ -165,10 +187,10 @@ export async function watchEvents(
         try {
           const result = await Promise.race([
             Promise.resolve()
-              .then(() => write(options.json ? formatJsonEvent(event) : formatEvent(event)))
+              .then(() => write(options.json ? formatJson(event) : formatEvent(event)))
               .then(() => true),
-            aborted,
-            heartbeatFailure,
+            live.aborted,
+            live.heartbeatFailure,
           ]);
           if (result === ABORTED) return cursor;
         } catch (error) {
@@ -180,17 +202,74 @@ export async function watchEvents(
 
       if (onceThrough !== null && cursor >= onceThrough) return cursor;
       if (fetched.length === PAGE_SIZE) {
-        if (!(await Promise.race([wait(0, options.signal), heartbeatFailure]))) return cursor;
+        if (!(await Promise.race([wait(0, options.signal), live.heartbeatFailure]))) return cursor;
         continue;
       }
       if (options.once) return cursor;
 
-      if (!(await Promise.race([wait(intervalMs, options.signal), heartbeatFailure])))
+      if (!(await Promise.race([wait(intervalMs, options.signal), live.heartbeatFailure])))
         return cursor;
     }
     return cursor;
   } finally {
-    clearInterval(heartbeat);
-    removeAbortListener();
+    live.close();
+  }
+}
+
+export async function followMessages(
+  coordinator: Coordinator,
+  options: {
+    intervalMs?: number;
+    json?: boolean;
+    once?: boolean;
+    prefix?: string;
+    signal?: AbortSignal;
+    write?: (line: string) => void | Promise<void>;
+    confirm?: (message: Message) => boolean | Promise<boolean>;
+  } = {},
+): Promise<number> {
+  const intervalMs = options.intervalMs ?? 1_000;
+  const write = options.write ?? stdoutLine;
+  const live = liveness(coordinator, options.signal);
+  let delivered = 0;
+  let reserved: Message | null = null;
+
+  try {
+    while (!options.signal?.aborted) {
+      reserved = coordinator.reserveNextMessageDelivery();
+      if (reserved) {
+        const message = reserved;
+        try {
+          const result = await Promise.race([
+            Promise.resolve()
+              .then(() => {
+                const output = options.json ? formatJson(message) : formatMessage(message);
+                return write(`${terminalSafe(options.prefix ?? '')}${output}`);
+              })
+              .then(() => true),
+            live.aborted,
+            live.heartbeatFailure,
+          ]);
+          if (result === ABORTED) return delivered;
+        } catch (error) {
+          if (brokenPipe(error)) return delivered;
+          throw error;
+        }
+        if (options.confirm && !(await options.confirm(message))) return delivered;
+        coordinator.completeMessageDelivery(message.id);
+        delivered += 1;
+        reserved = null;
+        continue;
+      }
+
+      if (options.once) return delivered;
+      if (!(await Promise.race([wait(intervalMs, options.signal), live.heartbeatFailure]))) {
+        return delivered;
+      }
+    }
+    return delivered;
+  } finally {
+    if (reserved) coordinator.releaseMessageDelivery(reserved.id);
+    live.close();
   }
 }

@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { Coordinator } from '../src/coordinator.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
@@ -14,10 +15,10 @@ interface ProcessResult {
   stdout: string;
 }
 
-function runCli(root: string, agent: string, args: string[]): Promise<ProcessResult> {
+function runCli(root: string, agent: string, args: string[], input = ''): Promise<ProcessResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cliPath, '--cwd', root, '--agent', agent, ...args], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
     let stderr = '';
@@ -27,6 +28,7 @@ function runCli(root: string, agent: string, args: string[]): Promise<ProcessRes
     child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
       stderr += chunk;
     });
+    child.stdin.end(input);
     child.once('error', reject);
     child.once('close', (code) => resolve({ code, stdout, stderr }));
   });
@@ -106,5 +108,32 @@ describe('CLI', () => {
     expect(result.stderr).toContain(
       "Watch options '--after' and '--tail' cannot be used together.",
     );
+  });
+
+  it('follows unread messages once as JSON Lines', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const recipient = Coordinator.open({ cwd: repository.root, agent: 'cli-recipient' });
+    recipient.close();
+    const sender = Coordinator.open({ cwd: repository.root, agent: 'sender' });
+    const message = sender.sendMessage({
+      to: 'cli-recipient',
+      subject: 'CLI delivery',
+      body: 'Deliver across the process boundary.',
+    });
+    sender.close();
+
+    const result = await runCli(
+      repository.root,
+      'cli-recipient',
+      ['message', 'follow', '--once', '--json', '--ack-stdin'],
+      `${message.id}\n`,
+    );
+
+    expect(result).toMatchObject({ code: 0, stderr: '' });
+    expect(JSON.parse(result.stdout)).toMatchObject({ id: message.id, readAt: null });
+    expect(
+      await runCli(repository.root, 'cli-recipient', ['message', 'follow', '--once', '--json']),
+    ).toMatchObject({ code: 0, stderr: '', stdout: '' });
   });
 });

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createInterface } from 'node:readline';
 import { Command, Option } from 'commander';
 
 import { Coordinator } from './coordinator.js';
@@ -8,7 +9,7 @@ import { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 import { initializeProject } from './project.js';
 import { setupProject } from './setup.js';
 import type { Harness, TaskPriority, TaskStatus } from './types.js';
-import { watchEvents } from './watch.js';
+import { followMessages, watchEvents } from './watch.js';
 
 interface GlobalOptions {
   agent?: string;
@@ -56,6 +57,44 @@ function runWithCoordinator<T>(command: Command, operation: (coordinator: Coordi
   } finally {
     coordinator.close();
   }
+}
+
+async function runStreaming(
+  command: Command,
+  operation: (coordinator: Coordinator, signal: AbortSignal) => Promise<unknown>,
+): Promise<void> {
+  const coordinator = openCoordinator(command);
+  const controller = new AbortController();
+  const abort = () => {
+    controller.abort();
+    if (!process.stdout.destroyed) process.stdout.destroy();
+  };
+  process.once('SIGINT', abort);
+  process.once('SIGTERM', abort);
+  try {
+    await operation(coordinator, controller.signal);
+  } finally {
+    process.removeListener('SIGINT', abort);
+    process.removeListener('SIGTERM', abort);
+    coordinator.close();
+  }
+}
+
+function stdinConfirmations(signal: AbortSignal) {
+  const lines = createInterface({ input: process.stdin, crlfDelay: Number.POSITIVE_INFINITY });
+  const iterator = lines[Symbol.asyncIterator]();
+  const close = () => lines.close();
+  signal.addEventListener('abort', close, { once: true });
+  return {
+    confirm: async (messageId: string) => {
+      const result = await iterator.next();
+      return !result.done && result.value === messageId;
+    },
+    close: () => {
+      signal.removeEventListener('abort', close);
+      lines.close();
+    },
+  };
 }
 
 const program = new Command()
@@ -287,6 +326,46 @@ message
     runWithCoordinator(command, (coordinator) => coordinator.acknowledgeMessage(messageId));
   });
 
+message
+  .command('follow')
+  .description('Follow unread messages addressed to this agent.')
+  .option('--interval <milliseconds>', 'poll interval', integer, 1_000)
+  .option('--json', 'emit one JSON message per line')
+  .option('--once', 'deliver available messages and exit')
+  .option('--ack-stdin', 'wait for each message ID on stdin before recording delivery')
+  .option('--prefix <text>', 'prefix each emitted message')
+  .action(
+    async (
+      options: {
+        interval: number;
+        json?: boolean;
+        once?: boolean;
+        ackStdin?: boolean;
+        prefix?: string;
+      },
+      command: Command,
+    ) => {
+      if (options.interval < 100 || options.interval > 60_000) {
+        throw new Error('Message follow interval must be between 100 and 60000 milliseconds.');
+      }
+      await runStreaming(command, async (coordinator, signal) => {
+        const confirmations = options.ackStdin ? stdinConfirmations(signal) : undefined;
+        try {
+          return await followMessages(coordinator, {
+            intervalMs: options.interval,
+            json: options.json ?? false,
+            once: options.once ?? false,
+            ...(options.prefix === undefined ? {} : { prefix: options.prefix }),
+            signal,
+            ...(confirmations ? { confirm: (message) => confirmations.confirm(message.id) } : {}),
+          });
+        } finally {
+          confirmations?.close();
+        }
+      });
+    },
+  );
+
 const handoff = program.command('handoff').description('Transfer work with structured context.');
 
 handoff
@@ -382,27 +461,15 @@ program
       if (options.interval < 100 || options.interval > 60_000) {
         throw new Error('Watch interval must be between 100 and 60000 milliseconds.');
       }
-      const coordinator = openCoordinator(command);
-      const controller = new AbortController();
-      const abort = () => {
-        controller.abort();
-        if (!process.stdout.destroyed) process.stdout.destroy();
-      };
-      process.once('SIGINT', abort);
-      process.once('SIGTERM', abort);
-      try {
-        await watchEvents(coordinator, {
+      await runStreaming(command, (coordinator, signal) =>
+        watchEvents(coordinator, {
           after: options.tail ? coordinator.snapshot().lastEventSequence : options.after,
           intervalMs: options.interval,
           json: options.json ?? false,
           once: options.once ?? false,
-          signal: controller.signal,
-        });
-      } finally {
-        process.removeListener('SIGINT', abort);
-        process.removeListener('SIGTERM', abort);
-        coordinator.close();
-      }
+          signal,
+        }),
+      );
     },
   );
 

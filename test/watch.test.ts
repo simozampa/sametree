@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Coordinator } from '../src/coordinator.js';
-import type { CoordinationEvent } from '../src/types.js';
-import { formatEvent, watchEvents } from '../src/watch.js';
+import type { CoordinationEvent, Message } from '../src/types.js';
+import { followMessages, formatEvent, formatMessage, watchEvents } from '../src/watch.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
@@ -24,6 +24,21 @@ function event(sequence: number, overrides: Partial<CoordinationEvent> = {}): Co
     entityId: `task-${sequence}`,
     payload: { priority: 'normal' },
     createdAt: Date.UTC(2026, 0, 1, 14, 2, 3),
+    ...overrides,
+  };
+}
+
+function message(overrides: Partial<Message> = {}): Message {
+  return {
+    id: 'message-1',
+    threadId: 'message-1',
+    sender: 'sender',
+    recipient: 'recipient',
+    taskId: null,
+    subject: 'Test message',
+    body: 'Please review this.',
+    createdAt: Date.UTC(2026, 0, 1, 14, 2, 3),
+    readAt: null,
     ...overrides,
   };
 }
@@ -225,5 +240,104 @@ describe('event watch', () => {
         },
       }),
     ).resolves.toBe(0);
+  });
+});
+
+describe('message follow', () => {
+  it('formats message metadata and neutralizes terminal controls', () => {
+    const formatted = formatMessage(
+      message({ subject: 'Review\u001b[31m', body: 'First line\nforged\u202e' }),
+    );
+
+    expect(formatted).toContain('sender -> recipient');
+    expect(formatted).toContain('message-1; thread message-1');
+    expect(formatted).toContain('Review?[31m');
+    expect(formatted).toContain('forged?');
+  });
+
+  it('drains unread messages once as JSON without acknowledging them', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const sender = Coordinator.open({ cwd: repository.root, agent: 'sender' });
+    const recipient = Coordinator.open({ cwd: repository.root, agent: 'recipient' });
+    coordinators.push(sender, recipient);
+    const sent = sender.sendMessage({
+      to: 'recipient',
+      subject: 'Follow this',
+      body: 'This should be emitted once.',
+    });
+    const lines: string[] = [];
+
+    expect(
+      await followMessages(recipient, {
+        json: true,
+        once: true,
+        prefix: 'SameTree message: ',
+        write: (line) => {
+          lines.push(line);
+        },
+      }),
+    ).toBe(1);
+    expect(JSON.parse((lines[0] ?? '').replace('SameTree message: ', ''))).toMatchObject({
+      id: sent.id,
+      readAt: null,
+    });
+    expect(await followMessages(recipient, { once: true })).toBe(0);
+    expect(recipient.inbox({ unreadOnly: true }).map((item) => item.id)).toContain(sent.id);
+  });
+
+  it('releases a message for retry when output fails', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const sender = Coordinator.open({ cwd: repository.root, agent: 'sender' });
+    const first = Coordinator.open({ cwd: repository.root, agent: 'recipient' });
+    const second = Coordinator.open({ cwd: repository.root, agent: 'recipient' });
+    coordinators.push(sender, first, second);
+    const sent = sender.sendMessage({
+      to: 'recipient',
+      subject: 'Retry this',
+      body: 'The first output fails.',
+    });
+
+    await expect(
+      followMessages(first, {
+        once: true,
+        write: () => {
+          throw new Error('output failed');
+        },
+      }),
+    ).rejects.toThrow('output failed');
+
+    expect(second.reserveNextMessageDelivery()?.id).toBe(sent.id);
+  });
+
+  it('records delivery only after downstream confirmation', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const sender = Coordinator.open({ cwd: repository.root, agent: 'sender' });
+    const first = Coordinator.open({ cwd: repository.root, agent: 'recipient' });
+    const second = Coordinator.open({ cwd: repository.root, agent: 'recipient' });
+    coordinators.push(sender, first, second);
+    const sent = sender.sendMessage({
+      to: 'recipient',
+      subject: 'Confirm this',
+      body: 'The adapter must accept the prompt first.',
+    });
+    let confirm: ((accepted: boolean) => void) | undefined;
+    const confirmation = new Promise<boolean>((resolve) => {
+      confirm = resolve;
+    });
+    const following = followMessages(first, {
+      once: true,
+      write: () => undefined,
+      confirm: () => confirmation,
+    });
+
+    await Promise.resolve();
+    expect(second.reserveNextMessageDelivery()).toBeNull();
+    confirm?.(true);
+    expect(await following).toBe(1);
+    expect(second.reserveNextMessageDelivery()).toBeNull();
+    expect(first.inbox({ unreadOnly: true }).map((item) => item.id)).toContain(sent.id);
   });
 });
