@@ -119,6 +119,33 @@ server.registerTool(
 );
 
 server.registerTool(
+  'sametree_task_force_takeover',
+  {
+    title: 'Force takeover of active work',
+    description:
+      'Reassign an active task and selected claims only after the user explicitly authorizes bypassing its live lease.',
+    inputSchema: {
+      taskId: z.string(),
+      expectedRevision: z.number().int().positive(),
+      reason: z.string().min(1).max(2_000),
+      userAuthorized: z.literal(true),
+      claimIds: z.array(z.string()).max(100).optional(),
+    },
+    outputSchema,
+    annotations: { destructiveHint: true },
+  },
+  ({ taskId, expectedRevision, reason, userAuthorized, claimIds }) =>
+    execute(() =>
+      coordinator.forceTakeoverTask(taskId, {
+        expectedRevision,
+        reason,
+        userAuthorized,
+        ...(claimIds !== undefined ? { claimIds } : {}),
+      }),
+    ),
+);
+
+server.registerTool(
   'sametree_task_update',
   {
     title: 'Update a task',

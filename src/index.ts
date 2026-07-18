@@ -3,6 +3,7 @@ export {
   Coordinator,
   type CoordinatorOptions,
   type CreateTaskInput,
+  type ForceTakeoverTaskInput,
   type UpdateTaskInput,
 } from './coordinator.js';
 export { type ErrorCode, errorResult, isSameTreeError, SameTreeError } from './errors.js';

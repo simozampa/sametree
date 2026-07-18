@@ -12,11 +12,15 @@ import { createTestRepository, type TestRepository } from './helpers.js';
 const repositories: TestRepository[] = [];
 const coordinators: Coordinator[] = [];
 
-function setup() {
+function setup(clock?: () => number) {
   const repository = createTestRepository();
   repositories.push(repository);
   const open = (agent: string) => {
-    const coordinator = Coordinator.open({ cwd: repository.root, agent });
+    const coordinator = Coordinator.open({
+      cwd: repository.root,
+      agent,
+      ...(clock ? { clock } : {}),
+    });
     coordinators.push(coordinator);
     return coordinator;
   };
@@ -81,6 +85,111 @@ describe('Coordinator', () => {
     expect(() => author.updateTask(assigned.id, { status: 'in_progress' })).toThrowError(
       expect.objectContaining({ code: 'TASK_BLOCKED' }),
     );
+  });
+
+  it('forcibly transfers active work and selected claims with user authorization', () => {
+    const { open } = setup();
+    const owner = open('owner');
+    const replacement = open('replacement');
+    const task = owner.createTask({ title: 'Transfer active work' });
+    const active = owner.claimTask(task.id);
+    const [claim] = owner.acquireClaims([{ path: 'src/active.ts' }]);
+    if (!claim) throw new Error('Expected an active claim.');
+
+    const takeover = replacement.forceTakeoverTask(task.id, {
+      claimIds: [claim.id],
+      expectedRevision: active.revision,
+      reason: 'The user reassigned this work while the first agent handles another task.',
+      userAuthorized: true,
+    });
+
+    expect(takeover.task).toMatchObject({ assignee: 'replacement', status: 'in_progress' });
+    expect(takeover.claims).toEqual([
+      expect.objectContaining({ id: claim.id, agentName: 'replacement' }),
+    ]);
+    expect(() => owner.updateTask(task.id, { description: 'Old owner update.' })).toThrowError(
+      expect.objectContaining({ code: 'NOT_ASSIGNED' }),
+    );
+    expect(
+      replacement.events({ after: 0 }).find((event) => event.kind === 'task.force_taken_over'),
+    ).toMatchObject({
+      actor: 'replacement',
+      payload: {
+        newAssignee: 'replacement',
+        previousAssignee: 'owner',
+        claimIds: [claim.id],
+        reason: 'The user reassigned this work while the first agent handles another task.',
+        userAuthorized: true,
+      },
+    });
+  });
+
+  it('requires authorization and a current revision for forced takeover', () => {
+    const { open } = setup();
+    const owner = open('owner');
+    const first = open('first-replacement');
+    const second = open('second-replacement');
+    const active = owner.claimTask(owner.createTask({ title: 'Contended takeover' }).id);
+
+    expect(() =>
+      first.forceTakeoverTask(active.id, {
+        expectedRevision: active.revision,
+        reason: 'No user authorization was supplied.',
+        userAuthorized: false,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'INVALID_INPUT' }));
+
+    first.forceTakeoverTask(active.id, {
+      expectedRevision: active.revision,
+      reason: 'The user selected the first replacement.',
+      userAuthorized: true,
+    });
+    expect(() =>
+      second.forceTakeoverTask(active.id, {
+        expectedRevision: active.revision,
+        reason: 'This instruction used a stale task view.',
+        userAuthorized: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'TASK_UNAVAILABLE' }));
+  });
+
+  it('uses normal task claiming instead of forced takeover after lease expiry', () => {
+    let now = Date.now();
+    const { open } = setup(() => now);
+    const owner = open('owner');
+    const replacement = open('replacement');
+    const active = owner.claimTask(owner.createTask({ title: 'Expired takeover' }).id);
+    now += 901_000;
+
+    expect(() =>
+      replacement.forceTakeoverTask(active.id, {
+        expectedRevision: active.revision,
+        reason: 'This lease has already expired.',
+        userAuthorized: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'TASK_UNAVAILABLE' }));
+    expect(replacement.claimTask(active.id).assignee).toBe('replacement');
+  });
+
+  it('rejects a forced partial claim transfer that creates overlap', () => {
+    const { open } = setup();
+    const owner = open('owner');
+    const replacement = open('replacement');
+    const active = owner.claimTask(owner.createTask({ title: 'Overlapping takeover' }).id);
+    owner.acquireClaims([{ path: 'src', kind: 'tree' }]);
+    const [nested] = owner.acquireClaims([{ path: 'src/api', kind: 'tree' }]);
+    if (!nested) throw new Error('Expected a nested claim.');
+
+    expect(() =>
+      replacement.forceTakeoverTask(active.id, {
+        claimIds: [nested.id],
+        expectedRevision: active.revision,
+        reason: 'The user selected only the nested path.',
+        userAuthorized: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'TASK_UNAVAILABLE' }));
+    expect(owner.listTasks().find((task) => task.id === active.id)?.assignee).toBe('owner');
+    expect(owner.listClaims().find((claim) => claim.id === nested.id)?.agentName).toBe('owner');
   });
 
   it('acquires claim batches atomically', () => {

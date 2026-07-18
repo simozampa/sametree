@@ -213,6 +213,30 @@ task
   });
 
 task
+  .command('force-takeover <task-id>')
+  .description('Reassign active work after the user explicitly authorizes it.')
+  .requiredOption('--revision <number>', 'expected current task revision', integer)
+  .requiredOption('--reason <text>', 'audit reason for bypassing the active lease')
+  .requiredOption('--user-authorized', 'confirm that the user explicitly authorized this takeover')
+  .option('--claim <claim-id>', 'active claim to transfer from the current owner', collect, [])
+  .action(
+    (
+      taskId: string,
+      options: { claim: string[]; reason: string; revision: number; userAuthorized: true },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.forceTakeoverTask(taskId, {
+          claimIds: options.claim,
+          expectedRevision: options.revision,
+          reason: options.reason,
+          userAuthorized: options.userAuthorized,
+        }),
+      );
+    },
+  );
+
+task
   .command('update <task-id>')
   .addOption(
     new Option('--status <status>').choices([

@@ -65,6 +65,66 @@ describe('CLI', () => {
     expect(failure?.stderr).toContain('CLAIM_CONFLICT');
   });
 
+  it('forcibly takes over active work with explicit user authorization', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const owner = Coordinator.open({ cwd: repository.root, agent: 'owner' });
+    const active = owner.claimTask(owner.createTask({ title: 'CLI takeover' }).id);
+    const [claim] = owner.acquireClaims([{ path: 'src/cli-takeover.ts' }]);
+    owner.close();
+    if (!claim) throw new Error('Expected an active claim.');
+
+    const result = await runCli(repository.root, 'replacement', [
+      'task',
+      'force-takeover',
+      active.id,
+      '--revision',
+      String(active.revision),
+      '--reason',
+      'The user reassigned this task.',
+      '--user-authorized',
+      '--claim',
+      claim.id,
+    ]);
+    const output = JSON.parse(result.stdout) as {
+      claims: Array<{ agentName: string; id: string }>;
+      task: { assignee: string };
+    };
+
+    expect(result).toMatchObject({ code: 0, stderr: '' });
+    expect(output.task.assignee).toBe('replacement');
+    expect(output.claims).toEqual([
+      expect.objectContaining({ id: claim.id, agentName: 'replacement' }),
+    ]);
+  });
+
+  it('grants exactly one of two competing forced takeovers', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const owner = Coordinator.open({ cwd: repository.root, agent: 'owner' });
+    const active = owner.claimTask(owner.createTask({ title: 'Contended CLI takeover' }).id);
+    owner.close();
+    const args = [
+      'task',
+      'force-takeover',
+      active.id,
+      '--revision',
+      String(active.revision),
+      '--reason',
+      'The user requested one replacement.',
+      '--user-authorized',
+    ];
+
+    const results = await Promise.all([
+      runCli(repository.root, 'replacement-a', args),
+      runCli(repository.root, 'replacement-b', args),
+    ]);
+
+    expect(results.filter((result) => result.code === 0)).toHaveLength(1);
+    const failure = results.find((result) => result.code !== 0);
+    expect(failure?.stderr).toContain('TASK_UNAVAILABLE');
+  });
+
   it('returns one structured error for invalid commands', async () => {
     const repository = createTestRepository();
     repositories.push(repository);

@@ -53,6 +53,13 @@ export interface UpdateTaskInput {
   expectedRevision?: number;
 }
 
+export interface ForceTakeoverTaskInput {
+  claimIds?: string[];
+  expectedRevision: number;
+  reason: string;
+  userAuthorized: boolean;
+}
+
 export interface AcquireClaimInput {
   path: string;
   kind?: ClaimKind;
@@ -312,6 +319,73 @@ export class Coordinator {
     ).map((row) => stringValue(row, 'id'));
   }
 
+  #transferClaims(
+    claimIds: string[],
+    fromAgent: string,
+    now: number,
+    conflictCode: 'HANDOFF_CONFLICT' | 'TASK_UNAVAILABLE' = 'HANDOFF_CONFLICT',
+  ): PathClaim[] {
+    const selectedIds = [...new Set(claimIds)];
+    if (selectedIds.length > 100) {
+      throw new SameTreeError('INVALID_INPUT', 'Transfer at most 100 claims at once.');
+    }
+    const selectedClaims = selectedIds.map((claimId) => {
+      const claim = this.#database
+        .prepare(
+          `SELECT * FROM path_claims
+           WHERE id = ? AND agent_name = ? AND expires_at > ?`,
+        )
+        .get(claimId, fromAgent, now) as Row | undefined;
+      if (!claim) {
+        throw new SameTreeError(
+          conflictCode,
+          `Claim '${claimId}' is no longer transferable from ${fromAgent}.`,
+        );
+      }
+      return claim;
+    });
+    const sourceClaims = this.#database
+      .prepare('SELECT * FROM path_claims WHERE agent_name = ? AND expires_at > ?')
+      .all(fromAgent, now) as Row[];
+    for (const selected of selectedClaims) {
+      const overlap = sourceClaims.find(
+        (candidate) =>
+          !selectedIds.includes(stringValue(candidate, 'id')) &&
+          claimsOverlap(
+            {
+              comparisonPath: stringValue(selected, 'comparison_path'),
+              kind: stringValue(selected, 'kind') as ClaimKind,
+            },
+            {
+              comparisonPath: stringValue(candidate, 'comparison_path'),
+              kind: stringValue(candidate, 'kind') as ClaimKind,
+            },
+          ),
+      );
+      if (overlap) {
+        throw new SameTreeError(
+          conflictCode,
+          `Claim '${stringValue(selected, 'id')}' overlaps an unselected source claim.`,
+          { overlappingClaim: mapClaim(overlap) },
+        );
+      }
+    }
+
+    const expiresAt = now + this.config.claimTtlSeconds * 1_000;
+    const transfer = this.#database.prepare(
+      `UPDATE path_claims SET agent_name = ?, session_id = ?, expires_at = ?
+       WHERE id = ? AND agent_name = ? AND expires_at > ?`,
+    );
+    for (const claimId of selectedIds) {
+      transfer.run(this.agentName, this.sessionId, expiresAt, claimId, fromAgent, now);
+    }
+    return selectedClaims.map((claim) => ({
+      ...mapClaim(claim),
+      agentName: this.agentName,
+      expiresAt,
+    }));
+  }
+
   #nextDeliverableMessage(now: number): Row | undefined {
     return this.#database
       .prepare(
@@ -507,6 +581,84 @@ export class Coordinator {
         previousAssignee: task.assignee,
       });
       return this.#task(taskId);
+    });
+  }
+
+  forceTakeoverTask(
+    taskId: string,
+    input: ForceTakeoverTaskInput,
+  ): { claims: PathClaim[]; task: Task } {
+    if (!input.userAuthorized) {
+      throw new SameTreeError(
+        'INVALID_INPUT',
+        'Forced takeover requires explicit user authorization.',
+      );
+    }
+    if (!Number.isInteger(input.expectedRevision) || input.expectedRevision < 1) {
+      throw new SameTreeError(
+        'INVALID_INPUT',
+        'Expected task revision must be a positive integer.',
+      );
+    }
+    const reason = requireText(input.reason, 'Takeover reason', 2_000);
+    const claimIds = [...new Set(input.claimIds ?? [])];
+    const now = this.#clock();
+
+    return immediateTransaction(this.#database, () => {
+      const task = this.#task(taskId);
+      if (task.revision !== input.expectedRevision) {
+        throw new SameTreeError(
+          'TASK_UNAVAILABLE',
+          `Task '${taskId}' changed from revision ${input.expectedRevision} to ${task.revision}.`,
+          { currentRevision: task.revision },
+        );
+      }
+      if (
+        task.status !== 'in_progress' ||
+        !task.assignee ||
+        task.leaseExpiresAt === null ||
+        task.leaseExpiresAt <= now
+      ) {
+        throw new SameTreeError(
+          'TASK_UNAVAILABLE',
+          `Task '${taskId}' does not have an active execution lease; use normal task claiming instead.`,
+        );
+      }
+      if (task.assignee === this.agentName) {
+        throw new SameTreeError('INVALID_INPUT', `Task '${taskId}' is already assigned to you.`);
+      }
+      const blockers = this.#unfinishedDependencies(taskId);
+      if (blockers.length > 0) {
+        throw new SameTreeError('TASK_BLOCKED', `Task '${taskId}' has unfinished dependencies.`, {
+          dependencies: blockers,
+        });
+      }
+
+      const previousAssignee = task.assignee;
+      const claims = this.#transferClaims(claimIds, previousAssignee, now, 'TASK_UNAVAILABLE');
+      this.#database
+        .prepare(
+          `UPDATE tasks SET assignee = ?, claimed_by_session = ?, lease_expires_at = ?,
+             status = 'in_progress', revision = revision + 1, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          this.agentName,
+          this.sessionId,
+          now + this.config.taskLeaseSeconds * 1_000,
+          now,
+          taskId,
+        );
+      this.#recordEvent('task.force_taken_over', 'task', taskId, {
+        newAssignee: this.agentName,
+        previousAssignee,
+        previousLeaseExpiresAt: task.leaseExpiresAt,
+        previousRevision: task.revision,
+        claimIds,
+        reason,
+        userAuthorized: true,
+      });
+      return { task: this.#task(taskId), claims };
     });
   }
 
@@ -1070,61 +1222,7 @@ export class Coordinator {
         const claimIds = Array.isArray(context.claimIds)
           ? context.claimIds.filter((value): value is string => typeof value === 'string')
           : [];
-        const selectedClaims = claimIds.map((claimId) => {
-          const claim = this.#database
-            .prepare(
-              `SELECT * FROM path_claims
-               WHERE id = ? AND agent_name = ? AND expires_at > ?`,
-            )
-            .get(claimId, stringValue(row, 'from_agent'), now) as Row | undefined;
-          if (!claim) {
-            throw new SameTreeError(
-              'HANDOFF_CONFLICT',
-              `Claim '${claimId}' is no longer transferable.`,
-            );
-          }
-          return claim;
-        });
-        const sourceClaims = this.#database
-          .prepare('SELECT * FROM path_claims WHERE agent_name = ? AND expires_at > ?')
-          .all(stringValue(row, 'from_agent'), now) as Row[];
-        for (const selected of selectedClaims) {
-          const overlap = sourceClaims.find(
-            (candidate) =>
-              !claimIds.includes(stringValue(candidate, 'id')) &&
-              claimsOverlap(
-                {
-                  comparisonPath: stringValue(selected, 'comparison_path'),
-                  kind: stringValue(selected, 'kind') as ClaimKind,
-                },
-                {
-                  comparisonPath: stringValue(candidate, 'comparison_path'),
-                  kind: stringValue(candidate, 'kind') as ClaimKind,
-                },
-              ),
-          );
-          if (overlap) {
-            throw new SameTreeError(
-              'HANDOFF_CONFLICT',
-              `Claim '${stringValue(selected, 'id')}' overlaps an unselected source claim.`,
-              { overlappingClaim: mapClaim(overlap) },
-            );
-          }
-        }
-        const transfer = this.#database.prepare(
-          `UPDATE path_claims SET agent_name = ?, session_id = ?, expires_at = ?
-           WHERE id = ? AND agent_name = ? AND expires_at > ?`,
-        );
-        for (const claimId of claimIds) {
-          transfer.run(
-            this.agentName,
-            this.sessionId,
-            now + this.config.claimTtlSeconds * 1_000,
-            claimId,
-            stringValue(row, 'from_agent'),
-            now,
-          );
-        }
+        this.#transferClaims(claimIds, stringValue(row, 'from_agent'), now);
       }
 
       this.#recordEvent(`handoff.${status}`, 'handoff', handoffId, { taskId: task.id });

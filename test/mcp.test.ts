@@ -7,6 +7,7 @@ import {
 } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { Coordinator } from '../src/coordinator.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
@@ -40,7 +41,9 @@ describe('MCP server', () => {
     const tools = await client.listTools();
     const response = await client.callTool({ name: 'sametree_status', arguments: {} });
 
-    expect(tools.tools.map((tool) => tool.name)).toContain('sametree_claim_acquire');
+    expect(tools.tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(['sametree_claim_acquire', 'sametree_task_force_takeover']),
+    );
     expect(response.isError).not.toBe(true);
     expect(response.structuredContent).toMatchObject({
       result: { agent: { name: 'mcp-agent', harness: 'opencode' } },
@@ -89,5 +92,49 @@ describe('MCP server', () => {
     expect(firstStatus.result.agent.name).toMatch(/^opencode-\d+$/u);
     expect(secondStatus.result.agent.name).toMatch(/^opencode-\d+$/u);
     expect(secondStatus.result.agent.name).not.toBe(firstStatus.result.agent.name);
+  });
+
+  it('forcibly takes over active work through an explicit MCP call', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const owner = Coordinator.open({ cwd: repository.root, agent: 'owner' });
+    const active = owner.claimTask(owner.createTask({ title: 'MCP takeover' }).id);
+    const [claim] = owner.acquireClaims([{ path: 'src/mcp-takeover.ts' }]);
+    owner.close();
+    if (!claim) throw new Error('Expected an active claim.');
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [mcpPath],
+      cwd: repository.root,
+      env: {
+        ...getDefaultEnvironment(),
+        SAMETREE_AGENT: 'replacement',
+        SAMETREE_HARNESS: 'opencode',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'sametree-test', version: '1.0.0' });
+    clients.push(client);
+    await client.connect(transport);
+
+    const response = await client.callTool({
+      name: 'sametree_task_force_takeover',
+      arguments: {
+        taskId: active.id,
+        expectedRevision: active.revision,
+        reason: 'The user reassigned this task.',
+        userAuthorized: true,
+        claimIds: [claim.id],
+      },
+    });
+
+    expect(response.isError).not.toBe(true);
+    expect(response.structuredContent).toMatchObject({
+      result: {
+        task: { assignee: 'replacement' },
+        claims: [{ id: claim.id, agentName: 'replacement' }],
+      },
+    });
   });
 });

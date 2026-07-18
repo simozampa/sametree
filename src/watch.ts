@@ -95,6 +95,7 @@ function payloadSummary(event: CoordinationEvent): string {
       return `${String(payload.fromStatus ?? '')} -> ${String(payload.toStatus ?? '')}`;
     case 'task.claimed':
     case 'task.taken_over':
+    case 'task.force_taken_over':
       return payload.previousAssignee ? `from ${String(payload.previousAssignee)}` : '';
     default:
       return '';
