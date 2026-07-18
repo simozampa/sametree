@@ -12,7 +12,8 @@ This repository is edited by multiple coding agents in one working tree. Treat e
 
 - Start every session by reading this policy and checking SameTree status.
 - Use a unique, stable agent name. Include your harness and role when you register.
-- Claim exact files or the smallest practical directory before editing. Claims are cooperative leases, not filesystem locks.
+- Inspect active claims before editing. Acquire narrow path claims when concurrent editing is plausible, ownership is ambiguous, or a collision would be costly; claim when uncertain.
+- Prefer exact files or the smallest practical tree. Broad tree claims unnecessarily block independent work, and all claims remain cooperative leases rather than filesystem locks.
 - Do not edit a path claimed by another agent. Send a message and agree on an order instead.
 - Act on automatically delivered peer messages and reply through SameTree when appropriate.
 - Record decisions and unfinished context in a handoff rather than relying on chat history.
@@ -36,7 +37,7 @@ export const IMPLEMENTER_ROLE_TEMPLATE = `# Implementer
 
 Own a narrow task from investigation through verification.
 
-- Confirm dependencies and claim paths before editing.
+- Confirm dependencies and inspect active claims before editing; claim narrow paths when overlap is plausible or uncertain.
 - Prefer the smallest correct change that matches existing patterns.
 - Ask the reviewer focused questions through SameTree messages when a decision is ambiguous.
 - Commit coherent increments, then send the task ID and commit hash for review.
@@ -65,12 +66,13 @@ At session start:
 
 During work:
 
-1. Claim a task and the smallest required file paths before editing.
+1. Claim a task. Acquire narrow path claims when concurrent editing is plausible, ownership is ambiguous, or a collision would be costly; claim when uncertain.
 2. Act on delivered peer messages. Coordinate conflicts instead of overwriting another agent.
 3. Make small atomic commits without co-author trailers.
 4. Release claims and update the task when finished; create a handoff when another agent must continue.
 5. Never force takeover a live task unless the user explicitly instructs you to; include the current revision, reason, and only the claims they want transferred.
 
 SameTree claims are cooperative. They do not prevent direct writes, so following this protocol is required.
+Prefer exact files or the smallest practical tree; broad tree claims can block unrelated work.
 Harness adapters deliver new messages automatically; do not start a manual inbox polling loop.
 `;

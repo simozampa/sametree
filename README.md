@@ -71,7 +71,7 @@ After upgrading SameTree, refresh Claude Code's cached plugin with `claude plugi
 The generated agent instructions tell each agent to:
 
 1. Check current tasks, claims, and policy.
-2. Claim a task and the smallest paths it needs.
+2. Claim a task and use narrow path claims when concurrent editing is plausible or uncertain.
 3. Coordinate conflicts instead of overwriting another agent.
 4. Update or hand off work and release claims when finished.
 
@@ -133,7 +133,7 @@ SameTree is designed for trusted agents on one machine. It coordinates edits but
 
 ### Can multiple Claude Code and OpenCode agents safely work in the same repository?
 
-SameTree reduces collisions between Claude Code and OpenCode instances sharing one checkout. Each agent gets its own identity, sees the same task board, and claims files before editing them.
+SameTree reduces collisions between Claude Code and OpenCode instances sharing one checkout. Each agent gets its own identity, sees the same task board, and can claim contested files before editing them.
 
 ### Do parallel coding agents need separate branches or Git worktrees?
 

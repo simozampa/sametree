@@ -113,6 +113,9 @@ describe('project setup', () => {
     expect(readFileSync(path.join(repository.root, 'AGENTS.md'), 'utf8')).toContain(
       'acknowledge the policy only when `acknowledgedAt` is null',
     );
+    expect(readFileSync(path.join(repository.root, 'AGENTS.md'), 'utf8')).toContain(
+      'use narrow path claims when concurrent editing is plausible or uncertain',
+    );
     expect(
       JSON.parse(readFileSync(path.join(repository.root, '.opencode', 'tui.json'), 'utf8')),
     ).toMatchObject({ plugin: ['./sametree-tui.ts'] });

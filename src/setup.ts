@@ -36,7 +36,7 @@ const AGENT_INSTRUCTIONS = `<!-- sametree:coordination -->
 
 Read and follow \`.sametree/coordination.md\`, \`.sametree/policy.md\`, and the role matching your task under \`.sametree/roles/\`.
 
-Use SameTree before editing: check status, inbox, and policy state; acknowledge the policy only when \`acknowledgedAt\` is null, claim the task and required paths, and release or hand off ownership when finished.
+Use SameTree before editing: check status, inbox, policy state, and active claims; acknowledge the policy only when \`acknowledgedAt\` is null, claim the task, use narrow path claims when concurrent editing is plausible or uncertain, and release or hand off ownership when finished.
 `;
 
 const INITIALIZATION_FILES = PROJECT_FILE_TEMPLATES.map((file) => file.relativePath);

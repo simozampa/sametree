@@ -36,6 +36,24 @@ describe('generated state paths', () => {
     ).toContain('acknowledge the returned hash only when `acknowledgedAt` is null');
   });
 
+  it('generates contention-based path claim guidance', () => {
+    const repository = createTestRepository({ initialize: false });
+    repositories.push(repository);
+
+    initializeProject(repository.root);
+    const coordination = readFileSync(
+      path.join(repository.root, '.sametree', 'coordination.md'),
+      'utf8',
+    );
+    const policy = readFileSync(path.join(repository.root, '.sametree', 'policy.md'), 'utf8');
+
+    expect(coordination).toContain(
+      'Acquire narrow path claims when concurrent editing is plausible',
+    );
+    expect(coordination).toContain('broad tree claims can block unrelated work');
+    expect(policy).toContain('claim when uncertain');
+  });
+
   it('refuses to initialize through a symlinked policy directory', () => {
     const repository = createTestRepository();
     repositories.push(repository);

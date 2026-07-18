@@ -76,6 +76,8 @@ Two claims overlap when:
 
 Agents may hold overlapping claims with themselves. Any overlap with another agent rejects acquisition. A request containing multiple paths commits all claims or none.
 
+Agents should inspect active claims before editing and acquire a narrow claim when concurrent editing is plausible, ownership is ambiguous, or a collision would be costly. When uncertain, claim. Prefer exact files or the smallest practical tree because broad tree claims can block unrelated work.
+
 Claims expire unless renewed and should be released immediately when work ends. They are advisory and do not modify filesystem permissions.
 
 ## Messages
