@@ -182,6 +182,20 @@ function compareVersions(left: string, right: string): number {
   return 0;
 }
 
+function isBusy(error: unknown): boolean {
+  const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+  return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED';
+}
+
+function enableWal(database: DatabaseType): void {
+  try {
+    database.pragma('journal_mode = WAL');
+  } catch (error) {
+    // Another first-use process can hold the schema lock after it has already enabled WAL.
+    if (!isBusy(error)) throw error;
+  }
+}
+
 function migrate(database: DatabaseType, now: number): void {
   database.exec('BEGIN IMMEDIATE');
   try {
@@ -243,10 +257,10 @@ export function openDatabase(
   const database = new Database(databasePath, { timeout: 2_500 });
   if (databasePath !== ':memory:') chmodSync(databasePath, 0o600);
 
-  database.pragma('foreign_keys = ON');
-  database.pragma('journal_mode = WAL');
-  database.pragma('synchronous = FULL');
   database.pragma('busy_timeout = 2500');
+  database.pragma('foreign_keys = ON');
+  enableWal(database);
+  database.pragma('synchronous = FULL');
   database.pragma('trusted_schema = OFF');
   database.pragma('cell_size_check = ON');
   database.pragma('wal_autocheckpoint = 1000');
@@ -263,6 +277,7 @@ export function openDatabase(
   }
 
   migrate(database, options.now ?? Date.now());
+  if (database.pragma('journal_mode', { simple: true }) !== 'wal') enableWal(database);
   return database;
 }
 

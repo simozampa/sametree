@@ -155,6 +155,23 @@ describe('CLI', () => {
     expect(failure?.stderr).toContain('CLAIM_CONFLICT');
   });
 
+  it('opens a fresh database concurrently without leaking lock errors', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const results = await Promise.all(
+      Array.from({ length: 6 }, (_, index) =>
+        runCli(repository.root, `starter-${index}`, [
+          'claim',
+          'acquire',
+          `src/startup-${index}.ts`,
+        ]),
+      ),
+    );
+
+    for (const result of results) expect(result).toMatchObject({ code: 0, stderr: '' });
+  });
+
   it('returns a compact claim acquisition receipt', async () => {
     const repository = createTestRepository();
     repositories.push(repository);
