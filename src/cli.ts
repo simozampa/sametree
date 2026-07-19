@@ -152,7 +152,7 @@ program
 
 program
   .command('status')
-  .description('Show active agents, current work, claims, and unread coordination state.')
+  .description('Show live Git state, active agents, current work, claims, and unread state.')
   .option('--all-agents', 'include inactive registered agents')
   .option('--all-tasks', 'include done and cancelled tasks')
   .action((options: { allAgents?: boolean; allTasks?: boolean }, command: Command) => {

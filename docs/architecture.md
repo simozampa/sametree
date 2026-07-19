@@ -101,6 +101,8 @@ A typical mutation is:
 
 No Git command, filesystem traversal, or network operation runs inside a database transaction.
 
+Status queries observe Git's porcelain-v2 branch and worktree state immediately before reading coordination rows. This derived state is never persisted, so a long-running MCP process reflects branch switches, commits, and dirty changes on its next status call.
+
 ## Path Safety
 
 Claims accept exact files and recursive directory trees, not arbitrary globs. Predictable overlap is more important than compact syntax.

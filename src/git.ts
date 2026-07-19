@@ -3,6 +3,7 @@ import { realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import { SameTreeError } from './errors.js';
+import type { GitWorktreeContext } from './types.js';
 
 export interface RepositoryContext {
   root: string;
@@ -61,6 +62,32 @@ export function gitConfig(cwd: string, key: string, type?: 'bool' | 'path'): str
   } catch {
     return null;
   }
+}
+
+export function readGitWorktreeContext(repositoryRoot: string): GitWorktreeContext {
+  const lines = git(repositoryRoot, [
+    '--no-optional-locks',
+    'status',
+    '--porcelain=v2',
+    '--branch',
+    '--no-ahead-behind',
+    '--untracked-files=normal',
+  ]).split('\n');
+  const oidPrefix = '# branch.oid ';
+  const headPrefix = '# branch.head ';
+  const oid = lines.find((line) => line.startsWith(oidPrefix))?.slice(oidPrefix.length);
+  const head = lines.find((line) => line.startsWith(headPrefix))?.slice(headPrefix.length);
+  if (!oid || !head) {
+    throw new SameTreeError('NOT_GIT_REPOSITORY', 'Git did not report worktree HEAD state.');
+  }
+  const detached = head === '(detached)';
+  return {
+    root: realpathSync(repositoryRoot),
+    branch: detached ? null : head,
+    commit: oid === '(initial)' ? null : oid,
+    detached,
+    dirty: lines.some((line) => line.length > 0 && !line.startsWith('# ')),
+  };
 }
 
 export function stagedFiles(repositoryRoot: string): string[] {

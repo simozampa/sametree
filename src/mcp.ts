@@ -56,7 +56,7 @@ server.registerTool(
   {
     title: 'SameTree status',
     description:
-      'Read active agents, nonterminal tasks, claims, unread messages, handoffs, and the event cursor. Historical rows are opt-in.',
+      'Read live Git worktree state, active agents, nonterminal tasks, claims, unread messages, handoffs, and the event cursor. Historical rows are opt-in.',
     inputSchema: {
       includeInactiveAgents: z.boolean().optional(),
       includeTerminalTasks: z.boolean().optional(),

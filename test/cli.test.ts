@@ -65,11 +65,16 @@ describe('CLI', () => {
     repositories.push(repository);
 
     const result = await runCli(repository.root, 'cli-agent', ['status']);
-    const output = JSON.parse(result.stdout) as { agent: { name: string }; claims: unknown[] };
+    const output = JSON.parse(result.stdout) as {
+      agent: { name: string };
+      claims: unknown[];
+      git: { branch: string | null; commit: string | null; root: string };
+    };
 
     expect(result).toMatchObject({ code: 0, stderr: '' });
     expect(output.agent.name).toBe('cli-agent');
     expect(output.claims).toEqual([]);
+    expect(output.git).toMatchObject({ branch: 'main', commit: null, root: repository.root });
   });
 
   it('runs doctor without an agent or session registration', async () => {

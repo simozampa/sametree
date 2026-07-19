@@ -46,7 +46,10 @@ describe('MCP server', () => {
     );
     expect(response.isError).not.toBe(true);
     expect(response.structuredContent).toMatchObject({
-      result: { agent: { name: 'mcp-agent', harness: 'opencode' } },
+      result: {
+        agent: { name: 'mcp-agent', harness: 'opencode' },
+        git: { branch: 'main', commit: null, root: repository.root },
+      },
     });
     const content = response.content as Array<{ text?: string; type: string }>;
     const text = content.find((item) => item.type === 'text')?.text;

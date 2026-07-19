@@ -26,6 +26,7 @@ export type {
   CoordinationEvent,
   CoordinationSnapshot,
   DoctorReport,
+  GitWorktreeContext,
   Handoff,
   HandoffStatus,
   Harness,

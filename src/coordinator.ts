@@ -8,7 +8,7 @@ import { loadConfig, POLICY_FILE, type SameTreeConfig } from './config.js';
 import { immediateTransaction, openDatabase } from './database.js';
 import { inspectDatabase } from './doctor.js';
 import { SameTreeError } from './errors.js';
-import { type RepositoryContext, resolveRepository } from './git.js';
+import { type RepositoryContext, readGitWorktreeContext, resolveRepository } from './git.js';
 import { claimsOverlap, normalizeClaim } from './paths.js';
 import type {
   Agent,
@@ -1398,6 +1398,7 @@ export class Coordinator {
   }
 
   snapshot(options: SnapshotOptions = {}): CoordinationSnapshot {
+    const git = readGitWorktreeContext(this.repository.root);
     return this.#database.transaction(() => {
       const agentRow = this.#database
         .prepare('SELECT * FROM agents WHERE name = ?')
@@ -1428,6 +1429,7 @@ export class Coordinator {
         .get() as Row;
 
       return {
+        git,
         agent: mapAgent(agentRow as Row),
         session: mapSession(sessionRow as Row),
         agents: this.listAgents({ activeOnly: !options.includeInactiveAgents }),

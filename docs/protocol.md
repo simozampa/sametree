@@ -46,6 +46,8 @@ Assignments are durable agent ownership. Execution leases identify the active se
 
 Status is a current-state view by default: it includes agents with a live session and at most 100 nonterminal tasks. Callers can explicitly include inactive agents and terminal tasks. Task listing defaults to 25 nonterminal rows, accepts a maximum of 100, and uses the last returned task ID as the `after` cursor. A status filter selects that state even when it is terminal.
 
+Every status response also observes the live Git worktree root, branch or detached state, full commit ID, and dirty state. An unborn branch has a `null` commit; detached HEAD has a `null` branch. Dirty state includes staged, unstaged, conflicted, submodule, and untracked changes, but not ignored files. Git state is queried on demand outside the SQLite transaction, so it remains current but is not atomically synchronized with coordination rows.
+
 ### Forced Takeover
 
 Normal task claiming never changes another agent's assignment. When the user explicitly reassigns work, `sametree_task_force_takeover` or `sametree task force-takeover` transfers it regardless of whether its execution lease is live or expired.
