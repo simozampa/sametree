@@ -61,6 +61,60 @@ describe('Coordinator', () => {
     database.close();
   });
 
+  it('keeps status compact while preserving opt-in history', () => {
+    const { open } = setup();
+    const historical = open('historical');
+    const completed = historical.claimTask(historical.createTask({ title: 'Completed work' }).id);
+    historical.updateTask(completed.id, { status: 'done' });
+    historical.close();
+    const observer = open('observer');
+
+    const current = observer.snapshot();
+    expect(current.agents.map((agent) => agent.name)).toEqual(['observer']);
+    expect(current.tasks).toEqual([]);
+
+    const history = observer.snapshot({
+      includeInactiveAgents: true,
+      includeTerminalTasks: true,
+    });
+    expect(history.agents.map((agent) => agent.name)).toEqual(
+      expect.arrayContaining(['historical', 'observer']),
+    );
+    expect(history.tasks).toEqual([expect.objectContaining({ id: completed.id, status: 'done' })]);
+  });
+
+  it('pages task history with stable task cursors', () => {
+    const { open } = setup(() => 1_000);
+    const author = open('author');
+    const created = [
+      author.createTask({ title: 'One' }),
+      author.createTask({ title: 'Two' }),
+      author.createTask({ title: 'Three' }),
+      author.createTask({ title: 'Four' }),
+    ];
+
+    const first = author.listTasks({ limit: 2 });
+    const cursor = first.at(-1)?.id;
+    if (!cursor) throw new Error('Expected a task cursor.');
+    const second = author.listTasks({ after: cursor, limit: 2 });
+
+    expect([...first, ...second].map((task) => task.id).sort()).toEqual(
+      created.map((task) => task.id).sort(),
+    );
+    expect(new Set([...first, ...second].map((task) => task.id)).size).toBe(4);
+  });
+
+  it('limits direct event reads to 25 rows by default', () => {
+    const { open } = setup();
+    const author = open('author');
+    for (let index = 0; index < 30; index += 1) {
+      author.createTask({ title: `Task ${index}` });
+    }
+
+    expect(author.events()).toHaveLength(25);
+    expect(author.events({ limit: 30 })).toHaveLength(30);
+  });
+
   it('enforces task dependencies and active leases', () => {
     const { open } = setup();
     const author = open('author');
@@ -578,8 +632,16 @@ describe('Coordinator', () => {
 
     expect(policy.acknowledgedAt).toBeNull();
     const acknowledged = author.acknowledgePolicy(policy.hash);
-    expect(acknowledged.acknowledgedAt).not.toBeNull();
-    expect(author.acknowledgePolicy(policy.hash).acknowledgedAt).toBe(acknowledged.acknowledgedAt);
+    expect(acknowledged).toMatchObject({ hash: policy.hash, newlyAcknowledged: true });
+    expect(Object.keys(acknowledged).sort()).toEqual([
+      'acknowledgedAt',
+      'hash',
+      'newlyAcknowledged',
+    ]);
+    expect(author.acknowledgePolicy(policy.hash)).toEqual({
+      ...acknowledged,
+      newlyAcknowledged: false,
+    });
     expect(
       author.events({ after: 0 }).filter((event) => event.kind === 'policy.acknowledged'),
     ).toHaveLength(1);

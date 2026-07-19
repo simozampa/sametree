@@ -6,7 +6,7 @@ import { z } from 'zod';
 
 import { Coordinator } from './coordinator.js';
 import { errorResult } from './errors.js';
-import type { Harness, TaskPriority, TaskStatus } from './types.js';
+import type { Harness, PathClaim, TaskPriority, TaskStatus } from './types.js';
 import { VERSION } from './version.js';
 
 const harness = (process.env.SAMETREE_HARNESS ?? 'other') as Harness;
@@ -24,6 +24,7 @@ const coordinator = Coordinator.open({
   harness,
   role: process.env.SAMETREE_ROLE ?? 'implementer',
   cwd: process.env.SAMETREE_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
+  recordSessionLifecycleEvents: false,
 });
 
 const server = new McpServer({ name: 'sametree', version: VERSION });
@@ -32,9 +33,13 @@ const outputSchema = { result: z.unknown() };
 function result(value: unknown) {
   const structuredContent = { result: value };
   return {
-    content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
+    content: [{ type: 'text' as const, text: JSON.stringify(value) }],
     structuredContent,
   };
+}
+
+function claimReceipts(claims: PathClaim[]) {
+  return claims.map(({ id, path, kind, expiresAt }) => ({ id, path, kind, expiresAt }));
 }
 
 function execute(operation: () => unknown) {
@@ -50,11 +55,22 @@ server.registerTool(
   'sametree_status',
   {
     title: 'SameTree status',
-    description: 'Read agents, tasks, claims, unread messages, handoffs, and the event cursor.',
+    description:
+      'Read active agents, nonterminal tasks, claims, unread messages, handoffs, and the event cursor. Historical rows are opt-in.',
+    inputSchema: {
+      includeInactiveAgents: z.boolean().optional(),
+      includeTerminalTasks: z.boolean().optional(),
+    },
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
-  () => execute(() => coordinator.snapshot()),
+  ({ includeInactiveAgents, includeTerminalTasks }) =>
+    execute(() =>
+      coordinator.snapshot({
+        ...(includeInactiveAgents !== undefined ? { includeInactiveAgents } : {}),
+        ...(includeTerminalTasks !== undefined ? { includeTerminalTasks } : {}),
+      }),
+    ),
 );
 
 server.registerTool(
@@ -99,14 +115,26 @@ server.registerTool(
   'sametree_task_list',
   {
     title: 'List tasks',
-    description: 'List all durable tasks or only tasks in one state.',
+    description:
+      'List a page of nonterminal tasks by default. Opt into terminal history or select one state.',
     inputSchema: {
       status: z.enum(['ready', 'in_progress', 'blocked', 'done', 'cancelled']).optional(),
+      after: z.string().optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+      includeTerminal: z.boolean().optional(),
     },
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
-  ({ status }) => execute(() => coordinator.listTasks(status ? { status } : {})),
+  ({ status, after, limit, includeTerminal }) =>
+    execute(() =>
+      coordinator.listTasks({
+        ...(status !== undefined ? { status } : {}),
+        ...(after !== undefined ? { after } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+        ...(includeTerminal !== undefined ? { includeTerminal } : {}),
+      }),
+    ),
 );
 
 server.registerTool(
@@ -201,9 +229,11 @@ server.registerTool(
   },
   ({ paths, ttlSeconds }) =>
     execute(() =>
-      coordinator.acquireClaims(
-        paths.map(({ path, kind }) => ({ path, ...(kind !== undefined ? { kind } : {}) })),
-        ttlSeconds,
+      claimReceipts(
+        coordinator.acquireClaims(
+          paths.map(({ path, kind }) => ({ path, ...(kind !== undefined ? { kind } : {}) })),
+          ttlSeconds,
+        ),
       ),
     ),
 );

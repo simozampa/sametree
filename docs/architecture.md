@@ -138,6 +138,8 @@ SameTree is not fully event-sourced. Normalized tables hold current state, while
 
 Audit consumers poll after a sequence cursor. Resource subscriptions remain unnecessary because the audit stream is for context refresh and debugging; addressed messages use the separate durable follower and native harness adapters.
 
+Built-in adapters keep process history in the session table without adding start and close events. This keeps the audit stream focused on tasks, claims, messages, handoffs, and policy changes while preserving session diagnostics.
+
 ## Security Model
 
 SameTree validates paths and SQL inputs, refuses symlinked state paths, never loads SQLite extensions, and stores its database with restrictive permissions where supported.

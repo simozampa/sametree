@@ -20,6 +20,7 @@ import type {
   Harness,
   Message,
   PathClaim,
+  PolicyAcknowledgement,
   PolicyDocument,
   Session,
   Task,
@@ -71,6 +72,18 @@ export interface UserAuthorizedTaskInput {
 export interface UserAuthorizedHandoffInput {
   reason?: string;
   userAuthorized?: boolean;
+}
+
+export interface ListTasksOptions {
+  after?: string;
+  includeTerminal?: boolean;
+  limit?: number;
+  status?: TaskStatus;
+}
+
+export interface SnapshotOptions {
+  includeInactiveAgents?: boolean;
+  includeTerminalTasks?: boolean;
 }
 
 export interface AcquireClaimInput {
@@ -496,10 +509,21 @@ export class Coordinator {
     this.#closed = true;
   }
 
-  listAgents(): Agent[] {
-    return (
-      this.#database.prepare('SELECT * FROM agents ORDER BY last_seen_at DESC, name').all() as Row[]
-    ).map(mapAgent);
+  listAgents(options: { activeOnly?: boolean } = {}): Agent[] {
+    const rows = options.activeOnly
+      ? (this.#database
+          .prepare(
+            `SELECT DISTINCT agent.*
+             FROM agents agent
+             JOIN sessions session ON session.agent_name = agent.name
+             WHERE session.status = 'active' AND session.expires_at > ?
+             ORDER BY agent.last_seen_at DESC, agent.name`,
+          )
+          .all(this.#clock()) as Row[])
+      : (this.#database
+          .prepare('SELECT * FROM agents ORDER BY last_seen_at DESC, name')
+          .all() as Row[]);
+    return rows.map(mapAgent);
   }
 
   createTask(input: CreateTaskInput): Task {
@@ -540,12 +564,35 @@ export class Coordinator {
     });
   }
 
-  listTasks(options: { status?: TaskStatus } = {}): Task[] {
-    const rows = options.status
-      ? (this.#database
-          .prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at')
-          .all(options.status) as Row[])
-      : (this.#database.prepare('SELECT * FROM tasks ORDER BY created_at').all() as Row[]);
+  listTasks(options: ListTasksOptions = {}): Task[] {
+    const limit = Math.min(Math.max(options.limit ?? 25, 1), 100);
+    const conditions: string[] = [];
+    const parameters: Array<number | string> = [];
+    if (options.status) {
+      conditions.push('status = ?');
+      parameters.push(options.status);
+    } else if (!options.includeTerminal) {
+      conditions.push("status NOT IN ('done', 'cancelled')");
+    }
+    if (options.after) {
+      const cursor = this.#database
+        .prepare('SELECT created_at, id FROM tasks WHERE id = ?')
+        .get(options.after) as Row | undefined;
+      if (!cursor) {
+        throw new SameTreeError('NOT_FOUND', `Task cursor '${options.after}' does not exist.`);
+      }
+      conditions.push('(created_at > ? OR (created_at = ? AND id > ?))');
+      parameters.push(
+        numberValue(cursor, 'created_at'),
+        numberValue(cursor, 'created_at'),
+        stringValue(cursor, 'id'),
+      );
+    }
+    parameters.push(limit);
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const rows = this.#database
+      .prepare(`SELECT * FROM tasks ${where} ORDER BY created_at, id LIMIT ?`)
+      .all(...parameters) as Row[];
     return rows.map((row) => mapTask(row, this.#dependencies(stringValue(row, 'id'))));
   }
 
@@ -1300,7 +1347,7 @@ export class Coordinator {
     };
   }
 
-  acknowledgePolicy(hash: string): PolicyDocument {
+  acknowledgePolicy(hash: string): PolicyAcknowledgement {
     const policy = this.getPolicy();
     if (policy.hash !== hash) {
       throw new SameTreeError(
@@ -1324,12 +1371,16 @@ export class Coordinator {
       const acknowledgement = this.#database
         .prepare('SELECT acknowledged_at FROM policy_acks WHERE policy_hash = ? AND agent_name = ?')
         .get(hash, this.agentName) as Row;
-      return { ...policy, acknowledgedAt: numberValue(acknowledgement, 'acknowledged_at') };
+      return {
+        hash,
+        acknowledgedAt: numberValue(acknowledgement, 'acknowledged_at'),
+        newlyAcknowledged: inserted === 1,
+      };
     });
   }
 
   events(options: { after?: number; limit?: number } = {}): CoordinationEvent[] {
-    const limit = Math.min(Math.max(options.limit ?? 100, 1), 1_000);
+    const limit = Math.min(Math.max(options.limit ?? 25, 1), 1_000);
     return (
       this.#database
         .prepare('SELECT * FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?')
@@ -1346,7 +1397,7 @@ export class Coordinator {
     }));
   }
 
-  snapshot(): CoordinationSnapshot {
+  snapshot(options: SnapshotOptions = {}): CoordinationSnapshot {
     return this.#database.transaction(() => {
       const agentRow = this.#database
         .prepare('SELECT * FROM agents WHERE name = ?')
@@ -1379,8 +1430,11 @@ export class Coordinator {
       return {
         agent: mapAgent(agentRow as Row),
         session: mapSession(sessionRow as Row),
-        agents: this.listAgents(),
-        tasks: this.listTasks(),
+        agents: this.listAgents({ activeOnly: !options.includeInactiveAgents }),
+        tasks: this.listTasks({
+          includeTerminal: options.includeTerminalTasks ?? false,
+          limit: 100,
+        }),
         claims: this.listClaims(),
         unreadMessages: numberValue(unread, 'count'),
         pendingHandoffs: numberValue(handoffs, 'count'),

@@ -33,7 +33,7 @@ describe('generated state paths', () => {
 
     expect(
       readFileSync(path.join(repository.root, '.sametree', 'coordination.md'), 'utf8'),
-    ).toContain('acknowledge the returned hash only when `acknowledgedAt` is null');
+    ).toContain('acknowledge its hash only when `acknowledgedAt` is null');
   });
 
   it('generates contention-based path claim guidance', () => {

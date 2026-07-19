@@ -6,7 +6,7 @@ This document defines the behavior shared by the CLI and MCP adapters.
 
 An agent name is unique within one working tree and contains letters, numbers, `.`, `_`, or `-`. MCP adapters generate a process-scoped name from the harness's native session identifier, falling back to the MCP process ID. Set `SAMETREE_AGENT` when a durable human-readable identity such as `claude-reviewer` or `opencode-1` is required.
 
-A session represents one process lifetime. Starting a CLI command or MCP server creates a new session for its agent. One-shot CLI sessions remain in the session table for lease ownership and diagnostics but omit lifecycle audit events; long-running MCP, watch, and message-follower sessions record `session.started` and `session.closed`. An MCP heartbeat renews:
+A session represents one process lifetime. Starting a CLI command or MCP server creates a new session for its agent. Built-in CLI, MCP, watch, and message-follower sessions remain in the session table for lease ownership and diagnostics but omit lifecycle audit events. Library callers may opt into `session.started` and `session.closed` events when exact process-lifecycle auditing is useful. An MCP heartbeat renews:
 
 - The session expiry.
 - Active path claims owned by that session.
@@ -43,6 +43,8 @@ Tasks are awareness records for work already assigned by the user, not a peer-ma
 - Callers may submit `expectedRevision` to reject stale updates.
 
 Assignments are durable agent ownership. Execution leases identify the active session. Keeping these separate makes crashed work visible instead of silently re-queuing it.
+
+Status is a current-state view by default: it includes agents with a live session and at most 100 nonterminal tasks. Callers can explicitly include inactive agents and terminal tasks. Task listing defaults to 25 nonterminal rows, accepts a maximum of 100, and uses the last returned task ID as the `after` cursor. A status filter selects that state even when it is terminal.
 
 ### Forced Takeover
 
@@ -126,13 +128,13 @@ The shared policy is the tracked `.sametree/policy.md` file. SameTree computes i
 
 Editing any byte produces a new hash, so previous acknowledgements no longer satisfy the current policy. Clients should read the policy state at session start.
 
-Acknowledgement is idempotent per agent and policy hash: repeating it preserves the original timestamp and does not append another event. Clients should call the acknowledgement operation only when `sametree_policy_get` reports `acknowledgedAt` as `null`.
+Acknowledgement is idempotent per agent and policy hash: repeating it preserves the original timestamp and does not append another event. The acknowledgement operation returns only the hash, timestamp, and whether a row was newly recorded; policy content remains in `sametree_policy_get`. Clients should acknowledge only when that read reports `acknowledgedAt` as `null`.
 
 Prompt policy is backed by optional Git hooks for rules that can be checked mechanically. Hooks remain bypassable safety rails.
 
 ## Events
 
-Every meaningful mutation appends an event in the same transaction as current state. Consumers call `sametree_events` with the last seen sequence and persist the returned maximum as their next cursor.
+Every meaningful coordination mutation appends an event in the same transaction as current state. Built-in process lifecycle churn is retained in session rows rather than copied into the event stream. Consumers call `sametree_events` with the last seen sequence and persist the returned maximum as their next cursor. Direct reads default to 25 events and accept an explicit limit up to 1,000; streaming watchers request larger pages internally.
 
 Event polling is intended for context refresh and debugging. Current-state tools remain authoritative for decisions.
 

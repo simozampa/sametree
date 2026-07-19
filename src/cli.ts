@@ -9,7 +9,7 @@ import { errorResult } from './errors.js';
 import { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 import { initializeProject } from './project.js';
 import { setupProject } from './setup.js';
-import type { Harness, TaskPriority, TaskStatus } from './types.js';
+import type { Harness, PathClaim, TaskPriority, TaskStatus } from './types.js';
 import { VERSION } from './version.js';
 import { followMessages, watchEvents } from './watch.js';
 
@@ -42,6 +42,10 @@ function objectJson(value: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+function claimReceipts(claims: PathClaim[]) {
+  return claims.map(({ id, path, kind, expiresAt }) => ({ id, path, kind, expiresAt }));
+}
+
 function openCoordinator(
   command: Command,
   coordinatorOptions: { recordSessionLifecycleEvents?: boolean } = {},
@@ -69,7 +73,7 @@ async function runStreaming(
   command: Command,
   operation: (coordinator: Coordinator, signal: AbortSignal) => Promise<unknown>,
 ): Promise<void> {
-  const coordinator = openCoordinator(command);
+  const coordinator = openCoordinator(command, { recordSessionLifecycleEvents: false });
   const controller = new AbortController();
   const abort = () => {
     controller.abort();
@@ -148,9 +152,16 @@ program
 
 program
   .command('status')
-  .description('Show agents, work, claims, and unread coordination state.')
-  .action((_options: unknown, command: Command) => {
-    runWithCoordinator(command, (coordinator) => coordinator.snapshot());
+  .description('Show active agents, current work, claims, and unread coordination state.')
+  .option('--all-agents', 'include inactive registered agents')
+  .option('--all-tasks', 'include done and cancelled tasks')
+  .action((options: { allAgents?: boolean; allTasks?: boolean }, command: Command) => {
+    runWithCoordinator(command, (coordinator) =>
+      coordinator.snapshot({
+        includeInactiveAgents: options.allAgents ?? false,
+        includeTerminalTasks: options.allTasks ?? false,
+      }),
+    );
   });
 
 program
@@ -206,11 +217,24 @@ task
       'cancelled',
     ]),
   )
-  .action((options: { status?: TaskStatus }, command: Command) => {
-    runWithCoordinator(command, (coordinator) =>
-      coordinator.listTasks(options.status ? { status: options.status } : {}),
-    );
-  });
+  .option('--all', 'include done and cancelled tasks')
+  .option('--after <task-id>', 'continue after this task cursor')
+  .option('--limit <number>', 'maximum tasks', integer, 25)
+  .action(
+    (
+      options: { after?: string; all?: boolean; limit: number; status?: TaskStatus },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.listTasks({
+          ...(options.status ? { status: options.status } : {}),
+          ...(options.after ? { after: options.after } : {}),
+          includeTerminal: options.all ?? false,
+          limit: options.limit,
+        }),
+      );
+    },
+  );
 
 task
   .command('claim <task-id>')
@@ -304,12 +328,14 @@ claim
   .option('--ttl <seconds>', 'lease duration', integer)
   .action((paths: string[], options: { tree?: boolean; ttl?: number }, command: Command) => {
     runWithCoordinator(command, (coordinator) =>
-      coordinator.acquireClaims(
-        paths.map((claimedPath) => ({
-          path: claimedPath,
-          ...(options.tree ? { kind: 'tree' as const } : {}),
-        })),
-        options.ttl,
+      claimReceipts(
+        coordinator.acquireClaims(
+          paths.map((claimedPath) => ({
+            path: claimedPath,
+            ...(options.tree ? { kind: 'tree' as const } : {}),
+          })),
+          options.ttl,
+        ),
       ),
     );
   });
@@ -488,7 +514,7 @@ policy.command('ack <hash>').action((hash: string, _options: unknown, command: C
 program
   .command('events')
   .option('--after <sequence>', 'event cursor', integer, 0)
-  .option('--limit <number>', 'maximum events', integer, 100)
+  .option('--limit <number>', 'maximum events', integer, 25)
   .action((options: { after: number; limit: number }, command: Command) => {
     runWithCoordinator(command, (coordinator) => coordinator.events(options));
   });

@@ -150,6 +150,17 @@ describe('CLI', () => {
     expect(failure?.stderr).toContain('CLAIM_CONFLICT');
   });
 
+  it('returns a compact claim acquisition receipt', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const result = await runCli(repository.root, 'claimant', ['claim', 'acquire', 'src/api.ts']);
+    const output = JSON.parse(result.stdout) as Array<Record<string, unknown>>;
+
+    expect(result).toMatchObject({ code: 0, stderr: '' });
+    expect(Object.keys(output[0] ?? {}).sort()).toEqual(['expiresAt', 'id', 'kind', 'path']);
+  });
+
   it('forcibly takes over active work with explicit user authorization', async () => {
     const repository = createTestRepository();
     repositories.push(repository);
@@ -221,20 +232,25 @@ describe('CLI', () => {
     expect(error.error.code).toBe('INTERNAL_ERROR');
   });
 
-  it('emits watch events as JSON Lines', async () => {
+  it('keeps streaming session rows without lifecycle events', async () => {
     const repository = createTestRepository();
     repositories.push(repository);
 
     const result = await runCli(repository.root, 'cli-observer', ['watch', '--once', '--json']);
-    const events = result.stdout
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line) as { kind: string });
+    const database = new Database(resolveRepository(repository.root).databasePath, {
+      readonly: true,
+    });
+    const events = database
+      .prepare('SELECT kind FROM events WHERE actor = ? ORDER BY sequence')
+      .all('cli-observer');
+    const sessions = database
+      .prepare('SELECT status FROM sessions WHERE agent_name = ?')
+      .all('cli-observer');
+    database.close();
 
-    expect(result).toMatchObject({ code: 0, stderr: '' });
-    expect(events).toEqual(
-      expect.arrayContaining([expect.objectContaining({ kind: 'session.started' })]),
-    );
+    expect(result).toMatchObject({ code: 0, stderr: '', stdout: '' });
+    expect(events).toEqual([]);
+    expect(sessions).toEqual([{ status: 'closed' }]);
   });
 
   it('rejects conflicting watch cursors', async () => {

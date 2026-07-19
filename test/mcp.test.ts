@@ -48,6 +48,9 @@ describe('MCP server', () => {
     expect(response.structuredContent).toMatchObject({
       result: { agent: { name: 'mcp-agent', harness: 'opencode' } },
     });
+    const content = response.content as Array<{ text?: string; type: string }>;
+    const text = content.find((item) => item.type === 'text')?.text;
+    expect(text).not.toContain('\n');
   });
 
   it('assigns distinct identities when clients do not provide agent names', async () => {

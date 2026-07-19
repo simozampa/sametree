@@ -89,6 +89,12 @@ export interface PolicyDocument {
   acknowledgedAt: number | null;
 }
 
+export interface PolicyAcknowledgement {
+  hash: string;
+  acknowledgedAt: number;
+  newlyAcknowledged: boolean;
+}
+
 export interface CoordinationSnapshot {
   agent: Agent;
   session: Session;

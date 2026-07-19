@@ -67,9 +67,9 @@ This repository uses SameTree for coordination between coding agents sharing one
 
 At session start:
 
-1. Read \`.sametree/policy.md\` and your role file under \`.sametree/roles/\`.
-2. Call \`sametree_status\` and \`sametree_policy_get\`; acknowledge the returned hash only when \`acknowledgedAt\` is null.
-3. Read your inbox and pending handoffs for context about overlapping work.
+1. Read your role file under \`.sametree/roles/\`.
+2. Call \`sametree_status\` and \`sametree_policy_get\`; the policy response contains the shared policy, and you should acknowledge its hash only when \`acknowledgedAt\` is null.
+3. Read the inbox or pending handoffs only when status reports unread items.
 
 During work:
 

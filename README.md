@@ -89,6 +89,8 @@ sametree message follow --json
 SAMETREE_AGENT=observer sametree watch --tail
 ```
 
+Status shows active agents and nonterminal work by default. Use `sametree status --all-agents --all-tasks` or cursor-page `sametree task list --all` when historical rows are needed.
+
 Normal task claiming never takes work from another agent, even after its execution lease expires. If the user explicitly reassigns work, use the current task revision and select any claims that must move with it:
 
 ```bash
