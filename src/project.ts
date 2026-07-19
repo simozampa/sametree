@@ -9,6 +9,9 @@ import {
   configTemplate,
   IMPLEMENTER_ROLE_TEMPLATE,
   INTEGRATION_TEMPLATE,
+  LEGACY_INTEGRATION_TEMPLATE,
+  LEGACY_POLICY_TEMPLATE,
+  LEGACY_REVIEWER_ROLE_TEMPLATE,
   POLICY_TEMPLATE,
   REVIEWER_ROLE_TEMPLATE,
 } from './templates.js';
@@ -17,15 +20,21 @@ export interface InitializationResult {
   repositoryRoot: string;
   created: string[];
   preserved: string[];
+  updated: string[];
 }
 
 export const PROJECT_FILE_TEMPLATES: ReadonlyArray<{
   relativePath: string;
   content: string;
+  legacyContent?: string;
 }> = [
   { relativePath: CONFIG_FILE, content: configTemplate(DEFAULT_CONFIG) },
-  { relativePath: POLICY_FILE, content: POLICY_TEMPLATE },
-  { relativePath: path.join(CONFIG_DIRECTORY, 'coordination.md'), content: INTEGRATION_TEMPLATE },
+  { relativePath: POLICY_FILE, content: POLICY_TEMPLATE, legacyContent: LEGACY_POLICY_TEMPLATE },
+  {
+    relativePath: path.join(CONFIG_DIRECTORY, 'coordination.md'),
+    content: INTEGRATION_TEMPLATE,
+    legacyContent: LEGACY_INTEGRATION_TEMPLATE,
+  },
   {
     relativePath: path.join(CONFIG_DIRECTORY, 'roles', 'implementer.md'),
     content: IMPLEMENTER_ROLE_TEMPLATE,
@@ -33,6 +42,7 @@ export const PROJECT_FILE_TEMPLATES: ReadonlyArray<{
   {
     relativePath: path.join(CONFIG_DIRECTORY, 'roles', 'reviewer.md'),
     content: REVIEWER_ROLE_TEMPLATE,
+    legacyContent: LEGACY_REVIEWER_ROLE_TEMPLATE,
   },
 ];
 
@@ -40,6 +50,7 @@ function writeProjectFile(
   repositoryRoot: string,
   relativePath: string,
   content: string,
+  legacyContent: string | undefined,
   force: boolean,
   result: InitializationResult,
   onFileWritten?: (relativePath: string, content: string) => void,
@@ -54,8 +65,13 @@ function writeProjectFile(
     } catch (error) {
       const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
       if (code !== 'EEXIST') throw error;
-      // Confirm the existing path is a readable file rather than hiding an invalid target.
-      readFileSync(target);
+      const existing = readFileSync(target, 'utf8');
+      if (legacyContent !== undefined && existing === legacyContent) {
+        writeTextFileAtomic(target, content);
+        result.updated.push(relativePath);
+        onFileWritten?.(relativePath, content);
+        return;
+      }
       result.preserved.push(relativePath);
       return;
     }
@@ -76,6 +92,7 @@ function initializeProjectFiles(
     repositoryRoot: repository.root,
     created: [],
     preserved: [],
+    updated: [],
   };
 
   assertSafeWritePath(repository.root, CONFIG_DIRECTORY);
@@ -88,6 +105,7 @@ function initializeProjectFiles(
       repository.root,
       file.relativePath,
       file.content,
+      file.legacyContent,
       force,
       result,
       onFileWritten,

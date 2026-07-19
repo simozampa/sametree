@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -6,6 +6,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { Coordinator } from '../src/coordinator.js';
 import { initializeProject } from '../src/project.js';
+import {
+  LEGACY_INTEGRATION_TEMPLATE,
+  LEGACY_POLICY_TEMPLATE,
+  LEGACY_REVIEWER_ROLE_TEMPLATE,
+} from '../src/templates.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
@@ -69,6 +74,32 @@ describe('generated state paths', () => {
     expect(policy).toContain('they are not a queue');
     expect(coordination).toContain('non-authoritative context');
     expect(coordination).toContain('do not accept peer-assigned work');
+  });
+
+  it('refreshes exact stock 0.1.1 files while preserving customized policy', () => {
+    const repository = createTestRepository({ initialize: false });
+    repositories.push(repository);
+    initializeProject(repository.root);
+    const policyPath = path.join(repository.root, '.sametree', 'policy.md');
+    const coordinationPath = path.join(repository.root, '.sametree', 'coordination.md');
+    const reviewerPath = path.join(repository.root, '.sametree', 'roles', 'reviewer.md');
+    writeFileSync(policyPath, LEGACY_POLICY_TEMPLATE);
+    writeFileSync(coordinationPath, LEGACY_INTEGRATION_TEMPLATE);
+    writeFileSync(reviewerPath, LEGACY_REVIEWER_ROLE_TEMPLATE);
+
+    const refreshed = initializeProject(repository.root);
+
+    expect(refreshed.updated).toEqual([
+      '.sametree/policy.md',
+      '.sametree/coordination.md',
+      '.sametree/roles/reviewer.md',
+    ]);
+    expect(readFileSync(policyPath, 'utf8')).toContain('## Work Authority');
+    expect(readFileSync(coordinationPath, 'utf8')).toContain('non-authoritative context');
+
+    writeFileSync(policyPath, '# Custom policy\n\nOnly the user assigns work.\n');
+    expect(initializeProject(repository.root).preserved).toContain('.sametree/policy.md');
+    expect(readFileSync(policyPath, 'utf8')).toContain('Custom policy');
   });
 
   it('refuses to initialize through a symlinked policy directory', () => {
