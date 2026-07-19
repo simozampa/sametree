@@ -72,7 +72,8 @@ server.registerTool(
   'sametree_task_create',
   {
     title: 'Create a task',
-    description: 'Create durable work with optional dependencies and an assignee.',
+    description:
+      'Record the current agent’s user-defined work. An assignee, when provided for compatibility, must be this agent.',
     inputSchema: {
       title: z.string().min(1).max(200),
       description: z.string().max(20_000).optional(),
@@ -111,20 +112,33 @@ server.registerTool(
 server.registerTool(
   'sametree_task_claim',
   {
-    title: 'Claim a task',
-    description: 'Claim ready work or explicitly take over an expired task lease.',
-    inputSchema: { taskId: z.string() },
+    title: 'Start or renew assigned work',
+    description:
+      'Start or renew this agent’s assigned task. Adopting a legacy unassigned task requires direct user authorization.',
+    inputSchema: {
+      taskId: z.string(),
+      expectedRevision: z.number().int().positive().optional(),
+      reason: z.string().min(1).max(2_000).optional(),
+      userAuthorized: z.literal(true).optional(),
+    },
     outputSchema,
   },
-  ({ taskId }) => execute(() => coordinator.claimTask(taskId)),
+  ({ taskId, expectedRevision, reason, userAuthorized }) =>
+    execute(() =>
+      coordinator.claimTask(taskId, {
+        ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+        ...(reason !== undefined ? { reason } : {}),
+        ...(userAuthorized !== undefined ? { userAuthorized } : {}),
+      }),
+    ),
 );
 
 server.registerTool(
   'sametree_task_force_takeover',
   {
-    title: 'Force takeover of active work',
+    title: 'Reassign work with user authorization',
     description:
-      'Reassign an active task and selected claims only after the user explicitly authorizes bypassing its live lease.',
+      'Reassign another agent’s task and selected claims only after the user explicitly authorizes the scope change.',
     inputSchema: {
       taskId: z.string(),
       expectedRevision: z.number().int().positive(),
@@ -288,7 +302,8 @@ server.registerTool(
   'sametree_handoff_offer',
   {
     title: 'Offer a handoff',
-    description: 'Offer assigned work, structured context, and selected claims to another agent.',
+    description:
+      'Offer non-authoritative context and selected claims to another agent. The offer does not change their scope.',
     inputSchema: {
       taskId: z.string(),
       to: z.string(),
@@ -331,11 +346,23 @@ server.registerTool(
   'sametree_handoff_respond',
   {
     title: 'Respond to a handoff',
-    description: 'Accept or reject a handoff. Acceptance transfers its task and selected claims.',
-    inputSchema: { handoffId: z.string(), accept: z.boolean() },
+    description:
+      'Reject a peer handoff, or accept it only after the user explicitly authorizes the scope transfer.',
+    inputSchema: {
+      handoffId: z.string(),
+      accept: z.boolean(),
+      reason: z.string().min(1).max(2_000).optional(),
+      userAuthorized: z.literal(true).optional(),
+    },
     outputSchema,
   },
-  ({ handoffId, accept }) => execute(() => coordinator.respondToHandoff(handoffId, accept)),
+  ({ handoffId, accept, reason, userAuthorized }) =>
+    execute(() =>
+      coordinator.respondToHandoff(handoffId, accept, {
+        ...(reason !== undefined ? { reason } : {}),
+        ...(userAuthorized !== undefined ? { userAuthorized } : {}),
+      }),
+    ),
 );
 
 server.registerTool(

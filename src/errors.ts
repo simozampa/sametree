@@ -10,7 +10,8 @@ export type ErrorCode =
   | 'NOT_GIT_REPOSITORY'
   | 'POLICY_NOT_FOUND'
   | 'TASK_BLOCKED'
-  | 'TASK_UNAVAILABLE';
+  | 'TASK_UNAVAILABLE'
+  | 'USER_AUTHORIZATION_REQUIRED';
 
 /** An expected domain failure that adapters can render without a stack trace. */
 export class SameTreeError extends Error {

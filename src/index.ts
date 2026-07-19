@@ -5,6 +5,8 @@ export {
   type CreateTaskInput,
   type ForceTakeoverTaskInput,
   type UpdateTaskInput,
+  type UserAuthorizedHandoffInput,
+  type UserAuthorizedTaskInput,
 } from './coordinator.js';
 export { diagnoseRepository } from './doctor.js';
 export { type ErrorCode, errorResult, isSameTreeError, SameTreeError } from './errors.js';

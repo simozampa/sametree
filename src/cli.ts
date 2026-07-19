@@ -214,14 +214,31 @@ task
 
 task
   .command('claim <task-id>')
-  .description('Claim ready work or explicitly take over an expired lease.')
-  .action((taskId: string, _options: unknown, command: Command) => {
-    runWithCoordinator(command, (coordinator) => coordinator.claimTask(taskId));
-  });
+  .description('Start or renew assigned work; never take over a peer task implicitly.')
+  .option('--revision <number>', 'expected revision for a legacy unassigned task', integer)
+  .option('--reason <text>', 'audit reason for adopting a legacy unassigned task')
+  .option('--user-authorized', 'confirm that the user explicitly added this task to your scope')
+  .action(
+    (
+      taskId: string,
+      options: { reason?: string; revision?: number; userAuthorized?: true },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.claimTask(taskId, {
+          ...(options.revision !== undefined ? { expectedRevision: options.revision } : {}),
+          ...(options.reason !== undefined ? { reason: options.reason } : {}),
+          ...(options.userAuthorized !== undefined
+            ? { userAuthorized: options.userAuthorized }
+            : {}),
+        }),
+      );
+    },
+  );
 
 task
   .command('force-takeover <task-id>')
-  .description('Reassign active work after the user explicitly authorizes it.')
+  .description('Reassign another agent’s work after the user explicitly authorizes it.')
   .requiredOption('--revision <number>', 'expected current task revision', integer)
   .requiredOption('--reason <text>', 'audit reason for bypassing the active lease')
   .requiredOption('--user-authorized', 'confirm that the user explicitly authorized this takeover')
@@ -439,9 +456,18 @@ handoff
 
 handoff
   .command('accept <handoff-id>')
-  .action((handoffId: string, _options: unknown, command: Command) => {
-    runWithCoordinator(command, (coordinator) => coordinator.respondToHandoff(handoffId, true));
-  });
+  .requiredOption('--reason <text>', 'audit reason for the user-authorized scope transfer')
+  .requiredOption('--user-authorized', 'confirm that the user explicitly authorized this handoff')
+  .action(
+    (handoffId: string, options: { reason: string; userAuthorized: true }, command: Command) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.respondToHandoff(handoffId, true, {
+          reason: options.reason,
+          userAuthorized: options.userAuthorized,
+        }),
+      );
+    },
+  );
 
 handoff
   .command('reject <handoff-id>')

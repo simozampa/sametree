@@ -81,23 +81,53 @@ describe('Coordinator', () => {
 
     expect(claimed.assignee).toBe('author');
     expect(() => reviewer.claimTask(implementation.id)).toThrowError(
-      expect.objectContaining({ code: 'TASK_UNAVAILABLE' }),
+      expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
     );
   });
 
-  it('preserves ready assignments and requires a claim before updates', () => {
+  it('creates self-owned task records and rejects peer assignment', () => {
     const { open } = setup();
     const author = open('author');
     const reviewer = open('reviewer');
     const assigned = author.createTask({ title: 'Assigned work', assignee: 'author' });
-    const unassigned = author.createTask({ title: 'Unassigned work' });
+    const implicit = author.createTask({ title: 'Implicit self-assignment' });
+
+    expect(implicit.assignee).toBe('author');
+    expect(() =>
+      author.createTask({ title: 'Peer assignment', assignee: 'reviewer' }),
+    ).toThrowError(expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }));
 
     expect(() => reviewer.claimTask(assigned.id)).toThrowError(
-      expect.objectContaining({ code: 'TASK_UNAVAILABLE' }),
+      expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
     );
     expect(() =>
-      reviewer.updateTask(unassigned.id, { description: 'Taken without a claim' }),
+      reviewer.updateTask(implicit.id, { description: 'Taken without a claim' }),
     ).toThrowError(expect.objectContaining({ code: 'NOT_ASSIGNED' }));
+  });
+
+  it('requires direct user authorization to adopt a legacy unassigned task', () => {
+    const { repository, open } = setup();
+    const author = open('author');
+    const database = new Database(resolveRepository(repository.root).databasePath);
+    database
+      .prepare(
+        `INSERT INTO tasks
+          (id, title, description, status, priority, assignee, revision, created_at, updated_at)
+         VALUES ('task_legacy', 'Legacy task', '', 'ready', 'normal', NULL, 1, 1, 1)`,
+      )
+      .run();
+    database.close();
+
+    expect(() => author.claimTask('task_legacy')).toThrowError(
+      expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
+    );
+    expect(
+      author.claimTask('task_legacy', {
+        expectedRevision: 1,
+        reason: 'The user explicitly assigned this legacy task.',
+        userAuthorized: true,
+      }),
+    ).toMatchObject({ assignee: 'author', status: 'in_progress' });
   });
 
   it('checks dependencies on every transition into progress', () => {
@@ -181,7 +211,7 @@ describe('Coordinator', () => {
     ).toThrowError(expect.objectContaining({ code: 'TASK_UNAVAILABLE' }));
   });
 
-  it('uses normal task claiming instead of forced takeover after lease expiry', () => {
+  it('requires user-authorized takeover after lease expiry', () => {
     let now = Date.now();
     const { open } = setup(() => now);
     const owner = open('owner');
@@ -189,14 +219,16 @@ describe('Coordinator', () => {
     const active = owner.claimTask(owner.createTask({ title: 'Expired takeover' }).id);
     now += 901_000;
 
-    expect(() =>
+    expect(() => replacement.claimTask(active.id)).toThrowError(
+      expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
+    );
+    expect(
       replacement.forceTakeoverTask(active.id, {
         expectedRevision: active.revision,
-        reason: 'This lease has already expired.',
+        reason: 'The user reassigned this expired work.',
         userAuthorized: true,
-      }),
-    ).toThrowError(expect.objectContaining({ code: 'TASK_UNAVAILABLE' }));
-    expect(replacement.claimTask(active.id).assignee).toBe('replacement');
+      }).task.assignee,
+    ).toBe('replacement');
   });
 
   it('rejects a forced partial claim transfer that creates overlap', () => {
@@ -396,7 +428,13 @@ describe('Coordinator', () => {
       context: { commit: 'abc123' },
       claimIds: [claim.id],
     });
-    reviewer.respondToHandoff(offer.id, true);
+    expect(() => reviewer.respondToHandoff(offer.id, true)).toThrowError(
+      expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
+    );
+    reviewer.respondToHandoff(offer.id, true, {
+      reason: 'The user moved parser ownership to the reviewer.',
+      userAuthorized: true,
+    });
 
     expect(reviewer.listTasks().find((item) => item.id === task.id)?.assignee).toBe('reviewer');
     expect(reviewer.listClaims().find((item) => item.id === claim.id)?.agentName).toBe('reviewer');
@@ -418,9 +456,12 @@ describe('Coordinator', () => {
       claimIds: [nested.id],
     });
 
-    expect(() => reviewer.respondToHandoff(offer.id, true)).toThrowError(
-      expect.objectContaining({ code: 'HANDOFF_CONFLICT' }),
-    );
+    expect(() =>
+      reviewer.respondToHandoff(offer.id, true, {
+        reason: 'The user authorized this transfer.',
+        userAuthorized: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'HANDOFF_CONFLICT' }));
     expect(author.listTasks().find((item) => item.id === task.id)?.assignee).toBe('author');
   });
 
@@ -441,7 +482,12 @@ describe('Coordinator', () => {
 
     author.close();
 
-    expect(reviewer.respondToHandoff(offer.id, true).status).toBe('accepted');
+    expect(
+      reviewer.respondToHandoff(offer.id, true, {
+        reason: 'The user asked the reviewer to continue after the author exited.',
+        userAuthorized: true,
+      }).status,
+    ).toBe('accepted');
   });
 
   it('rejects a handoff when its task revision becomes stale', () => {
@@ -457,9 +503,12 @@ describe('Coordinator', () => {
     });
     author.updateTask(task.id, { description: 'The contract changed.' });
 
-    expect(() => reviewer.respondToHandoff(offer.id, true)).toThrowError(
-      expect.objectContaining({ code: 'HANDOFF_CONFLICT' }),
-    );
+    expect(() =>
+      reviewer.respondToHandoff(offer.id, true, {
+        reason: 'The user authorized the original handoff.',
+        userAuthorized: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'HANDOFF_CONFLICT' }));
   });
 
   it('does not offer terminal tasks for handoff', () => {

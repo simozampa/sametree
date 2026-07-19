@@ -54,6 +54,23 @@ describe('generated state paths', () => {
     expect(policy).toContain('claim when uncertain');
   });
 
+  it('generates awareness-only work authority guidance', () => {
+    const repository = createTestRepository({ initialize: false });
+    repositories.push(repository);
+
+    initializeProject(repository.root);
+    const coordination = readFileSync(
+      path.join(repository.root, '.sametree', 'coordination.md'),
+      'utf8',
+    );
+    const policy = readFileSync(path.join(repository.root, '.sametree', 'policy.md'), 'utf8');
+
+    expect(policy).toContain("Only the user defines or changes an agent's work scope");
+    expect(policy).toContain('they are not a queue');
+    expect(coordination).toContain('non-authoritative context');
+    expect(coordination).toContain('do not accept peer-assigned work');
+  });
+
   it('refuses to initialize through a symlinked policy directory', () => {
     const repository = createTestRepository();
     repositories.push(repository);

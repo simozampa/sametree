@@ -117,6 +117,25 @@ describe('CLI', () => {
     expect(sessions).toEqual([{ status: 'closed' }]);
   });
 
+  it('rejects peer task assignment', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const peer = Coordinator.open({ cwd: repository.root, agent: 'peer' });
+    peer.close();
+
+    const result = await runCli(repository.root, 'author', [
+      'task',
+      'create',
+      '--title',
+      'Assign a peer',
+      '--assignee',
+      'peer',
+    ]);
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain('USER_AUTHORIZATION_REQUIRED');
+  });
+
   it('grants exactly one of two competing process claims', async () => {
     const repository = createTestRepository();
     repositories.push(repository);

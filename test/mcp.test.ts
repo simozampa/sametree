@@ -94,6 +94,37 @@ describe('MCP server', () => {
     expect(secondStatus.result.agent.name).not.toBe(firstStatus.result.agent.name);
   });
 
+  it('does not let one MCP agent assign work to another', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const peer = Coordinator.open({ cwd: repository.root, agent: 'peer' });
+    peer.close();
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [mcpPath],
+      cwd: repository.root,
+      env: {
+        ...getDefaultEnvironment(),
+        SAMETREE_AGENT: 'author',
+        SAMETREE_HARNESS: 'opencode',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'sametree-test', version: '1.0.0' });
+    clients.push(client);
+    await client.connect(transport);
+
+    const response = await client.callTool({
+      name: 'sametree_task_create',
+      arguments: { title: 'Assign a peer', assignee: 'peer' },
+    });
+
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toMatchObject({
+      result: { error: { code: 'USER_AUTHORIZATION_REQUIRED' }, ok: false },
+    });
+  });
+
   it('forcibly takes over active work through an explicit MCP call', async () => {
     const repository = createTestRepository();
     repositories.push(repository);

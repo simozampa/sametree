@@ -62,6 +62,17 @@ export interface ForceTakeoverTaskInput {
   userAuthorized: boolean;
 }
 
+export interface UserAuthorizedTaskInput {
+  expectedRevision?: number;
+  reason?: string;
+  userAuthorized?: boolean;
+}
+
+export interface UserAuthorizedHandoffInput {
+  reason?: string;
+  userAuthorized?: boolean;
+}
+
 export interface AcquireClaimInput {
   path: string;
   kind?: ClaimKind;
@@ -499,11 +510,18 @@ export class Coordinator {
       throw new SameTreeError('INVALID_INPUT', 'Task descriptions cannot exceed 20000 characters.');
     }
     const priority = input.priority ?? 'normal';
+    const assignee = input.assignee ?? this.agentName;
+    if (assignee !== this.agentName) {
+      throw new SameTreeError(
+        'USER_AUTHORIZATION_REQUIRED',
+        'Agents may create task records only for their own user-defined scope. Ask the user to instruct the target agent directly.',
+        { requestedAssignee: assignee },
+      );
+    }
     const dependencies = [...new Set(input.dependencies ?? [])];
     const now = this.#clock();
 
     return immediateTransaction(this.#database, () => {
-      if (input.assignee) this.#requireAgent(input.assignee);
       for (const dependency of dependencies) this.#task(dependency);
 
       this.#database
@@ -512,12 +530,12 @@ export class Coordinator {
             (id, title, description, status, priority, assignee, created_at, updated_at)
            VALUES (?, ?, ?, 'ready', ?, ?, ?, ?)`,
         )
-        .run(id, title, description, priority, input.assignee ?? null, now, now);
+        .run(id, title, description, priority, assignee, now, now);
       const addDependency = this.#database.prepare(
         'INSERT INTO task_dependencies (task_id, depends_on) VALUES (?, ?)',
       );
       for (const dependency of dependencies) addDependency.run(id, dependency);
-      this.#recordEvent('task.created', 'task', id, { dependencies, priority });
+      this.#recordEvent('task.created', 'task', id, { assignee, dependencies, priority });
       return this.#task(id);
     });
   }
@@ -531,7 +549,7 @@ export class Coordinator {
     return rows.map((row) => mapTask(row, this.#dependencies(stringValue(row, 'id'))));
   }
 
-  claimTask(taskId: string): Task {
+  claimTask(taskId: string, authorization: UserAuthorizedTaskInput = {}): Task {
     const now = this.#clock();
     return immediateTransaction(this.#database, () => {
       const task = this.#task(taskId);
@@ -546,31 +564,33 @@ export class Coordinator {
         });
       }
 
-      if (task.status === 'ready' && task.assignee && task.assignee !== this.agentName) {
+      if (task.assignee && task.assignee !== this.agentName) {
         throw new SameTreeError(
-          'TASK_UNAVAILABLE',
-          `Task '${taskId}' is assigned to ${task.assignee}.`,
-          { assignee: task.assignee },
+          'USER_AUTHORIZATION_REQUIRED',
+          `Task '${taskId}' is assigned to ${task.assignee}; only an explicitly user-authorized takeover may reassign it.`,
+          { assignee: task.assignee, currentRevision: task.revision },
         );
       }
 
-      if (
-        task.status === 'in_progress' &&
-        task.leaseExpiresAt !== null &&
-        task.leaseExpiresAt > now &&
-        task.assignee !== this.agentName
-      ) {
-        throw new SameTreeError(
-          'TASK_UNAVAILABLE',
-          `Task '${taskId}' is leased by ${task.assignee}.`,
-          {
-            assignee: task.assignee,
-            leaseExpiresAt: task.leaseExpiresAt,
-          },
-        );
+      let adoptionReason: string | undefined;
+      if (!task.assignee) {
+        if (!authorization.userAuthorized) {
+          throw new SameTreeError(
+            'USER_AUTHORIZATION_REQUIRED',
+            `Task '${taskId}' is an unassigned legacy record. Adopt it only after the user explicitly adds it to your scope.`,
+            { currentRevision: task.revision },
+          );
+        }
+        if (authorization.expectedRevision !== task.revision) {
+          throw new SameTreeError(
+            'TASK_UNAVAILABLE',
+            `Task '${taskId}' changed from revision ${authorization.expectedRevision ?? 'unknown'} to ${task.revision}.`,
+            { currentRevision: task.revision },
+          );
+        }
+        adoptionReason = requireText(authorization.reason ?? '', 'Adoption reason', 2_000);
       }
 
-      const takeover = task.status === 'in_progress' && task.assignee !== this.agentName;
       this.#database
         .prepare(
           `UPDATE tasks SET
@@ -585,8 +605,11 @@ export class Coordinator {
           now,
           taskId,
         );
-      this.#recordEvent(takeover ? 'task.taken_over' : 'task.claimed', 'task', taskId, {
+      this.#recordEvent(task.assignee ? 'task.claimed' : 'task.adopted', 'task', taskId, {
         previousAssignee: task.assignee,
+        ...(adoptionReason
+          ? { previousRevision: task.revision, reason: adoptionReason, userAuthorized: true }
+          : {}),
       });
       return this.#task(taskId);
     });
@@ -621,15 +644,17 @@ export class Coordinator {
           { currentRevision: task.revision },
         );
       }
-      if (
-        task.status !== 'in_progress' ||
-        !task.assignee ||
-        task.leaseExpiresAt === null ||
-        task.leaseExpiresAt <= now
-      ) {
+      if (task.status === 'done' || task.status === 'cancelled' || task.status === 'blocked') {
         throw new SameTreeError(
           'TASK_UNAVAILABLE',
-          `Task '${taskId}' does not have an active execution lease; use normal task claiming instead.`,
+          `Task '${taskId}' is ${task.status} and cannot be reassigned into progress.`,
+        );
+      }
+      if (!task.assignee) {
+        throw new SameTreeError(
+          'TASK_UNAVAILABLE',
+          `Task '${taskId}' is unassigned; use user-authorized task claiming to adopt it.`,
+          { currentRevision: task.revision },
         );
       }
       if (task.assignee === this.agentName) {
@@ -1162,7 +1187,20 @@ export class Coordinator {
     return rows.map((row) => mapHandoff(row, now));
   }
 
-  respondToHandoff(handoffId: string, accept: boolean): Handoff {
+  respondToHandoff(
+    handoffId: string,
+    accept: boolean,
+    authorization: UserAuthorizedHandoffInput = {},
+  ): Handoff {
+    if (accept && !authorization.userAuthorized) {
+      throw new SameTreeError(
+        'USER_AUTHORIZATION_REQUIRED',
+        'Accepting a handoff changes agent scope and requires explicit user authorization.',
+      );
+    }
+    const reason = accept
+      ? requireText(authorization.reason ?? '', 'Handoff authorization reason', 2_000)
+      : undefined;
     const now = this.#clock();
     return immediateTransaction(this.#database, () => {
       const row = this.#database.prepare('SELECT * FROM handoffs WHERE id = ?').get(handoffId) as
@@ -1233,7 +1271,10 @@ export class Coordinator {
         this.#transferClaims(claimIds, stringValue(row, 'from_agent'), now);
       }
 
-      this.#recordEvent(`handoff.${status}`, 'handoff', handoffId, { taskId: task.id });
+      this.#recordEvent(`handoff.${status}`, 'handoff', handoffId, {
+        taskId: task.id,
+        ...(accept ? { reason, userAuthorized: true } : {}),
+      });
       return mapHandoff({ ...row, status, responded_at: now }, now);
     });
   }

@@ -120,9 +120,9 @@ Batch acquisition is atomic. An overlap with another agent rejects the entire ba
 
 Sessions, task execution, claims, and handoffs use wall-clock expiries. A daemonless design cannot provide a shared persistent monotonic clock.
 
-Graceful MCP shutdown closes the session but leaves its claims and execution lease visible until explicit release or expiry. This preserves pending handoffs across normal client shutdown. Expired in-progress work is not silently marked ready; another agent claims it explicitly, producing an audit event.
+Graceful MCP shutdown closes the session but leaves its claims and execution lease visible until explicit release or expiry. This preserves pending handoffs across normal client shutdown. Expired in-progress work is not silently marked ready or exposed as peer-claimable work. Its assignment remains durable until the owner resumes it or the user explicitly reassigns it.
 
-Normal claims cannot bypass a live lease. A separate forced-takeover operation exists for a direct user reassignment: it requires the current task revision, an audit reason, explicit user authorization, and selected claim IDs. The task and claims move in one immediate transaction, or none move. This is a cooperative recovery mechanism rather than an authorization boundary.
+Normal claims never change task assignment. A separate forced-takeover operation exists for a direct user reassignment, whether the prior execution lease is live or expired: it requires the current task revision, an audit reason, explicit user authorization, and selected claim IDs. The task and claims move in one immediate transaction, or none move. This is a cooperative recovery mechanism rather than an authorization boundary.
 
 Leases cannot fence direct filesystem writes. They are coordination state for cooperative agents, not mandatory locks.
 
