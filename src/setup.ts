@@ -732,7 +732,7 @@ function configureClaudePlugin(
     );
     if (
       configuredPlugin?.enabled !== true ||
-      (plan.updatePlugin && configuredPlugin.version !== VERSION)
+      ((!plan.pluginExists || plan.updatePlugin) && configuredPlugin.version !== VERSION)
     ) {
       throw new SameTreeError(
         'INVALID_INPUT',

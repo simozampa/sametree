@@ -31,7 +31,9 @@ const PACKAGE_ROOT = path.resolve('.');
 
 const repositories: TestRepository[] = [];
 
-function claudePluginCommands(options: { pluginVersion?: string; updateVersion?: boolean } = {}) {
+function claudePluginCommands(
+  options: { installVersion?: string; pluginVersion?: string; updateVersion?: boolean } = {},
+) {
   let marketplace = options.pluginVersion !== undefined;
   let plugin = options.pluginVersion !== undefined;
   let enabled = options.pluginVersion !== undefined;
@@ -63,7 +65,7 @@ function claudePluginCommands(options: { pluginVersion?: string; updateVersion?:
     if (args[1] === 'install') {
       plugin = true;
       enabled = true;
-      pluginVersion = VERSION;
+      pluginVersion = options.installVersion ?? VERSION;
     }
     if (args[1] === 'uninstall') {
       plugin = false;
@@ -378,6 +380,21 @@ Use SameTree before editing: check status, inbox, policy state, and active claim
     const plugins = claudePluginCommands({ pluginVersion: '0.1.0', updateVersion: false });
     const runner: ClaudeCommandRunner = (args) =>
       plugins(args) ?? { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
+
+    expect(() => setupProject(repository.root, { claude: true, claudeRunner: runner })).toThrow(
+      /expected SameTree Claude Code plugin version/u,
+    );
+  });
+
+  it('rejects a fresh Claude plugin install with the wrong version', () => {
+    const repository = setup();
+    const plugins = claudePluginCommands({ installVersion: '0.1.0' });
+    const runner: ClaudeCommandRunner = (args) => {
+      if (args[0] === 'mcp' && args[1] === 'get') {
+        return { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
+      }
+      return plugins(args) ?? { status: 0, stdout: '', stderr: '' };
+    };
 
     expect(() => setupProject(repository.root, { claude: true, claudeRunner: runner })).toThrow(
       /expected SameTree Claude Code plugin version/u,

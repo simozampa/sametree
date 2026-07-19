@@ -6,7 +6,7 @@ This document defines the behavior shared by the CLI and MCP adapters.
 
 An agent name is unique within one working tree and contains letters, numbers, `.`, `_`, or `-`. MCP adapters generate a process-scoped name from the harness's native session identifier, falling back to the MCP process ID. Set `SAMETREE_AGENT` when a durable human-readable identity such as `claude-reviewer` or `opencode-1` is required.
 
-A session represents one process lifetime. Starting a CLI command or MCP server creates a new session for its agent. Built-in CLI, MCP, watch, and message-follower sessions remain in the session table for lease ownership and diagnostics but omit lifecycle audit events. Library callers may opt into `session.started` and `session.closed` events when exact process-lifecycle auditing is useful. An MCP heartbeat renews:
+A session represents one Coordinator-backed process lifetime. Coordination CLI commands, MCP servers, watchers, and message followers create sessions; setup, diagnostics, and hook commands that do not open the Coordinator do not. Built-in sessions remain in the session table for lease ownership and diagnostics but omit lifecycle audit events. Library callers emit `session.started` and `session.closed` by default and may disable them. An MCP heartbeat renews:
 
 - The session expiry.
 - Active path claims owned by that session.

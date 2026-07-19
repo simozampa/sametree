@@ -71,7 +71,7 @@ JSON remains at the boundaries and inside bounded event/context payloads, not as
 
 ## Connection Settings
 
-Every process configures its connection with:
+Every persistent database connection configures:
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -82,6 +82,8 @@ PRAGMA trusted_schema = OFF;
 PRAGMA cell_size_check = ON;
 PRAGMA wal_autocheckpoint = 1000;
 ```
+
+An explicit `:memory:` database keeps SQLite's in-memory journal mode while applying the remaining safety settings.
 
 SameTree requires SQLite 3.51.3 or newer because earlier WAL versions were affected by a rare multi-connection reset race. The pinned `better-sqlite3` release currently bundles SQLite 3.53.x.
 
