@@ -4,9 +4,11 @@
   "description": "Local coordination for coding agents that share a Git working tree",
   "keywords": [
     "agent",
+    "agents",
     "claude-code",
     "coordination",
     "mcp",
+    "mcp-server",
     "multi-agent",
     "opencode",
     "sqlite"
