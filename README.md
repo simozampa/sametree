@@ -60,7 +60,7 @@ Every instance gets a unique identity automatically and joins the agents in that
 
 Automatic OpenCode delivery requires a local TUI process. `opencode attach` can connect to a different server process with a different SameTree identity, so its adapter reports the limitation instead of consuming another identity's messages.
 
-After upgrading SameTree, refresh Claude Code's cached plugin with `claude plugin update --scope user sametree@sametree`.
+When upgrading, stop every active agent first, install the new package, rerun setup with the harnesses used by that repository, review preserved custom policy files, and restart the harnesses. Setup refreshes exact stock SameTree files and managed adapters without overwriting customized policy. See [Upgrading](docs/upgrading.md) for the `0.1.2` behavior and rollback procedure.
 
 ## Coordination Loop
 
@@ -157,6 +157,7 @@ No. SameTree is intentionally local to one machine and one Git worktree. Use a n
 
 - [Architecture](docs/architecture.md): storage and concurrency decisions
 - [Protocol](docs/protocol.md): tools, state transitions, and invariants
+- [Upgrading](docs/upgrading.md): safe package, policy, adapter, and session migration
 - [Four-agent review loop](examples/review-loop/): worker and reviewer example
 - [Contributing](CONTRIBUTING.md): development and demo generation
 - [Security](SECURITY.md): vulnerability reporting
