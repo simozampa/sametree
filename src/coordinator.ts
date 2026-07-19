@@ -248,38 +248,44 @@ export class Coordinator {
     this.sessionId = createId('session');
 
     const now = this.#clock();
-    immediateTransaction(this.#database, () => {
-      this.#database
-        .prepare(
-          `INSERT INTO agents (name, harness, role, created_at, last_seen_at)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(name) DO UPDATE SET
-             harness = excluded.harness,
-             role = excluded.role,
-             last_seen_at = excluded.last_seen_at`,
-        )
-        .run(this.agentName, options.harness ?? 'other', options.role ?? 'implementer', now, now);
-      this.#database
-        .prepare(
-          `INSERT INTO sessions
-            (id, agent_name, process_id, started_at, last_heartbeat_at, expires_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, 'active')`,
-        )
-        .run(
-          this.sessionId,
-          this.agentName,
-          process.pid,
-          now,
-          now,
-          now + this.config.sessionTtlSeconds * 1_000,
-        );
-      if (this.#recordSessionLifecycleEvents) {
-        this.#recordEvent('session.started', 'session', this.sessionId, {
-          harness: options.harness ?? 'other',
-          role: options.role ?? 'implementer',
-        });
-      }
-    });
+    try {
+      immediateTransaction(this.#database, () => {
+        this.#database
+          .prepare(
+            `INSERT INTO agents (name, harness, role, created_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET
+               harness = excluded.harness,
+               role = excluded.role,
+               last_seen_at = excluded.last_seen_at`,
+          )
+          .run(this.agentName, options.harness ?? 'other', options.role ?? 'implementer', now, now);
+        this.#database
+          .prepare(
+            `INSERT INTO sessions
+              (id, agent_name, process_id, started_at, last_heartbeat_at, expires_at, status)
+             VALUES (?, ?, ?, ?, ?, ?, 'active')`,
+          )
+          .run(
+            this.sessionId,
+            this.agentName,
+            process.pid,
+            now,
+            now,
+            now + this.config.sessionTtlSeconds * 1_000,
+          );
+        if (this.#recordSessionLifecycleEvents) {
+          this.#recordEvent('session.started', 'session', this.sessionId, {
+            harness: options.harness ?? 'other',
+            role: options.role ?? 'implementer',
+          });
+        }
+      });
+    } catch (error) {
+      this.#database.close();
+      this.#closed = true;
+      throw error;
+    }
   }
 
   static open(options: CoordinatorOptions): Coordinator {
@@ -481,32 +487,37 @@ export class Coordinator {
 
   close(options: { releaseClaims?: boolean } = {}): void {
     if (this.#closed) return;
-    immediateTransaction(this.#database, () => {
-      this.#database
-        .prepare(
-          'DELETE FROM message_deliveries WHERE reserved_by_session = ? AND delivered_at IS NULL',
-        )
-        .run(this.sessionId);
-      if (options.releaseClaims) {
-        this.#database.prepare('DELETE FROM path_claims WHERE session_id = ?').run(this.sessionId);
+    try {
+      immediateTransaction(this.#database, () => {
         this.#database
           .prepare(
-            `UPDATE tasks SET claimed_by_session = NULL, lease_expires_at = NULL
-             WHERE claimed_by_session = ? AND status = 'in_progress'`,
+            'DELETE FROM message_deliveries WHERE reserved_by_session = ? AND delivered_at IS NULL',
           )
           .run(this.sessionId);
-      }
-      this.#database
-        .prepare("UPDATE sessions SET status = 'closed', expires_at = ? WHERE id = ?")
-        .run(this.#clock(), this.sessionId);
-      if (this.#recordSessionLifecycleEvents) {
-        this.#recordEvent('session.closed', 'session', this.sessionId, {
-          releasedClaims: options.releaseClaims ?? false,
-        });
-      }
-    });
-    this.#database.close();
-    this.#closed = true;
+        if (options.releaseClaims) {
+          this.#database
+            .prepare('DELETE FROM path_claims WHERE session_id = ?')
+            .run(this.sessionId);
+          this.#database
+            .prepare(
+              `UPDATE tasks SET claimed_by_session = NULL, lease_expires_at = NULL
+               WHERE claimed_by_session = ? AND status = 'in_progress'`,
+            )
+            .run(this.sessionId);
+        }
+        this.#database
+          .prepare("UPDATE sessions SET status = 'closed', expires_at = ? WHERE id = ?")
+          .run(this.#clock(), this.sessionId);
+        if (this.#recordSessionLifecycleEvents) {
+          this.#recordEvent('session.closed', 'session', this.sessionId, {
+            releasedClaims: options.releaseClaims ?? false,
+          });
+        }
+      });
+    } finally {
+      this.#database.close();
+      this.#closed = true;
+    }
   }
 
   listAgents(options: { activeOnly?: boolean } = {}): Agent[] {

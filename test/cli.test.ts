@@ -170,6 +170,11 @@ describe('CLI', () => {
     );
 
     for (const result of results) expect(result).toMatchObject({ code: 0, stderr: '' });
+    const database = new Database(resolveRepository(repository.root).databasePath, {
+      readonly: true,
+    });
+    expect(database.pragma('journal_mode', { simple: true })).toBe('wal');
+    database.close();
   });
 
   it('returns a compact claim acquisition receipt', async () => {

@@ -2,6 +2,7 @@ export type ErrorCode =
   | 'AGENT_REQUIRED'
   | 'CLAIM_CONFLICT'
   | 'DATABASE_ERROR'
+  | 'GIT_STATUS_ERROR'
   | 'HANDOFF_CONFLICT'
   | 'HOOK_REFUSED'
   | 'INVALID_INPUT'

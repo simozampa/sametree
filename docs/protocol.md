@@ -149,6 +149,7 @@ Expected failures return stable machine-readable codes:
 | `AGENT_REQUIRED` | No agent identity was provided |
 | `CLAIM_CONFLICT` | Another agent owns an overlapping active claim |
 | `HANDOFF_CONFLICT` | A handoff expired, resolved, or references stale work |
+| `GIT_STATUS_ERROR` | Git could not report live branch or worktree state |
 | `HOOK_REFUSED` | A configured Git policy check failed |
 | `INVALID_INPUT` | Input or repository configuration is invalid |
 | `NOT_ASSIGNED` | The actor does not own the requested entity |

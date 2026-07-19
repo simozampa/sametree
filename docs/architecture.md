@@ -101,7 +101,7 @@ A typical mutation is:
 
 No Git command, filesystem traversal, or network operation runs inside a database transaction.
 
-Status queries observe Git's porcelain-v2 branch and worktree state immediately before reading coordination rows. This derived state is never persisted, so a long-running MCP process reflects branch switches, commits, and dirty changes on its next status call.
+Status queries observe Git's porcelain-v2 branch and worktree state immediately before reading coordination rows. The command has a bounded runtime and output buffer, includes configured submodule changes, and uses symbolic HEAD to distinguish detached mode from a branch literally named `(detached)`. This derived state is never persisted, so a long-running MCP process reflects branch switches, commits, and dirty changes on its next status call.
 
 ## Path Safety
 

@@ -62,11 +62,22 @@ function openCoordinator(
 
 function runWithCoordinator<T>(command: Command, operation: (coordinator: Coordinator) => T): void {
   const coordinator = openCoordinator(command, { recordSessionLifecycleEvents: false });
+  let operationFailed = false;
+  let operationError: unknown;
   try {
     print(operation(coordinator));
-  } finally {
-    coordinator.close();
+  } catch (error) {
+    operationFailed = true;
+    operationError = error;
   }
+  let closeError: unknown;
+  try {
+    coordinator.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (operationFailed) throw operationError;
+  if (closeError !== undefined) throw closeError;
 }
 
 async function runStreaming(
@@ -81,13 +92,24 @@ async function runStreaming(
   };
   process.once('SIGINT', abort);
   process.once('SIGTERM', abort);
+  let operationFailed = false;
+  let operationError: unknown;
   try {
     await operation(coordinator, controller.signal);
-  } finally {
-    process.removeListener('SIGINT', abort);
-    process.removeListener('SIGTERM', abort);
-    coordinator.close();
+  } catch (error) {
+    operationFailed = true;
+    operationError = error;
   }
+  process.removeListener('SIGINT', abort);
+  process.removeListener('SIGTERM', abort);
+  let closeError: unknown;
+  try {
+    coordinator.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (operationFailed) throw operationError;
+  if (closeError !== undefined) throw closeError;
 }
 
 function stdinConfirmations(signal: AbortSignal) {

@@ -12,6 +12,9 @@ export interface RepositoryContext {
   ignoreCase: boolean;
 }
 
+const GIT_STATUS_TIMEOUT_MS = 15_000;
+const GIT_STATUS_MAX_BUFFER = 16 * 1024 * 1024;
+
 function git(cwd: string, args: string[]): string {
   try {
     return execFileSync('git', args, {
@@ -65,27 +68,54 @@ export function gitConfig(cwd: string, key: string, type?: 'bool' | 'path'): str
 }
 
 export function readGitWorktreeContext(repositoryRoot: string): GitWorktreeContext {
-  const lines = git(repositoryRoot, [
-    '--no-optional-locks',
-    'status',
-    '--porcelain=v2',
-    '--branch',
-    '--no-ahead-behind',
-    '--untracked-files=normal',
-  ]).split('\n');
-  const oidPrefix = '# branch.oid ';
-  const headPrefix = '# branch.head ';
-  const oid = lines.find((line) => line.startsWith(oidPrefix))?.slice(oidPrefix.length);
-  const head = lines.find((line) => line.startsWith(headPrefix))?.slice(headPrefix.length);
-  if (!oid || !head) {
-    throw new SameTreeError('NOT_GIT_REPOSITORY', 'Git did not report worktree HEAD state.');
+  let output: string;
+  try {
+    output = execFileSync(
+      'git',
+      [
+        '--no-optional-locks',
+        'status',
+        '--porcelain=v2',
+        '--branch',
+        '--no-ahead-behind',
+        '--untracked-files=normal',
+        '--ignore-submodules=none',
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: GIT_STATUS_TIMEOUT_MS,
+        maxBuffer: GIT_STATUS_MAX_BUFFER,
+      },
+    ).trim();
+  } catch (error) {
+    throw new SameTreeError('GIT_STATUS_ERROR', 'Could not inspect live Git worktree state.', {
+      cause: error instanceof Error ? error.message : String(error),
+    });
   }
-  const detached = head === '(detached)';
+  const lines = output.split('\n');
+  const oidPrefix = '# branch.oid ';
+  const oid = lines.find((line) => line.startsWith(oidPrefix))?.slice(oidPrefix.length);
+  if (!oid) {
+    throw new SameTreeError('GIT_STATUS_ERROR', 'Git did not report worktree HEAD state.');
+  }
+  let branch: string | null;
+  try {
+    branch = execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: GIT_STATUS_TIMEOUT_MS,
+    }).trim();
+  } catch {
+    branch = null;
+  }
   return {
     root: realpathSync(repositoryRoot),
-    branch: detached ? null : head,
+    branch,
     commit: oid === '(initial)' ? null : oid,
-    detached,
+    detached: branch === null,
     dirty: lines.some((line) => line.length > 0 && !line.startsWith('# ')),
   };
 }

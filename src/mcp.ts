@@ -19,13 +19,22 @@ const nativeSession =
 const automaticSuffix =
   nativeSession?.replace(/[^A-Za-z0-9._-]/gu, '-').replace(/^-+|-+$/gu, '') || String(process.pid);
 const agent = process.env.SAMETREE_AGENT || `${harness}-${automaticSuffix}`.slice(0, 80);
-const coordinator = Coordinator.open({
-  agent,
-  harness,
-  role: process.env.SAMETREE_ROLE ?? 'implementer',
-  cwd: process.env.SAMETREE_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
-  recordSessionLifecycleEvents: false,
-});
+function openCoordinator(): Coordinator {
+  try {
+    return Coordinator.open({
+      agent,
+      harness,
+      role: process.env.SAMETREE_ROLE ?? 'implementer',
+      cwd: process.env.SAMETREE_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
+      recordSessionLifecycleEvents: false,
+    });
+  } catch (error) {
+    process.stderr.write(`${JSON.stringify(errorResult(error))}\n`);
+    process.exit(1);
+  }
+}
+
+const coordinator = openCoordinator();
 
 const server = new McpServer({ name: 'sametree', version: VERSION });
 const outputSchema = { result: z.unknown() };

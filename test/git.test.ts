@@ -56,6 +56,14 @@ describe('Git worktree context', () => {
       dirty: false,
     });
 
+    git(repository.root, ['checkout', '-b', '(detached)']);
+    expect(readGitWorktreeContext(repository.root)).toMatchObject({
+      branch: '(detached)',
+      commit,
+      detached: false,
+      dirty: false,
+    });
+
     git(repository.root, ['checkout', '--detach']);
     expect(readGitWorktreeContext(repository.root)).toMatchObject({
       branch: null,
