@@ -4,6 +4,7 @@ import { createInterface } from 'node:readline';
 import { Command, Option } from 'commander';
 
 import { Coordinator } from './coordinator.js';
+import { diagnoseRepository } from './doctor.js';
 import { errorResult } from './errors.js';
 import { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 import { initializeProject } from './project.js';
@@ -155,7 +156,8 @@ program
   .command('doctor')
   .description('Check Git, SQLite, policy, and state integrity.')
   .action((_options: unknown, command: Command) => {
-    runWithCoordinator(command, (coordinator) => coordinator.doctor());
+    const options = command.optsWithGlobals<GlobalOptions>();
+    print(diagnoseRepository(options.cwd));
   });
 
 const task = program.command('task').description('Create and coordinate durable tasks.');

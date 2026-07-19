@@ -6,6 +6,7 @@ export {
   type ForceTakeoverTaskInput,
   type UpdateTaskInput,
 } from './coordinator.js';
+export { diagnoseRepository } from './doctor.js';
 export { type ErrorCode, errorResult, isSameTreeError, SameTreeError } from './errors.js';
 export { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 export { type InitializationResult, initializeProject } from './project.js';

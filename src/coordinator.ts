@@ -6,6 +6,7 @@ import type { Database as DatabaseType } from 'better-sqlite3';
 
 import { loadConfig, POLICY_FILE, type SameTreeConfig } from './config.js';
 import { immediateTransaction, openDatabase } from './database.js';
+import { inspectDatabase } from './doctor.js';
 import { SameTreeError } from './errors.js';
 import { type RepositoryContext, resolveRepository } from './git.js';
 import { claimsOverlap, normalizeClaim } from './paths.js';
@@ -1348,26 +1349,6 @@ export class Coordinator {
   }
 
   doctor(): DoctorReport {
-    const sqlite = this.#database.prepare('SELECT sqlite_version() AS version').get() as Row;
-    const integrity = this.#database.pragma('integrity_check', { simple: true }) as string;
-    const foreignKeys = this.#database.pragma('foreign_key_check') as Row[];
-    const journalMode = this.#database.pragma('journal_mode', { simple: true }) as string;
-    const warnings: string[] = [];
-    if (journalMode.toLowerCase() !== 'wal') warnings.push('SQLite journal mode is not WAL.');
-    if (!existsSync(path.join(this.repository.root, POLICY_FILE))) {
-      warnings.push(`Missing ${POLICY_FILE}; run 'sametree init'.`);
-    }
-
-    return {
-      ok: integrity === 'ok' && foreignKeys.length === 0 && warnings.length === 0,
-      repositoryRoot: this.repository.root,
-      databasePath: this.repository.databasePath,
-      sqliteVersion: stringValue(sqlite, 'version'),
-      journalMode,
-      integrity,
-      foreignKeyViolations: foreignKeys.length,
-      policyPresent: existsSync(path.join(this.repository.root, POLICY_FILE)),
-      warnings,
-    };
+    return inspectDatabase(this.#database, this.repository);
   }
 }

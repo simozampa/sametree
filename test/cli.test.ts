@@ -17,11 +17,18 @@ interface ProcessResult {
   stdout: string;
 }
 
-function runCli(root: string, agent: string, args: string[], input = ''): Promise<ProcessResult> {
+function runCli(
+  root: string,
+  agent: string | undefined,
+  args: string[],
+  input = '',
+): Promise<ProcessResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [cliPath, '--cwd', root, '--agent', agent, ...args], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const child = spawn(
+      process.execPath,
+      [cliPath, '--cwd', root, ...(agent ? ['--agent', agent] : []), ...args],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    );
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
@@ -51,6 +58,25 @@ describe('CLI', () => {
     expect(result).toMatchObject({ code: 0, stderr: '' });
     expect(output.agent.name).toBe('cli-agent');
     expect(output.claims).toEqual([]);
+  });
+
+  it('runs doctor without an agent or session registration', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const result = await runCli(repository.root, undefined, ['doctor']);
+    const output = JSON.parse(result.stdout) as { ok: boolean; repositoryRoot: string };
+    const database = new Database(resolveRepository(repository.root).databasePath, {
+      readonly: true,
+    });
+    const agents = database.prepare('SELECT COUNT(*) AS count FROM agents').get();
+    const sessions = database.prepare('SELECT COUNT(*) AS count FROM sessions').get();
+    database.close();
+
+    expect(result).toMatchObject({ code: 0, stderr: '' });
+    expect(output).toMatchObject({ ok: true, repositoryRoot: repository.root });
+    expect(agents).toEqual({ count: 0 });
+    expect(sessions).toEqual({ count: 0 });
   });
 
   it('omits lifecycle events for one-shot commands but keeps their session rows', async () => {
