@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { Coordinator } from './coordinator.js';
 import { errorResult } from './errors.js';
 import type { Harness, TaskPriority, TaskStatus } from './types.js';
+import { VERSION } from './version.js';
 
 const harness = (process.env.SAMETREE_HARNESS ?? 'other') as Harness;
 const nativeSession =
@@ -25,7 +26,7 @@ const coordinator = Coordinator.open({
   cwd: process.env.SAMETREE_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
 });
 
-const server = new McpServer({ name: 'sametree', version: '0.1.0' });
+const server = new McpServer({ name: 'sametree', version: VERSION });
 const outputSchema = { result: z.unknown() };
 
 function result(value: unknown) {

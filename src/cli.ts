@@ -10,6 +10,7 @@ import { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 import { initializeProject } from './project.js';
 import { setupProject } from './setup.js';
 import type { Harness, TaskPriority, TaskStatus } from './types.js';
+import { VERSION } from './version.js';
 import { followMessages, watchEvents } from './watch.js';
 
 interface GlobalOptions {
@@ -106,7 +107,7 @@ const program = new Command()
   .name('sametree')
   .configureOutput({ writeErr: () => undefined })
   .description('Coordinate coding agents that share a Git working tree.')
-  .version('0.1.0')
+  .version(VERSION)
   .option('--agent <name>', 'unique agent name', process.env.SAMETREE_AGENT)
   .option('--cwd <path>', 'working tree directory', process.env.SAMETREE_CWD ?? process.cwd())
   .addOption(

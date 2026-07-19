@@ -33,4 +33,5 @@ export type {
   TaskPriority,
   TaskStatus,
 } from './types.js';
+export { VERSION } from './version.js';
 export { followMessages, formatEvent, formatMessage, watchEvents } from './watch.js';

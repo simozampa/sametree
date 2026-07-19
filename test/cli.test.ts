@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { Coordinator } from '../src/coordinator.js';
 import { resolveRepository } from '../src/git.js';
+import { VERSION } from '../src/version.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
@@ -48,6 +49,17 @@ afterEach(() => {
 });
 
 describe('CLI', () => {
+  it('reports the package version', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    expect(await runCli(repository.root, undefined, ['--version'])).toMatchObject({
+      code: 0,
+      stderr: '',
+      stdout: `${VERSION}\n`,
+    });
+  });
+
   it('returns machine-readable status', async () => {
     const repository = createTestRepository();
     repositories.push(repository);
