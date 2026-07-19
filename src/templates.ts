@@ -69,7 +69,7 @@ At session start:
 
 1. Read your role file under \`.sametree/roles/\`.
 2. Call \`sametree_status\` and \`sametree_policy_get\`; the policy response contains the shared policy, and you should acknowledge its hash only when \`acknowledgedAt\` is null.
-3. Read the inbox or pending handoffs only when status reports unread items.
+3. Read the inbox when \`unreadMessages\` is greater than zero and pending handoffs when \`pendingHandoffs\` is greater than zero.
 
 During work:
 

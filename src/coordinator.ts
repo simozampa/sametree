@@ -565,7 +565,10 @@ export class Coordinator {
   }
 
   listTasks(options: ListTasksOptions = {}): Task[] {
-    const limit = Math.min(Math.max(options.limit ?? 25, 1), 100);
+    const limit = options.limit ?? 25;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new SameTreeError('INVALID_INPUT', 'Task list limit must be between 1 and 100.');
+    }
     const conditions: string[] = [];
     const parameters: Array<number | string> = [];
     if (options.status) {
@@ -691,10 +694,10 @@ export class Coordinator {
           { currentRevision: task.revision },
         );
       }
-      if (task.status === 'done' || task.status === 'cancelled' || task.status === 'blocked') {
+      if (task.status === 'done' || task.status === 'cancelled') {
         throw new SameTreeError(
           'TASK_UNAVAILABLE',
-          `Task '${taskId}' is ${task.status} and cannot be reassigned into progress.`,
+          `Task '${taskId}' is ${task.status} and cannot be reassigned.`,
         );
       }
       if (!task.assignee) {
@@ -708,24 +711,21 @@ export class Coordinator {
         throw new SameTreeError('INVALID_INPUT', `Task '${taskId}' is already assigned to you.`);
       }
       const blockers = this.#unfinishedDependencies(taskId);
-      if (blockers.length > 0) {
-        throw new SameTreeError('TASK_BLOCKED', `Task '${taskId}' has unfinished dependencies.`, {
-          dependencies: blockers,
-        });
-      }
+      const startExecution = task.status !== 'blocked' && blockers.length === 0;
 
       const previousAssignee = task.assignee;
       const claims = this.#transferClaims(claimIds, previousAssignee, now, 'TASK_UNAVAILABLE');
       this.#database
         .prepare(
           `UPDATE tasks SET assignee = ?, claimed_by_session = ?, lease_expires_at = ?,
-             status = 'in_progress', revision = revision + 1, updated_at = ?
+             status = ?, revision = revision + 1, updated_at = ?
            WHERE id = ?`,
         )
         .run(
           this.agentName,
-          this.sessionId,
-          now + this.config.taskLeaseSeconds * 1_000,
+          startExecution ? this.sessionId : null,
+          startExecution ? now + this.config.taskLeaseSeconds * 1_000 : null,
+          startExecution ? 'in_progress' : task.status,
           now,
           taskId,
         );
@@ -735,6 +735,8 @@ export class Coordinator {
         previousLeaseExpiresAt: task.leaseExpiresAt,
         previousRevision: task.revision,
         claimIds,
+        blockers,
+        newStatus: startExecution ? 'in_progress' : task.status,
         reason,
         userAuthorized: true,
       });
@@ -1145,6 +1147,9 @@ export class Coordinator {
     const id = createId('handoff');
     const summary = requireText(input.summary, 'Handoff summary', 20_000);
     const claimIds = [...new Set(input.claimIds ?? [])];
+    if (claimIds.length > 100) {
+      throw new SameTreeError('INVALID_INPUT', 'Transfer at most 100 claims in one handoff.');
+    }
     const now = this.#clock();
     const expiresAt = now + this.config.handoffTtlSeconds * 1_000;
     let contextJson: string;
@@ -1219,9 +1224,12 @@ export class Coordinator {
     const rows = options.pendingOnly
       ? (this.#database
           .prepare(
-            `SELECT * FROM handoffs
-             WHERE to_agent = ? AND status = 'offered' AND expires_at > ?
-             ORDER BY created_at DESC`,
+            `SELECT handoff.* FROM handoffs handoff
+             JOIN tasks task ON task.id = handoff.task_id
+             WHERE handoff.to_agent = ? AND handoff.status = 'offered'
+               AND handoff.expires_at > ? AND task.revision = handoff.task_revision
+               AND task.assignee = handoff.from_agent AND task.status = 'in_progress'
+             ORDER BY handoff.created_at DESC`,
           )
           .all(this.agentName, now) as Row[])
       : (this.#database
@@ -1380,7 +1388,10 @@ export class Coordinator {
   }
 
   events(options: { after?: number; limit?: number } = {}): CoordinationEvent[] {
-    const limit = Math.min(Math.max(options.limit ?? 25, 1), 1_000);
+    const limit = options.limit ?? 25;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new SameTreeError('INVALID_INPUT', 'Event limit must be between 1 and 1000.');
+    }
     return (
       this.#database
         .prepare('SELECT * FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?')
@@ -1400,6 +1411,15 @@ export class Coordinator {
   snapshot(options: SnapshotOptions = {}): CoordinationSnapshot {
     const git = readGitWorktreeContext(this.repository.root);
     return this.#database.transaction(() => {
+      const taskRows = options.includeTerminalTasks
+        ? (this.#database.prepare('SELECT * FROM tasks ORDER BY created_at, id').all() as Row[])
+        : (this.#database
+            .prepare(
+              `SELECT * FROM tasks
+               WHERE status NOT IN ('done', 'cancelled')
+               ORDER BY created_at, id`,
+            )
+            .all() as Row[]);
       const agentRow = this.#database
         .prepare('SELECT * FROM agents WHERE name = ?')
         .get(this.agentName);
@@ -1420,8 +1440,11 @@ export class Coordinator {
         .get(this.agentName, this.agentName, this.agentName) as Row;
       const handoffs = this.#database
         .prepare(
-          `SELECT COUNT(*) AS count FROM handoffs
-           WHERE to_agent = ? AND status = 'offered' AND expires_at > ?`,
+          `SELECT COUNT(*) AS count FROM handoffs handoff
+           JOIN tasks task ON task.id = handoff.task_id
+           WHERE handoff.to_agent = ? AND handoff.status = 'offered'
+             AND handoff.expires_at > ? AND task.revision = handoff.task_revision
+             AND task.assignee = handoff.from_agent AND task.status = 'in_progress'`,
         )
         .get(this.agentName, this.#clock()) as Row;
       const lastEvent = this.#database
@@ -1433,10 +1456,7 @@ export class Coordinator {
         agent: mapAgent(agentRow as Row),
         session: mapSession(sessionRow as Row),
         agents: this.listAgents({ activeOnly: !options.includeInactiveAgents }),
-        tasks: this.listTasks({
-          includeTerminal: options.includeTerminalTasks ?? false,
-          limit: 100,
-        }),
+        tasks: taskRows.map((row) => mapTask(row, this.#dependencies(stringValue(row, 'id')))),
         claims: this.listClaims(),
         unreadMessages: numberValue(unread, 'count'),
         pendingHandoffs: numberValue(handoffs, 'count'),

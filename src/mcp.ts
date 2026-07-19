@@ -339,7 +339,7 @@ server.registerTool(
       to: z.string(),
       summary: z.string().min(1).max(20_000),
       context: z.record(z.string(), z.unknown()).optional(),
-      claimIds: z.array(z.string()).optional(),
+      claimIds: z.array(z.string()).max(100).optional(),
     },
     outputSchema,
   },

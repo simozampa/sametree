@@ -35,7 +35,7 @@ SameTree is a local-first coordination layer for a small number of cooperative c
                                                 └────────────────────┘
 ```
 
-Each MCP client owns one server child process and one SameTree session. A heartbeat every 20 seconds renews the session, tasks, and path claims held by that process. CLI commands open their own sessions and leave acquired leases alive until explicit release or expiry; a later CLI process cannot renew an earlier process's session. One-shot CLI sessions omit lifecycle audit events to keep the event stream focused on coordination, while streaming CLI and MCP process lifecycles remain visible.
+Each MCP client owns one server child process and one SameTree session. A heartbeat every 20 seconds renews the session, tasks, and path claims held by that process. CLI commands open their own sessions and leave acquired leases alive until explicit release or expiry; a later CLI process cannot renew an earlier process's session. Built-in CLI, streaming, and MCP sessions retain durable session rows but omit lifecycle audit events to keep the event stream focused on coordination.
 
 The CLI and MCP server call the same `Coordinator` domain service. Neither adapter contains coordination rules.
 
