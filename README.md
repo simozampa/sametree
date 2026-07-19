@@ -32,14 +32,10 @@ SameTree does not support state databases on NFS, SMB, cloud-synced folders, or 
 ## Install
 
 ```bash
-git clone https://github.com/simozampa/sametree.git
-cd sametree
-npm ci
-npm run build
-npm link
+npm install --global sametree
 ```
 
-SameTree is not yet published to npm. `npm link` exposes `sametree` and `sametree-mcp` from the source checkout.
+This installs the `sametree` CLI and `sametree-mcp` server.
 
 ## Quick Start
 
