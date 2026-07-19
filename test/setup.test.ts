@@ -31,7 +31,7 @@ const PACKAGE_ROOT = path.resolve('.');
 
 const repositories: TestRepository[] = [];
 
-function claudePluginCommands(options: { pluginVersion?: string } = {}) {
+function claudePluginCommands(options: { pluginVersion?: string; updateVersion?: boolean } = {}) {
   let marketplace = options.pluginVersion !== undefined;
   let plugin = options.pluginVersion !== undefined;
   let enabled = options.pluginVersion !== undefined;
@@ -70,7 +70,7 @@ function claudePluginCommands(options: { pluginVersion?: string } = {}) {
       enabled = false;
       pluginVersion = undefined;
     }
-    if (args[1] === 'update') pluginVersion = VERSION;
+    if (args[1] === 'update' && options.updateVersion !== false) pluginVersion = VERSION;
     if (args[1] === 'enable') enabled = true;
     return { status: 0, stdout: 'ok', stderr: '' };
   };
@@ -225,6 +225,32 @@ Use SameTree before editing: check status, inbox, policy state, and active claim
     expect(readFileSync(agentsPath, 'utf8')).toContain('Custom managed wording');
   });
 
+  it('does not treat a fenced legacy OpenCode block as active instructions', () => {
+    const repository = setup();
+    const agentsPath = path.join(repository.root, 'AGENTS.md');
+    writeFileSync(
+      agentsPath,
+      `# Example
+
+\`\`\`markdown
+<!-- sametree:coordination -->
+## SameTree Coordination
+
+Read and follow \`.sametree/coordination.md\`, \`.sametree/policy.md\`, and the role matching your task under \`.sametree/roles/\`.
+
+Use SameTree before editing: check status, inbox, policy state, and active claims; acknowledge the policy only when \`acknowledgedAt\` is null, claim the task, use narrow path claims when concurrent editing is plausible or uncertain, and release or hand off ownership when finished.
+\`\`\`
+`,
+    );
+
+    const result = setupProject(repository.root, { opencode: true });
+    const instructions = readFileSync(agentsPath, 'utf8');
+
+    expect(result.opencode?.instructions).toBe('added');
+    expect(instructions.match(/<!-- sametree:coordination -->/gu)).toHaveLength(2);
+    expect(instructions).toContain('<!-- /sametree:coordination -->');
+  });
+
   it('writes a syntactically valid OpenCode TUI plugin module', async () => {
     const repository = setup();
     setupProject(repository.root, { opencode: true });
@@ -345,6 +371,17 @@ Use SameTree before editing: check status, inbox, policy state, and active claim
       plugin: 'updated',
     });
     expect(calls).toContainEqual(['plugin', 'update', '--scope', 'user', 'sametree@sametree']);
+  });
+
+  it('rejects a Claude plugin update that leaves the old version installed', () => {
+    const repository = setup();
+    const plugins = claudePluginCommands({ pluginVersion: '0.1.0', updateVersion: false });
+    const runner: ClaudeCommandRunner = (args) =>
+      plugins(args) ?? { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
+
+    expect(() => setupProject(repository.root, { claude: true, claudeRunner: runner })).toThrow(
+      /expected SameTree Claude Code plugin version/u,
+    );
   });
 
   it('validates an existing Claude server instead of trusting its name', () => {

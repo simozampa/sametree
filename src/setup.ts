@@ -146,6 +146,23 @@ function markdownOutsideFences(content: string): string {
     .join('\n');
 }
 
+function outsideFenceIndex(content: string, search: string): number {
+  let fence: '`' | '~' | null = null;
+  let offset = 0;
+  for (const line of content.match(/.*(?:\n|$)/gu) ?? []) {
+    const marker = /^\s*(`{3,}|~{3,})/u.exec(line)?.[1];
+    if (marker) {
+      const character = marker[0] as '`' | '~';
+      if (fence === null) fence = character;
+      else if (fence === character) fence = null;
+    } else if (fence === null && content.startsWith(search, offset)) {
+      return offset;
+    }
+    offset += line.length;
+  }
+  return -1;
+}
+
 function planInstructions(
   repositoryRoot: string,
   relativePath: string,
@@ -176,14 +193,15 @@ function planManagedInstructions(
   const target = assertSafeWritePath(repositoryRoot, relativePath);
   const originalContent = readTextFile(target);
   const existing = originalContent ?? '';
-  if (existing.includes(content.trim())) {
+  if (outsideFenceIndex(existing, content.trim()) >= 0) {
     return { relativePath, status: 'existing', content: null, originalContent };
   }
-  if (existing.includes(legacyContent.trim())) {
+  const legacyIndex = outsideFenceIndex(existing, legacyContent.trim());
+  if (legacyIndex >= 0) {
     return {
       relativePath,
       status: 'updated',
-      content: existing.replace(legacyContent.trim(), content.trim()),
+      content: `${existing.slice(0, legacyIndex)}${content.trim()}${existing.slice(legacyIndex + legacyContent.trim().length)}`,
       originalContent,
     };
   }
@@ -709,15 +727,16 @@ function configureClaudePlugin(
       runner(['plugin', 'list', '--json'], repositoryRoot),
       'Claude Code plugins after setup',
     );
+    const configuredPlugin = plugins.find(
+      (entry) => entry.id === 'sametree@sametree' && entry.scope === 'user',
+    );
     if (
-      !plugins.some(
-        (entry) =>
-          entry.id === 'sametree@sametree' && entry.scope === 'user' && entry.enabled === true,
-      )
+      configuredPlugin?.enabled !== true ||
+      (plan.updatePlugin && configuredPlugin.version !== VERSION)
     ) {
       throw new SameTreeError(
         'INVALID_INPUT',
-        'The SameTree Claude Code plugin was not enabled after setup.',
+        'The expected SameTree Claude Code plugin version was not enabled after setup.',
       );
     }
   } catch (error) {

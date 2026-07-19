@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { writeSync } from 'node:fs';
+
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -29,7 +31,7 @@ function openCoordinator(): Coordinator {
       recordSessionLifecycleEvents: false,
     });
   } catch (error) {
-    process.stderr.write(`${JSON.stringify(errorResult(error))}\n`);
+    writeSync(process.stderr.fd, `${JSON.stringify(errorResult(error))}\n`);
     process.exit(1);
   }
 }

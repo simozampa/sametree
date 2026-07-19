@@ -108,8 +108,13 @@ export function readGitWorktreeContext(repositoryRoot: string): GitWorktreeConte
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: GIT_STATUS_TIMEOUT_MS,
     }).trim();
-  } catch {
-    branch = null;
+  } catch (error) {
+    if (error instanceof Error && Reflect.get(error, 'status') === 1) branch = null;
+    else {
+      throw new SameTreeError('GIT_STATUS_ERROR', 'Could not inspect symbolic Git HEAD.', {
+        cause: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
   return {
     root: realpathSync(repositoryRoot),

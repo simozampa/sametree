@@ -60,7 +60,7 @@ A forced takeover requires:
 - An explicit `userAuthorized: true` assertion or `--user-authorized` flag.
 - Optional IDs for at most 100 active claims owned by the previous assignee.
 
-The task and selected claims transfer in one immediate transaction. Each selected claim must still belong to the previous assignee and cannot overlap a claim left with that assignee. Any stale revision or invalid claim rolls back the entire operation. Success starts a new execution lease, increments the task revision, and records `task.force_taken_over` with the previous assignee, previous lease expiry, reason, and transferred claim IDs.
+The task and selected claims transfer in one immediate transaction. Each selected claim must still belong to the previous assignee and cannot overlap a claim left with that assignee. Any stale revision or invalid claim rolls back the entire operation. Success increments the task revision and records `task.force_taken_over` with the previous assignee, previous lease expiry, reason, and transferred claim IDs. Ready work with finished dependencies starts a new execution lease; blocked or dependency-blocked work keeps its current state without a lease so the new owner can resolve it explicitly.
 
 Expired work remains assigned and uses the same user-authorized takeover path. The authorization field is an auditable cooperative assertion, not authentication; SameTree remains unsuitable across hostile trust boundaries.
 

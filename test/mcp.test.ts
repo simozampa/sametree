@@ -1,3 +1,6 @@
+import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -12,14 +15,42 @@ import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
 const clients: Client[] = [];
+const temporaryDirectories: string[] = [];
 const mcpPath = path.resolve('dist/mcp.js');
 
 afterEach(async () => {
   for (const client of clients.splice(0)) await client.close();
   for (const repository of repositories.splice(0)) repository.cleanup();
+  for (const directory of temporaryDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 describe('MCP server', () => {
+  it('reports startup failures as complete structured errors', async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'sametree-mcp-error-'));
+    temporaryDirectories.push(directory);
+    const result = await new Promise<{ code: number | null; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, [mcpPath], {
+        cwd: directory,
+        env: { ...getDefaultEnvironment(), SAMETREE_AGENT: 'invalid-root' },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+        stderr += chunk;
+      });
+      child.once('error', reject);
+      child.once('close', (code) => resolve({ code, stderr }));
+    });
+
+    expect(result.code).not.toBe(0);
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      error: { code: 'NOT_GIT_REPOSITORY' },
+      ok: false,
+    });
+  });
+
   it('negotiates tools and returns structured coordination state over stdio', async () => {
     const repository = createTestRepository();
     repositories.push(repository);

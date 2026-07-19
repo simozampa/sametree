@@ -33,6 +33,22 @@ afterEach(() => {
 });
 
 describe('Coordinator', () => {
+  it('supports an explicit in-memory database without requiring WAL', () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const coordinator = Coordinator.open({
+      cwd: repository.root,
+      agent: 'memory-agent',
+      databasePath: ':memory:',
+    });
+    coordinators.push(coordinator);
+
+    expect(coordinator.createTask({ title: 'Memory task' })).toMatchObject({
+      assignee: 'memory-agent',
+      status: 'ready',
+    });
+  });
+
   it('can omit lifecycle events while retaining a durable closed session', () => {
     const repository = createTestRepository();
     repositories.push(repository);

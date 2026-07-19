@@ -275,9 +275,10 @@ export function openDatabase(
   try {
     if (databasePath !== ':memory:') chmodSync(databasePath, 0o600);
 
+    const persistentDatabase = databasePath !== ':memory:';
     database.pragma('busy_timeout = 100');
     database.pragma('foreign_keys = ON');
-    enableWal(database);
+    if (persistentDatabase) enableWal(database);
     database.pragma('busy_timeout = 2500');
     database.pragma('synchronous = FULL');
     database.pragma('trusted_schema = OFF');
@@ -295,7 +296,7 @@ export function openDatabase(
     }
 
     migrate(database, options.now ?? Date.now());
-    if (database.pragma('journal_mode', { simple: true }) !== 'wal') {
+    if (persistentDatabase && database.pragma('journal_mode', { simple: true }) !== 'wal') {
       throw new SameTreeError('DATABASE_ERROR', 'SQLite left WAL mode during initialization.');
     }
     return database;
