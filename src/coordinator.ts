@@ -5,7 +5,7 @@ import path from 'node:path';
 import type { Database as DatabaseType } from 'better-sqlite3';
 
 import { loadConfig, POLICY_FILE, type SameTreeConfig } from './config.js';
-import { immediateTransaction, openDatabase } from './database.js';
+import { databaseWorktreeId, immediateTransaction, openDatabase } from './database.js';
 import { inspectDatabase } from './doctor.js';
 import { SameTreeError } from './errors.js';
 import { type RepositoryContext, readGitWorktreeContext, resolveRepository } from './git.js';
@@ -229,6 +229,7 @@ export class Coordinator {
   readonly config: SameTreeConfig;
   readonly agentName: string;
   readonly sessionId: string;
+  readonly worktreeId: string;
 
   readonly #database: DatabaseType;
   readonly #clock: () => number;
@@ -245,6 +246,7 @@ export class Coordinator {
       ...(options.databasePath ? { databasePath: options.databasePath } : {}),
       now: this.#clock(),
     });
+    this.worktreeId = databaseWorktreeId(this.#database, this.repository);
     this.sessionId = createId('session');
 
     const now = this.#clock();
@@ -263,12 +265,14 @@ export class Coordinator {
         this.#database
           .prepare(
             `INSERT INTO sessions
-              (id, agent_name, process_id, started_at, last_heartbeat_at, expires_at, status)
-             VALUES (?, ?, ?, ?, ?, ?, 'active')`,
+              (id, agent_name, home_worktree_id, process_id, started_at,
+               last_heartbeat_at, expires_at, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
           )
           .run(
             this.sessionId,
             this.agentName,
+            this.worktreeId,
             process.pid,
             now,
             now,
@@ -307,8 +311,8 @@ export class Coordinator {
     this.#database
       .prepare(
         `INSERT INTO events
-          (id, kind, actor, entity_type, entity_id, payload_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          (id, kind, actor, entity_type, entity_id, payload_json, created_at, worktree_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         createId('event'),
@@ -318,6 +322,7 @@ export class Coordinator {
         entityId,
         JSON.stringify(payload),
         this.#clock(),
+        this.worktreeId,
       );
   }
 
@@ -900,8 +905,9 @@ export class Coordinator {
         this.#database
           .prepare(
             `INSERT INTO path_claims
-              (id, path, comparison_path, kind, agent_name, session_id, expires_at, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              (id, path, comparison_path, kind, agent_name, session_id,
+               expires_at, created_at, worktree_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             id,
@@ -912,6 +918,7 @@ export class Coordinator {
             this.sessionId,
             expiresAt,
             now,
+            this.worktreeId,
           );
         results.push({
           id,
@@ -1356,8 +1363,11 @@ export class Coordinator {
     const content = readFileSync(policyPath, 'utf8');
     const hash = createHash('sha256').update(content).digest('hex');
     const ack = this.#database
-      .prepare('SELECT acknowledged_at FROM policy_acks WHERE policy_hash = ? AND agent_name = ?')
-      .get(hash, this.agentName) as Row | undefined;
+      .prepare(
+        `SELECT acknowledged_at FROM policy_acks
+         WHERE policy_hash = ? AND agent_name = ? AND worktree_id = ?`,
+      )
+      .get(hash, this.agentName, this.worktreeId) as Row | undefined;
     return {
       content,
       hash,
@@ -1381,15 +1391,18 @@ export class Coordinator {
       const acknowledgedAt = this.#clock();
       const inserted = this.#database
         .prepare(
-          `INSERT INTO policy_acks (policy_hash, agent_name, acknowledged_at)
-           VALUES (?, ?, ?)
-           ON CONFLICT(policy_hash, agent_name) DO NOTHING`,
+          `INSERT INTO policy_acks (policy_hash, agent_name, worktree_id, acknowledged_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(policy_hash, agent_name, worktree_id) DO NOTHING`,
         )
-        .run(hash, this.agentName, acknowledgedAt).changes;
+        .run(hash, this.agentName, this.worktreeId, acknowledgedAt).changes;
       if (inserted === 1) this.#recordEvent('policy.acknowledged', 'policy', hash);
       const acknowledgement = this.#database
-        .prepare('SELECT acknowledged_at FROM policy_acks WHERE policy_hash = ? AND agent_name = ?')
-        .get(hash, this.agentName) as Row;
+        .prepare(
+          `SELECT acknowledged_at FROM policy_acks
+           WHERE policy_hash = ? AND agent_name = ? AND worktree_id = ?`,
+        )
+        .get(hash, this.agentName, this.worktreeId) as Row;
       return {
         hash,
         acknowledgedAt: numberValue(acknowledgement, 'acknowledged_at'),

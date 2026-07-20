@@ -531,7 +531,7 @@ describe('Coordinator', () => {
 
     const database = new Database(resolveRepository(repository.root).databasePath);
     database.exec(
-      'DROP TABLE message_deliveries; DELETE FROM schema_migrations WHERE version = 3;',
+      'DROP TABLE message_deliveries; DELETE FROM schema_migrations WHERE version >= 3;',
     );
     database.close();
 
@@ -542,7 +542,7 @@ describe('Coordinator', () => {
     });
     expect(
       verification.prepare('SELECT MAX(version) AS version FROM schema_migrations').get(),
-    ).toEqual({ version: 3 });
+    ).toEqual({ version: 4 });
     verification.close();
   });
 
