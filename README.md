@@ -1,6 +1,6 @@
 # SameTree
 
-**Coordinate Claude Code and OpenCode agents in one working tree or across a local workspace.**
+**Coordinate multiple Claude Code and OpenCode agents in the same repository and branch, no worktrees required.**
 
 [![CI](https://github.com/simozampa/sametree/actions/workflows/ci.yml/badge.svg)](https://github.com/simozampa/sametree/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -22,7 +22,7 @@ SameTree gives coding agents shared tasks, path claims, messages, handoffs, and 
 
 ## Install
 
-Requires Node.js 22.12 or newer, Git, and a local filesystem.
+Requires Node.js 22.12 or newer and Git. Coordination state must remain on a local disk, not a network or cloud-synced folder.
 
 ```bash
 npm install --global sametree
@@ -110,6 +110,32 @@ SameTree is for trusted processes on one machine. It does not merge simultaneous
 - [Four-agent review loop](examples/review-loop/): worker and reviewer example
 - [Contributing](CONTRIBUTING.md): development and demo generation
 - [Security](SECURITY.md): vulnerability reporting
+
+## FAQ
+
+### Can multiple Claude Code and OpenCode agents safely work in the same repository?
+
+SameTree reduces collisions when multiple agents share one repository and branch by giving them common tasks, path claims, and messages. Claims remain cooperative, so agents must use the integration rather than bypassing active claims.
+
+### Do parallel coding agents need separate branches or Git worktrees?
+
+No. Agents can coordinate in the same live checkout when their work is intertwined, while optional workspaces connect repositories or linked worktrees when isolation is useful.
+
+### How do coding agents share context across sessions?
+
+SameTree stores tasks, messages, handoffs, claims, and policy acknowledgements in local SQLite. Its Claude Code and OpenCode adapters deliver addressed messages to active sessions.
+
+### Is SameTree a Conductor alternative?
+
+[Conductor](https://conductor.build/) gives each task an isolated workspace, branch, files, and merge path. SameTree instead coordinates cooperative agents in existing local checkouts and surfaces integration risks between linked worktrees.
+
+### How is SameTree different from agent-talk?
+
+[agent-talk](https://github.com/xhluca/agent-talk) provides encrypted agent messaging across people and machines through a relay. SameTree stays on one machine and adds shared tasks, path claims, handoffs, policy, and Git checks.
+
+### Does SameTree work across multiple machines?
+
+No. SameTree coordinates repositories and worktrees accessible on one machine; use a networked coordination or messaging tool across machines.
 
 ## License
 
