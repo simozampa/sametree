@@ -26,20 +26,20 @@ Generated MCP configuration intentionally does not embed this machine-specific p
 Create the workspace from one member:
 
 ```bash
-cd /path/to/studio
-sametree workspace create "Product" --member studio --import-current
+cd /path/to/frontend
+sametree workspace create "Product" --member frontend --import-current
 ```
 
 Use the returned ID for every additional member:
 
 ```bash
-sametree --cwd /path/to/holo-server \
-  workspace add Product --member holo-server --fresh
+sametree --cwd /path/to/backend \
+  workspace add Product --member backend --fresh
 
-sametree --cwd /path/to/studio workspace status
-sametree --cwd /path/to/studio workspace members
-sametree --cwd /path/to/studio workspace doctor
-sametree --cwd /path/to/studio doctor
+sametree --cwd /path/to/frontend workspace status
+sametree --cwd /path/to/frontend workspace members
+sametree --cwd /path/to/frontend workspace doctor
+sametree --cwd /path/to/frontend doctor
 ```
 
 Exactly one state mode is mandatory:

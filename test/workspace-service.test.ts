@@ -94,15 +94,15 @@ describe('workspace operations', () => {
 
     const joined = createWorkspace(
       source.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry, now: 1_000 },
     );
     expect(joined).toMatchObject({ mode: 'fresh', imported: false });
     expect(joined.sourceDatabasePath).toBe(resolveRepository(source.root).databasePath);
     expect(workspaceStatus(source.root, { registryRoot: registry })).toMatchObject({
       bound: true,
-      member: { name: 'studio', available: true },
-      members: [{ name: 'studio' }],
+      member: { name: 'frontend', available: true },
+      members: [{ name: 'frontend' }],
     });
 
     const workspaceCoordinator = open(source.root, 'workspace-agent', registry);
@@ -133,7 +133,7 @@ describe('workspace operations', () => {
 
     const joined = createWorkspace(
       source.root,
-      { name: 'Product', memberName: 'studio', mode: 'import-current' },
+      { name: 'Product', memberName: 'frontend', mode: 'import-current' },
       { registryRoot: registry, now: 1_000 },
     );
     expect(joined.imported).toBe(true);
@@ -143,7 +143,7 @@ describe('workspace operations', () => {
       expect.objectContaining({ id: task.id, members: [] }),
     );
     expect(workspaceCoordinator.listTasks()).toContainEqual(
-      expect.objectContaining({ id: taggedTask.id, members: ['studio'] }),
+      expect.objectContaining({ id: taggedTask.id, members: ['frontend'] }),
     );
     const workspaceDatabase = new Database(joined.workspace.databasePath, { readonly: true });
     expect(
@@ -161,7 +161,7 @@ describe('workspace operations', () => {
         source.root,
         {
           workspaceId: joined.workspace.id,
-          memberName: 'studio',
+          memberName: 'frontend',
           mode: 'import-current',
         },
         { registryRoot: registry, now: 2_000 },
@@ -170,18 +170,18 @@ describe('workspace operations', () => {
   });
 
   it('recovers a member inserted before its source transition was recorded', () => {
-    const studio = repository();
+    const frontend = repository();
     const server = repository();
     const registry = registryRoot();
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
     const serverContext = resolveRepository(server.root);
     writePendingWorkspaceJoin(serverContext, {
       workspaceId: workspace.workspace.id,
-      memberName: 'holo-server',
+      memberName: 'backend',
       mode: 'fresh',
     });
     const target = openDatabase(serverContext, {
@@ -191,16 +191,16 @@ describe('workspace operations', () => {
         workspaceName: workspace.workspace.name,
         workspaceImplicit: false,
         repositoryId: 'repository_interrupted',
-        repositoryName: 'holo-server',
+        repositoryName: 'backend',
         worktreeId: 'worktree_interrupted',
-        worktreeName: 'holo-server',
+        worktreeName: 'backend',
       },
     });
     target.close();
     expect(() =>
       relinkWorkspace(
         server.root,
-        { workspaceId: workspace.workspace.id, memberName: 'holo-server' },
+        { workspaceId: workspace.workspace.id, memberName: 'backend' },
         { registryRoot: registry },
       ),
     ).toThrow(/was not found/u);
@@ -211,7 +211,7 @@ describe('workspace operations', () => {
     expect(() =>
       addWorkspaceMember(
         server.root,
-        { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+        { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
         { registryRoot: registry },
       ),
     ).toThrow(/symlinked database path/u);
@@ -224,7 +224,7 @@ describe('workspace operations', () => {
       expect(() =>
         addWorkspaceMember(
           server.root,
-          { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+          { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
           { registryRoot: registry },
         ),
       ).toThrow(/locked/u);
@@ -239,7 +239,7 @@ describe('workspace operations', () => {
         server.root,
         {
           workspaceId: workspace.workspace.id,
-          memberName: 'holo-server',
+          memberName: 'backend',
           mode: 'import-current',
         },
         { registryRoot: registry },
@@ -249,17 +249,17 @@ describe('workspace operations', () => {
     expect(
       addWorkspaceMember(
         server.root,
-        { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+        { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
         { registryRoot: registry },
       ),
     ).toMatchObject({
-      member: { id: 'worktree_interrupted', name: 'holo-server' },
+      member: { id: 'worktree_interrupted', name: 'backend' },
       imported: false,
     });
     expect(readPendingWorkspaceJoin(serverContext)).toBeNull();
     writePendingWorkspaceJoin(serverContext, {
       workspaceId: workspace.workspace.id,
-      memberName: 'holo-server',
+      memberName: 'backend',
       mode: 'fresh',
     });
     open(server.root, 'recovered-agent', registry);
@@ -328,44 +328,44 @@ describe('workspace operations', () => {
   });
 
   it('shares tasks and messages across sibling repository members', () => {
-    const studio = repository();
+    const frontend = repository();
     const server = repository();
     const registry = registryRoot();
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
     addWorkspaceMember(
       server.root,
-      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
       { registryRoot: registry },
     );
 
-    const studioAgent = open(studio.root, 'studio-agent', registry);
+    const frontendAgent = open(frontend.root, 'frontend-agent', registry);
     const serverAgent = open(server.root, 'server-agent', registry);
-    const task = studioAgent.createTask({
+    const task = frontendAgent.createTask({
       title: 'Cross-repository task',
-      members: ['studio', 'holo-server'],
+      members: ['frontend', 'backend'],
     });
-    const globalTask = studioAgent.createTask({ title: 'Workspace-global task' });
-    studioAgent.updateTask(globalTask.id, { members: ['holo-server'] });
-    studioAgent.sendMessage({
+    const globalTask = frontendAgent.createTask({ title: 'Workspace-global task' });
+    frontendAgent.updateTask(globalTask.id, { members: ['backend'] });
+    frontendAgent.sendMessage({
       to: 'server-agent',
       subject: 'Workspace message',
       body: 'Visible across members.',
     });
 
     expect(serverAgent.listTasks().map((item) => item.id)).toContain(task.id);
-    expect(serverAgent.listTasks({ member: 'studio' })).toEqual([
-      expect.objectContaining({ id: task.id, members: ['holo-server', 'studio'] }),
+    expect(serverAgent.listTasks({ member: 'frontend' })).toEqual([
+      expect.objectContaining({ id: task.id, members: ['backend', 'frontend'] }),
     ]);
-    expect(serverAgent.listTasks({ member: 'holo-server' }).map((item) => item.id)).toEqual(
+    expect(serverAgent.listTasks({ member: 'backend' }).map((item) => item.id)).toEqual(
       expect.arrayContaining([task.id, globalTask.id]),
     );
     expect(serverAgent.inbox().map((message) => message.subject)).toContain('Workspace message');
-    studioAgent.claimTask(task.id);
-    const handoff = studioAgent.offerHandoff({
+    frontendAgent.claimTask(task.id);
+    const handoff = frontendAgent.offerHandoff({
       taskId: task.id,
       to: 'server-agent',
       summary: 'Continue this workspace-global task.',
@@ -375,45 +375,45 @@ describe('workspace operations', () => {
     expect(status.workspace).toMatchObject({
       id: workspace.workspace.id,
       name: 'Product',
-      currentMember: 'holo-server',
+      currentMember: 'backend',
       implicit: false,
     });
-    expect(status.session.homeMember).toBe('holo-server');
-    expect(status.agent.activeMembers).toEqual(['holo-server']);
+    expect(status.session.homeMember).toBe('backend');
+    expect(status.agent.activeMembers).toEqual(['backend']);
     expect(status.agents).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ name: 'studio-agent', activeMembers: ['studio'] }),
-        expect.objectContaining({ name: 'server-agent', activeMembers: ['holo-server'] }),
+        expect.objectContaining({ name: 'frontend-agent', activeMembers: ['frontend'] }),
+        expect.objectContaining({ name: 'server-agent', activeMembers: ['backend'] }),
       ]),
     );
     expect(
       serverAgent
         .events({ limit: 100 })
         .find((event) => event.kind === 'task.created' && event.entityId === task.id),
-    ).toMatchObject({ member: 'studio', worktreeId: workspace.member.id });
+    ).toMatchObject({ member: 'frontend', worktreeId: workspace.member.id });
     expect(
-      workspaceMembers(studio.root, { registryRoot: registry }).map((item) => item.name),
-    ).toEqual(['holo-server', 'studio']);
+      workspaceMembers(frontend.root, { registryRoot: registry }).map((item) => item.name),
+    ).toEqual(['backend', 'frontend']);
   });
 
   it('qualifies claims by member and renews cross-member batches', () => {
-    const studio = repository();
+    const frontend = repository();
     const server = repository();
     const registry = registryRoot();
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
     const serverMember = addWorkspaceMember(
       server.root,
-      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
       { registryRoot: registry },
     );
     let now = 1_000;
-    const studioAgent = Coordinator.open({
-      cwd: studio.root,
-      agent: 'studio-agent',
+    const frontendAgent = Coordinator.open({
+      cwd: frontend.root,
+      agent: 'frontend-agent',
       clock: () => now,
       workspaceRegistryRoot: registry,
     });
@@ -423,7 +423,7 @@ describe('workspace operations', () => {
       clock: () => now,
       workspaceRegistryRoot: registry,
     });
-    coordinators.push(studioAgent, serverAgent);
+    coordinators.push(frontendAgent, serverAgent);
     execFileSync('git', ['config', 'core.ignorecase', 'true'], { cwd: server.root });
 
     const metadata = new Database(workspace.workspace.databasePath);
@@ -432,42 +432,42 @@ describe('workspace operations', () => {
       .run(serverMember.member.repositoryId);
     metadata.close();
 
-    const studioPath = studioAgent.acquireClaims([{ member: 'studio', path: 'src/shared.ts' }])[0];
-    const serverPath = serverAgent.acquireClaims([
-      { member: 'holo-server', path: 'src/shared.ts' },
+    const frontendPath = frontendAgent.acquireClaims([
+      { member: 'frontend', path: 'src/shared.ts' },
     ])[0];
-    expect(studioPath?.worktreeId).not.toBe(serverPath?.worktreeId);
-    serverAgent.acquireClaims([{ member: 'holo-server', path: 'src/Case.ts' }]);
-    expect(() =>
-      studioAgent.acquireClaims([{ member: 'holo-server', path: 'src/case.ts' }]),
-    ).toThrow(/overlaps/u);
+    const serverPath = serverAgent.acquireClaims([{ member: 'backend', path: 'src/shared.ts' }])[0];
+    expect(frontendPath?.worktreeId).not.toBe(serverPath?.worktreeId);
+    serverAgent.acquireClaims([{ member: 'backend', path: 'src/Case.ts' }]);
+    expect(() => frontendAgent.acquireClaims([{ member: 'backend', path: 'src/case.ts' }])).toThrow(
+      /overlaps/u,
+    );
 
-    const crossMember = studioAgent.acquireClaims(
+    const crossMember = frontendAgent.acquireClaims(
       [
-        { member: 'studio', path: 'src/studio.ts' },
-        { member: 'holo-server', path: 'src/server.ts' },
+        { member: 'frontend', path: 'src/frontend.ts' },
+        { member: 'backend', path: 'src/server.ts' },
       ],
       30,
     );
-    expect(crossMember.map((claim) => claim.member)).toEqual(['studio', 'holo-server']);
+    expect(crossMember.map((claim) => claim.member)).toEqual(['frontend', 'backend']);
     expect(() =>
       serverAgent.acquireClaims([
-        { member: 'holo-server', path: 'src/server.ts' },
-        { member: 'studio', path: 'src/atomic-free.ts' },
+        { member: 'backend', path: 'src/server.ts' },
+        { member: 'frontend', path: 'src/atomic-free.ts' },
       ]),
-    ).toThrow(/holo-server:src\/server.ts overlaps/u);
+    ).toThrow(/backend:src\/server.ts overlaps/u);
     expect(
-      studioAgent
+      frontendAgent
         .listClaims()
         .some((claim) => claim.path === 'src/atomic-free.ts' && claim.agentName === 'server-agent'),
     ).toBe(false);
 
     now = 2_000;
-    studioAgent.heartbeat();
+    frontendAgent.heartbeat();
     expect(
-      studioAgent
+      frontendAgent
         .listClaims()
-        .filter((claim) => claim.agentName === 'studio-agent')
+        .filter((claim) => claim.agentName === 'frontend-agent')
         .map((claim) => claim.expiresAt),
     ).toEqual([902_000, 902_000, 902_000]);
   });
@@ -550,61 +550,57 @@ describe('workspace operations', () => {
   });
 
   it('scopes policy reads, acknowledgements, and events to a target member', () => {
-    const studio = repository();
+    const frontend = repository();
     const server = repository();
     const registry = registryRoot();
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
     const serverMember = addWorkspaceMember(
       server.root,
-      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
       { registryRoot: registry },
     );
-    writeFileSync(
-      path.join(server.root, '.sametree', 'policy.md'),
-      '# Holo server policy\n',
-      'utf8',
-    );
-    const agent = open(studio.root, 'policy-agent', registry);
+    writeFileSync(path.join(server.root, '.sametree', 'policy.md'), '# Backend policy\n', 'utf8');
+    const agent = open(frontend.root, 'policy-agent', registry);
 
     const local = agent.getPolicy();
-    const remote = agent.getPolicy('holo-server');
+    const remote = agent.getPolicy('backend');
     expect(remote).toMatchObject({
-      member: 'holo-server',
+      member: 'backend',
       worktreeId: serverMember.member.id,
       path: path.join(server.root, '.sametree', 'policy.md'),
       acknowledgedAt: null,
     });
     expect(remote.hash).not.toBe(local.hash);
-    expect(agent.acknowledgePolicy(remote.hash, 'holo-server')).toMatchObject({
-      member: 'holo-server',
+    expect(agent.acknowledgePolicy(remote.hash, 'backend')).toMatchObject({
+      member: 'backend',
       worktreeId: serverMember.member.id,
       newlyAcknowledged: true,
     });
-    expect(agent.getPolicy('holo-server').acknowledgedAt).not.toBeNull();
+    expect(agent.getPolicy('backend').acknowledgedAt).not.toBeNull();
     expect(agent.getPolicy().acknowledgedAt).toBeNull();
     expect(
       agent.events({ limit: 100 }).find((event) => event.kind === 'policy.acknowledged'),
     ).toMatchObject({
-      member: 'holo-server',
+      member: 'backend',
       worktreeId: serverMember.member.id,
     });
   });
 
   it('refuses active imports and identity collisions without binding the source', () => {
-    const studio = repository();
+    const frontend = repository();
     const server = repository();
     const active = repository();
     const registry = registryRoot();
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
-    const existing = open(studio.root, 'same-agent', registry);
+    const existing = open(frontend.root, 'same-agent', registry);
     existing.close();
 
     const source = open(server.root, 'same-agent');
@@ -620,7 +616,7 @@ describe('workspace operations', () => {
     expect(
       resolveWorkspaceBinding(resolveRepository(server.root), { registryRoot: registry }),
     ).toBeNull();
-    expect(workspaceMembers(studio.root, { registryRoot: registry })).toHaveLength(1);
+    expect(workspaceMembers(frontend.root, { registryRoot: registry })).toHaveLength(1);
 
     const activeAgent = open(active.root, 'active-agent');
     expect(() =>
@@ -637,12 +633,12 @@ describe('workspace operations', () => {
   });
 
   it('preflights member ID collisions without mutating the existing member', () => {
-    const studio = repository();
+    const frontend = repository();
     const server = repository();
     const registry = registryRoot();
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
 
@@ -663,8 +659,8 @@ describe('workspace operations', () => {
         { registryRoot: registry },
       ),
     ).toThrow(/Repository identity .* already exists/u);
-    expect(workspaceMembers(studio.root, { registryRoot: registry })).toEqual([
-      expect.objectContaining({ id: workspace.member.id, name: 'studio' }),
+    expect(workspaceMembers(frontend.root, { registryRoot: registry })).toEqual([
+      expect.objectContaining({ id: workspace.member.id, name: 'frontend' }),
     ]);
     expect(resolveWorkspaceBinding(serverContext, { registryRoot: registry })).toBeNull();
     const unlocked = new Database(serverContext.databasePath);
@@ -698,7 +694,7 @@ describe('workspace operations', () => {
     const joinedRepository = repository();
     const joined = createWorkspace(
       joinedRepository.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
     expect(() =>
@@ -732,7 +728,7 @@ describe('workspace operations', () => {
     const create = () =>
       createWorkspace(
         source.root,
-        { name: 'Product', memberName: 'studio', mode: 'fresh' },
+        { name: 'Product', memberName: 'frontend', mode: 'fresh' },
         { registryRoot: registry },
       );
 
@@ -743,7 +739,10 @@ describe('workspace operations', () => {
     expect(listRegisteredWorkspaces({ registryRoot: registry })).toHaveLength(1);
 
     active.close();
-    expect(create()).toMatchObject({ workspace: { id: pending?.id }, member: { name: 'studio' } });
+    expect(create()).toMatchObject({
+      workspace: { id: pending?.id },
+      member: { name: 'frontend' },
+    });
     expect(listRegisteredWorkspaces({ registryRoot: registry })).toHaveLength(1);
   });
 
@@ -755,7 +754,7 @@ describe('workspace operations', () => {
     expect(() =>
       createWorkspace(
         source.root,
-        { name: 'Product', memberName: 'studio', mode: 'fresh' },
+        { name: 'Product', memberName: 'frontend', mode: 'fresh' },
         { registryRoot: registry },
       ),
     ).toThrow(/Stop active standalone sessions/u);
@@ -783,18 +782,18 @@ describe('workspace operations', () => {
   });
 
   it('does not replace an interrupted add with a new workspace creation', () => {
-    const studio = repository();
+    const frontend = repository();
     const server = repository();
     const registry = registryRoot();
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
     const serverContext = resolveRepository(server.root);
     writePendingWorkspaceJoin(serverContext, {
       workspaceId: workspace.workspace.id,
-      memberName: 'holo-server',
+      memberName: 'backend',
       mode: 'fresh',
     });
     const target = openDatabase(serverContext, {
@@ -804,9 +803,9 @@ describe('workspace operations', () => {
         workspaceName: workspace.workspace.name,
         workspaceImplicit: false,
         repositoryId: 'repository_interrupted_add',
-        repositoryName: 'holo-server',
+        repositoryName: 'backend',
         worktreeId: 'worktree_interrupted_add',
-        worktreeName: 'holo-server',
+        worktreeName: 'backend',
       },
     });
     target.close();
@@ -825,36 +824,36 @@ describe('workspace operations', () => {
     expect(
       addWorkspaceMember(
         server.root,
-        { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+        { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
         { registryRoot: registry },
       ),
     ).toMatchObject({ member: { id: 'worktree_interrupted_add' } });
   });
 
   it('clears a join intent after a recoverable preflight collision', () => {
-    const studio = repository();
+    const frontend = repository();
     const server = repository();
     const registry = registryRoot();
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
 
     expect(() =>
       addWorkspaceMember(
         server.root,
-        { workspaceId: workspace.workspace.id, memberName: 'studio', mode: 'fresh' },
+        { workspaceId: workspace.workspace.id, memberName: 'frontend', mode: 'fresh' },
         { registryRoot: registry },
       ),
     ).toThrow(/Worktree name/u);
     expect(
       addWorkspaceMember(
         server.root,
-        { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+        { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
         { registryRoot: registry },
       ),
-    ).toMatchObject({ member: { name: 'holo-server' } });
+    ).toMatchObject({ member: { name: 'backend' } });
   });
 
   it('cancels a pending creation whose registration was never persisted', () => {
@@ -864,7 +863,7 @@ describe('workspace operations', () => {
     expect(() =>
       createWorkspace(
         source.root,
-        { name: 'Product', memberName: 'studio', mode: 'fresh' },
+        { name: 'Product', memberName: 'frontend', mode: 'fresh' },
         { registryRoot: registry },
       ),
     ).toThrow(/Stop active standalone sessions/u);
@@ -883,43 +882,41 @@ describe('workspace operations', () => {
   });
 
   it('prunes missing members while preserving their task and claim history', () => {
-    const studio = repository();
+    const frontend = repository();
     const server = repository();
     const registry = registryRoot();
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
     addWorkspaceMember(
       server.root,
-      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
       { registryRoot: registry },
     );
     const serverAgent = open(server.root, 'server-agent', registry);
     const task = serverAgent.claimTask(
       serverAgent.createTask({
         title: 'Preserve after prune',
-        members: ['holo-server'],
+        members: ['backend'],
       }).id,
     );
-    const claim = serverAgent.acquireClaims([
-      { member: 'holo-server', path: 'src/preserved.ts' },
-    ])[0];
+    const claim = serverAgent.acquireClaims([{ member: 'backend', path: 'src/preserved.ts' }])[0];
     serverAgent.close();
     server.cleanup();
 
-    expect(pruneWorkspace(studio.root, { registryRoot: registry }).pruned).toEqual([
-      expect.objectContaining({ name: 'holo-server', available: false }),
+    expect(pruneWorkspace(frontend.root, { registryRoot: registry }).pruned).toEqual([
+      expect.objectContaining({ name: 'backend', available: false }),
     ]);
-    const observer = open(studio.root, 'observer', registry);
-    expect(observer.listTasks({ member: 'holo-server' })).toContainEqual(
+    const observer = open(frontend.root, 'observer', registry);
+    expect(observer.listTasks({ member: 'backend' })).toContainEqual(
       expect.objectContaining({ id: task.id }),
     );
     expect(observer.listClaims({ includeExpired: true })).toContainEqual(
-      expect.objectContaining({ id: claim?.id, member: 'holo-server' }),
+      expect.objectContaining({ id: claim?.id, member: 'backend' }),
     );
-    expect(() => observer.acquireClaims([{ member: 'holo-server', path: 'src/new.ts' }])).toThrow(
+    expect(() => observer.acquireClaims([{ member: 'backend', path: 'src/new.ts' }])).toThrow(
       /is unavailable/u,
     );
     expect(() =>
@@ -930,39 +927,39 @@ describe('workspace operations', () => {
         userAuthorized: true,
       }),
     ).toThrow(/no longer transferable/u);
-    expect(diagnoseWorkspace(studio.root, { registryRoot: registry })).toMatchObject({
+    expect(diagnoseWorkspace(frontend.root, { registryRoot: registry })).toMatchObject({
       ok: false,
       foreignKeyViolations: 0,
-      warnings: [expect.stringContaining('holo-server is unavailable')],
+      warnings: [expect.stringContaining('backend is unavailable')],
     });
   });
 
   it('leaves without deleting workspace history', () => {
-    const studio = repository();
+    const frontend = repository();
     const server = repository();
     const registry = registryRoot();
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot: registry },
     );
     addWorkspaceMember(
       server.root,
-      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
       { registryRoot: registry },
     );
-    const studioAgent = open(studio.root, 'studio-agent', registry);
+    const frontendAgent = open(frontend.root, 'frontend-agent', registry);
     const serverAgent = open(server.root, 'server-agent', registry);
-    const task = serverAgent.createTask({ title: 'Leave history', members: ['holo-server'] });
-    const handoffTask = studioAgent.claimTask(
-      studioAgent.createTask({ title: 'Reject retired recipient' }).id,
+    const task = serverAgent.createTask({ title: 'Leave history', members: ['backend'] });
+    const handoffTask = frontendAgent.claimTask(
+      frontendAgent.createTask({ title: 'Reject retired recipient' }).id,
     );
-    const handoff = studioAgent.offerHandoff({
+    const handoff = frontendAgent.offerHandoff({
       taskId: handoffTask.id,
       to: 'server-agent',
       summary: 'Verify that a retired recipient cannot accept this work.',
     });
-    serverAgent.acquireClaims([{ member: 'studio', path: 'src/shared.ts' }]);
+    serverAgent.acquireClaims([{ member: 'frontend', path: 'src/shared.ts' }]);
     expect(() => leaveWorkspace(server.root, { registryRoot: registry })).toThrow(
       /Stop active sessions/u,
     );
@@ -970,12 +967,12 @@ describe('workspace operations', () => {
     expect(
       leaveWorkspace(server.root, { registryRoot: registry, now: Date.now() + 1_000_000 }),
     ).toMatchObject({
-      name: 'holo-server',
+      name: 'backend',
       available: false,
     });
-    expect(() => serverAgent.acquireClaims([{ member: 'studio', path: 'src/shared.ts' }])).toThrow(
-      /session expired/u,
-    );
+    expect(() =>
+      serverAgent.acquireClaims([{ member: 'frontend', path: 'src/shared.ts' }]),
+    ).toThrow(/session expired/u);
     expect(() => serverAgent.updateTask(task.id, { status: 'in_progress' })).toThrow(
       /session expired/u,
     );
@@ -995,8 +992,8 @@ describe('workspace operations', () => {
     expect(
       resolveWorkspaceBinding(resolveRepository(server.root), { registryRoot: registry }),
     ).toBeNull();
-    const observer = open(studio.root, 'observer', registry);
-    expect(observer.listTasks({ member: 'holo-server' })).toContainEqual(
+    const observer = open(frontend.root, 'observer', registry);
+    expect(observer.listTasks({ member: 'backend' })).toContainEqual(
       expect.objectContaining({ id: task.id }),
     );
   });

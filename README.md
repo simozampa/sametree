@@ -68,11 +68,11 @@ When upgrading, stop every active agent first, back up coordination databases, i
 Standalone mode needs no extra setup. To share coordination across repositories or linked worktrees, create an explicit workspace from its first member and add each other member using its unique workspace name or returned ID. Create and add initialize missing `.sametree/` project files automatically; run `sametree setup` separately in every member that needs Claude Code or OpenCode integration.
 
 ```bash
-cd /path/to/studio
-sametree workspace create "Product" --member studio --import-current
+cd /path/to/frontend
+sametree workspace create "Product" --member frontend --import-current
 
-cd /path/to/holo-server
-sametree workspace add Product --member holo-server --fresh
+cd /path/to/backend
+sametree workspace add Product --member backend --fresh
 
 sametree workspace status
 sametree workspace doctor
@@ -101,10 +101,10 @@ export SAMETREE_HARNESS=opencode
 
 sametree status
 sametree task create --title "Add request validation" --priority high
-sametree task create --title "Update UI and API" --member studio --member holo-server
+sametree task create --title "Update UI and API" --member frontend --member backend
 sametree task claim task_...
 sametree claim acquire src/http/request.ts test/http/request.test.ts
-sametree claim acquire --at studio:src/ui.ts --at holo-server:src/api.ts
+sametree claim acquire --at frontend:src/ui.ts --at backend:src/api.ts
 sametree task update task_... --status done
 sametree claim release --all
 sametree message follow --json

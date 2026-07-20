@@ -89,20 +89,20 @@ describe('MCP server', () => {
   });
 
   it('resolves a shared workspace and home member with a custom registry', async () => {
-    const studio = createTestRepository();
+    const frontend = createTestRepository();
     const server = createTestRepository();
-    repositories.push(studio, server);
+    repositories.push(frontend, server);
     const registryParent = mkdtempSync(path.join(tmpdir(), 'sametree-mcp-workspace-'));
     temporaryDirectories.push(registryParent);
     const registryRoot = path.join(registryParent, 'workspaces');
     const workspace = createWorkspace(
-      studio.root,
-      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'fresh' },
       { registryRoot },
     );
     addWorkspaceMember(
       server.root,
-      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { workspaceId: workspace.workspace.id, memberName: 'backend', mode: 'fresh' },
       { registryRoot },
     );
     const serverAgent = Coordinator.open({
@@ -111,18 +111,18 @@ describe('MCP server', () => {
       workspaceRegistryRoot: registryRoot,
     });
     const task = serverAgent.createTask({
-      title: 'Visible through studio MCP',
-      members: ['holo-server'],
+      title: 'Visible through frontend MCP',
+      members: ['backend'],
     });
     serverAgent.close();
 
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [mcpPath],
-      cwd: studio.root,
+      cwd: frontend.root,
       env: {
         ...getDefaultEnvironment(),
-        SAMETREE_AGENT: 'mcp-studio',
+        SAMETREE_AGENT: 'mcp-frontend',
         SAMETREE_HARNESS: 'opencode',
         SAMETREE_WORKSPACE_REGISTRY: registryRoot,
       },
@@ -135,24 +135,24 @@ describe('MCP server', () => {
     const status = await client.callTool({ name: 'sametree_status', arguments: {} });
     const tasks = await client.callTool({
       name: 'sametree_task_list',
-      arguments: { member: 'holo-server' },
+      arguments: { member: 'backend' },
     });
     const policy = await client.callTool({
       name: 'sametree_policy_get',
-      arguments: { member: 'holo-server' },
+      arguments: { member: 'backend' },
     });
 
     expect(status.structuredContent).toMatchObject({
       result: {
-        workspace: { id: workspace.workspace.id, currentMember: 'studio' },
-        session: { homeMember: 'studio' },
+        workspace: { id: workspace.workspace.id, currentMember: 'frontend' },
+        session: { homeMember: 'frontend' },
       },
     });
     expect(tasks.structuredContent).toMatchObject({
-      result: [expect.objectContaining({ id: task.id, members: ['holo-server'] })],
+      result: [expect.objectContaining({ id: task.id, members: ['backend'] })],
     });
     expect(policy.structuredContent).toMatchObject({
-      result: { member: 'holo-server', path: path.join(server.root, '.sametree', 'policy.md') },
+      result: { member: 'backend', path: path.join(server.root, '.sametree', 'policy.md') },
     });
   });
 

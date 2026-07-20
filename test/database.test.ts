@@ -248,9 +248,9 @@ describe('database workspace migration', () => {
         workspaceName: 'Test workspace',
         workspaceImplicit: false,
         repositoryId: 'repository_test',
-        repositoryName: 'Studio',
+        repositoryName: 'Frontend',
         worktreeId: 'worktree_test',
-        worktreeName: 'studio',
+        worktreeName: 'frontend',
       },
     });
 
@@ -261,11 +261,11 @@ describe('database workspace migration', () => {
     });
     expect(database.prepare('SELECT id, name FROM repositories').get()).toEqual({
       id: 'repository_test',
-      name: 'Studio',
+      name: 'Frontend',
     });
     expect(database.prepare('SELECT id, name FROM worktrees').get()).toEqual({
       id: 'worktree_test',
-      name: 'studio',
+      name: 'frontend',
     });
     database.close();
   });
@@ -282,9 +282,9 @@ describe('database workspace migration', () => {
       workspaceName: 'Test workspace',
       workspaceImplicit: false,
       repositoryId: 'repository_test',
-      repositoryName: 'Studio',
+      repositoryName: 'Frontend',
       worktreeId: 'worktree_test',
-      worktreeName: 'studio',
+      worktreeName: 'frontend',
     } as const;
     openDatabase(firstContext, { databasePath, member }).close();
 

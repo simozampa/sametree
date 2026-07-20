@@ -116,8 +116,8 @@ Agents may hold overlapping claims with themselves. Any overlap with another age
 CLI positional paths target the current member unless `--member` selects another. `--at <member>:<path>` may repeat to create a cross-member batch:
 
 ```bash
-sametree claim acquire src/local.ts --member studio \
-  --at holo-server:src/remote.ts
+sametree claim acquire src/local.ts --member frontend \
+  --at backend:src/remote.ts
 ```
 
 The MCP equivalent adds an optional `member` to each requested path. Compact CLI/MCP acquisition receipts return claim ID, member, path, kind, expiry, and warnings; full claim listings and library results also expose worktree identity. Matching paths in linked worktree members of one repository are allowed but return `LINKED_WORKTREE_OVERLAP`, including overlaps held by the same agent, because later branch integration may conflict. Matching paths in unrelated repositories do not warn. Git hooks enforce only claims targeting the current physical member.

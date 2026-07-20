@@ -109,7 +109,7 @@ describe('CLI', () => {
       'create',
       'Product',
       '--member',
-      'studio',
+      'frontend',
       '--fresh',
     ]);
     const result = JSON.parse(created.stdout) as {
@@ -135,11 +135,11 @@ describe('CLI', () => {
     ]);
 
     expect(created).toMatchObject({ code: 0, stderr: '' });
-    expect(result.member.name).toBe('studio');
+    expect(result.member.name).toBe('frontend');
     expect(JSON.parse(status.stdout)).toMatchObject({
       bound: true,
       workspace: { id: result.workspace.id, name: 'Product' },
-      member: { name: 'studio' },
+      member: { name: 'frontend' },
     });
     expect(JSON.parse(doctor.stdout)).toMatchObject({ ok: true, warnings: [] });
     expect(JSON.parse(repositoryDoctor.stdout)).toMatchObject({
@@ -149,21 +149,21 @@ describe('CLI', () => {
   });
 
   it('initializes members, resolves workspace names, and explains path-like references', async () => {
-    const studio = createTestRepository({ initialize: false });
+    const frontend = createTestRepository({ initialize: false });
     const server = createTestRepository({ initialize: false });
     const invalid = createTestRepository({ initialize: false });
     const invalidName = createTestRepository({ initialize: false });
-    repositories.push(studio, server, invalid, invalidName);
-    const registry = path.join(studio.root, '.workspace-registry');
+    repositories.push(frontend, server, invalid, invalidName);
+    const registry = path.join(frontend.root, '.workspace-registry');
 
-    const created = await runCli(studio.root, undefined, [
+    const created = await runCli(frontend.root, undefined, [
       '--workspace-registry',
       registry,
       'workspace',
       'create',
       'Product',
       '--member',
-      'studio',
+      'frontend',
       '--fresh',
     ]);
     const added = await runCli(server.root, undefined, [
@@ -173,7 +173,7 @@ describe('CLI', () => {
       'add',
       'Product',
       '--member',
-      'holo-server',
+      'backend',
       '--fresh',
     ]);
     const pathLike = await runCli(invalid.root, undefined, [
@@ -181,7 +181,7 @@ describe('CLI', () => {
       registry,
       'workspace',
       'add',
-      '../holo-server',
+      '../backend',
       '--member',
       'invalid',
       '--fresh',
@@ -201,10 +201,10 @@ describe('CLI', () => {
     expect(added).toMatchObject({ code: 0, stderr: '' });
     expect(JSON.parse(added.stdout)).toMatchObject({
       workspace: { name: 'Product' },
-      member: { name: 'holo-server' },
+      member: { name: 'backend' },
       initialization: { created: expect.arrayContaining(['.sametree/config.json']) },
     });
-    expect(existsSync(path.join(studio.root, '.sametree', 'config.json'))).toBe(true);
+    expect(existsSync(path.join(frontend.root, '.sametree', 'config.json'))).toBe(true);
     expect(existsSync(path.join(server.root, '.sametree', 'config.json'))).toBe(true);
     expect(pathLike.code).toBe(1);
     expect(JSON.parse(pathLike.stderr)).toMatchObject({
@@ -225,7 +225,7 @@ describe('CLI', () => {
       agent: 'server-agent',
       workspaceRegistryRoot: registry,
     });
-    expect(coordinator.acquireClaims([{ member: 'studio', path: 'src/shared.ts' }])).toHaveLength(
+    expect(coordinator.acquireClaims([{ member: 'frontend', path: 'src/shared.ts' }])).toHaveLength(
       1,
     );
     coordinator.close();
@@ -242,7 +242,7 @@ describe('CLI', () => {
       'create',
       'Product',
       '--member',
-      'studio',
+      'frontend',
     ]);
 
     expect(result.code).toBe(1);
