@@ -7,6 +7,8 @@ import { SameTreeError } from './errors.js';
 import type { RepositoryContext } from './git.js';
 
 const MINIMUM_SQLITE_VERSION = '3.51.3';
+const WAL_RETRY_ATTEMPTS = 20;
+const WAL_RETRY_DELAY_MS = 25;
 
 function assertNoSymlinkComponents(target: string): void {
   const absolute = path.resolve(target);
@@ -182,6 +184,35 @@ function compareVersions(left: string, right: string): number {
   return 0;
 }
 
+function isBusy(error: unknown): boolean {
+  const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+  return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED';
+}
+
+function sleep(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function enableWal(database: DatabaseType): void {
+  for (let attempt = 1; attempt <= WAL_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      if (database.pragma('journal_mode', { simple: true }) === 'wal') return;
+      if (database.pragma('journal_mode = WAL', { simple: true }) === 'wal') return;
+    } catch (error) {
+      if (!isBusy(error)) throw error;
+      if (attempt === WAL_RETRY_ATTEMPTS) {
+        throw new SameTreeError(
+          'DATABASE_ERROR',
+          'Could not enable SQLite WAL mode because the database remained locked.',
+          { cause: error instanceof Error ? error.message : String(error) },
+        );
+      }
+    }
+    sleep(WAL_RETRY_DELAY_MS);
+  }
+  throw new SameTreeError('DATABASE_ERROR', 'SQLite did not enter WAL mode.');
+}
+
 function migrate(database: DatabaseType, now: number): void {
   database.exec('BEGIN IMMEDIATE');
   try {
@@ -241,29 +272,38 @@ export function openDatabase(
   assertNoSymlinkComponents(databasePath);
 
   const database = new Database(databasePath, { timeout: 2_500 });
-  if (databasePath !== ':memory:') chmodSync(databasePath, 0o600);
+  try {
+    if (databasePath !== ':memory:') chmodSync(databasePath, 0o600);
 
-  database.pragma('foreign_keys = ON');
-  database.pragma('journal_mode = WAL');
-  database.pragma('synchronous = FULL');
-  database.pragma('busy_timeout = 2500');
-  database.pragma('trusted_schema = OFF');
-  database.pragma('cell_size_check = ON');
-  database.pragma('wal_autocheckpoint = 1000');
+    const persistentDatabase = databasePath !== ':memory:';
+    database.pragma('busy_timeout = 100');
+    database.pragma('foreign_keys = ON');
+    if (persistentDatabase) enableWal(database);
+    database.pragma('busy_timeout = 2500');
+    database.pragma('synchronous = FULL');
+    database.pragma('trusted_schema = OFF');
+    database.pragma('cell_size_check = ON');
+    database.pragma('wal_autocheckpoint = 1000');
 
-  const { version } = database.prepare('SELECT sqlite_version() AS version').get() as {
-    version: string;
-  };
-  if (compareVersions(version, MINIMUM_SQLITE_VERSION) < 0) {
+    const { version } = database.prepare('SELECT sqlite_version() AS version').get() as {
+      version: string;
+    };
+    if (compareVersions(version, MINIMUM_SQLITE_VERSION) < 0) {
+      throw new SameTreeError(
+        'DATABASE_ERROR',
+        `SQLite ${MINIMUM_SQLITE_VERSION} or newer is required; found ${version}.`,
+      );
+    }
+
+    migrate(database, options.now ?? Date.now());
+    if (persistentDatabase && database.pragma('journal_mode', { simple: true }) !== 'wal') {
+      throw new SameTreeError('DATABASE_ERROR', 'SQLite left WAL mode during initialization.');
+    }
+    return database;
+  } catch (error) {
     database.close();
-    throw new SameTreeError(
-      'DATABASE_ERROR',
-      `SQLite ${MINIMUM_SQLITE_VERSION} or newer is required; found ${version}.`,
-    );
+    throw error;
   }
-
-  migrate(database, options.now ?? Date.now());
-  return database;
 }
 
 export function immediateTransaction<T>(database: DatabaseType, operation: () => T): T {

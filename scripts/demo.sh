@@ -26,15 +26,14 @@ prompt 'sametree setup --opencode'
 SAMETREE_AGENT=agent-b SAMETREE_HARNESS=opencode \
   "${CLI[@]}" status >/dev/null
 
-prompt 'agent-a claims a task and its file'
+prompt 'agent-a records its task and claims its file'
 task_json="$(SAMETREE_AGENT=agent-a SAMETREE_HARNESS=opencode \
   "${CLI[@]}" task create --title 'Add request validation' --priority high)"
 task_id="$(jq -r '.id' <<<"$task_json")"
 SAMETREE_AGENT=agent-a "${CLI[@]}" task claim "$task_id" >/dev/null
 claim_json="$(SAMETREE_AGENT=agent-a "${CLI[@]}" claim acquire src/api.ts --ttl 3600)"
 printf 'task:  %s (in progress)\n' "$(jq -r '.title' <<<"$task_json")"
-printf 'file:  %s claimed by %s\n' \
-  "$(jq -r '.[0].path' <<<"$claim_json")" "$(jq -r '.[0].agentName' <<<"$claim_json")"
+printf 'file:  %s claimed by agent-a\n' "$(jq -r '.[0].path' <<<"$claim_json")"
 
 prompt 'agent-b tries to claim the same file'
 if conflict="$(SAMETREE_AGENT=agent-b "${CLI[@]}" claim acquire src/api.ts 2>&1)"; then

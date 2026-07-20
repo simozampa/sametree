@@ -3,6 +3,7 @@ import { realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import { SameTreeError } from './errors.js';
+import type { GitWorktreeContext } from './types.js';
 
 export interface RepositoryContext {
   root: string;
@@ -10,6 +11,9 @@ export interface RepositoryContext {
   hooksPath: string;
   ignoreCase: boolean;
 }
+
+const GIT_STATUS_TIMEOUT_MS = 15_000;
+const GIT_STATUS_MAX_BUFFER = 16 * 1024 * 1024;
 
 function git(cwd: string, args: string[]): string {
   try {
@@ -61,6 +65,64 @@ export function gitConfig(cwd: string, key: string, type?: 'bool' | 'path'): str
   } catch {
     return null;
   }
+}
+
+export function readGitWorktreeContext(repositoryRoot: string): GitWorktreeContext {
+  let output: string;
+  try {
+    output = execFileSync(
+      'git',
+      [
+        '--no-optional-locks',
+        'status',
+        '--porcelain=v2',
+        '--branch',
+        '--no-ahead-behind',
+        '--untracked-files=normal',
+        '--ignore-submodules=none',
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: GIT_STATUS_TIMEOUT_MS,
+        maxBuffer: GIT_STATUS_MAX_BUFFER,
+      },
+    ).trim();
+  } catch (error) {
+    throw new SameTreeError('GIT_STATUS_ERROR', 'Could not inspect live Git worktree state.', {
+      cause: error instanceof Error ? error.message : String(error),
+    });
+  }
+  const lines = output.split('\n');
+  const oidPrefix = '# branch.oid ';
+  const oid = lines.find((line) => line.startsWith(oidPrefix))?.slice(oidPrefix.length);
+  if (!oid) {
+    throw new SameTreeError('GIT_STATUS_ERROR', 'Git did not report worktree HEAD state.');
+  }
+  let branch: string | null;
+  try {
+    branch = execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: GIT_STATUS_TIMEOUT_MS,
+    }).trim();
+  } catch (error) {
+    if (error instanceof Error && Reflect.get(error, 'status') === 1) branch = null;
+    else {
+      throw new SameTreeError('GIT_STATUS_ERROR', 'Could not inspect symbolic Git HEAD.', {
+        cause: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return {
+    root: realpathSync(repositoryRoot),
+    branch,
+    commit: oid === '(initial)' ? null : oid,
+    detached: branch === null,
+    dirty: lines.some((line) => line.length > 0 && !line.startsWith('# ')),
+  };
 }
 
 export function stagedFiles(repositoryRoot: string): string[] {

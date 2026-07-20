@@ -4,7 +4,11 @@ export {
   type CoordinatorOptions,
   type CreateTaskInput,
   type ForceTakeoverTaskInput,
+  type ListTasksOptions,
+  type SnapshotOptions,
   type UpdateTaskInput,
+  type UserAuthorizedHandoffInput,
+  type UserAuthorizedTaskInput,
 } from './coordinator.js';
 export { diagnoseRepository } from './doctor.js';
 export { type ErrorCode, errorResult, isSameTreeError, SameTreeError } from './errors.js';
@@ -22,11 +26,13 @@ export type {
   CoordinationEvent,
   CoordinationSnapshot,
   DoctorReport,
+  GitWorktreeContext,
   Handoff,
   HandoffStatus,
   Harness,
   Message,
   PathClaim,
+  PolicyAcknowledgement,
   PolicyDocument,
   Session,
   Task,

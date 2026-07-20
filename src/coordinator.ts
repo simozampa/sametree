@@ -8,7 +8,7 @@ import { loadConfig, POLICY_FILE, type SameTreeConfig } from './config.js';
 import { immediateTransaction, openDatabase } from './database.js';
 import { inspectDatabase } from './doctor.js';
 import { SameTreeError } from './errors.js';
-import { type RepositoryContext, resolveRepository } from './git.js';
+import { type RepositoryContext, readGitWorktreeContext, resolveRepository } from './git.js';
 import { claimsOverlap, normalizeClaim } from './paths.js';
 import type {
   Agent,
@@ -20,6 +20,7 @@ import type {
   Harness,
   Message,
   PathClaim,
+  PolicyAcknowledgement,
   PolicyDocument,
   Session,
   Task,
@@ -60,6 +61,29 @@ export interface ForceTakeoverTaskInput {
   expectedRevision: number;
   reason: string;
   userAuthorized: boolean;
+}
+
+export interface UserAuthorizedTaskInput {
+  expectedRevision?: number;
+  reason?: string;
+  userAuthorized?: boolean;
+}
+
+export interface UserAuthorizedHandoffInput {
+  reason?: string;
+  userAuthorized?: boolean;
+}
+
+export interface ListTasksOptions {
+  after?: string;
+  includeTerminal?: boolean;
+  limit?: number;
+  status?: TaskStatus;
+}
+
+export interface SnapshotOptions {
+  includeInactiveAgents?: boolean;
+  includeTerminalTasks?: boolean;
 }
 
 export interface AcquireClaimInput {
@@ -224,38 +248,44 @@ export class Coordinator {
     this.sessionId = createId('session');
 
     const now = this.#clock();
-    immediateTransaction(this.#database, () => {
-      this.#database
-        .prepare(
-          `INSERT INTO agents (name, harness, role, created_at, last_seen_at)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(name) DO UPDATE SET
-             harness = excluded.harness,
-             role = excluded.role,
-             last_seen_at = excluded.last_seen_at`,
-        )
-        .run(this.agentName, options.harness ?? 'other', options.role ?? 'implementer', now, now);
-      this.#database
-        .prepare(
-          `INSERT INTO sessions
-            (id, agent_name, process_id, started_at, last_heartbeat_at, expires_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, 'active')`,
-        )
-        .run(
-          this.sessionId,
-          this.agentName,
-          process.pid,
-          now,
-          now,
-          now + this.config.sessionTtlSeconds * 1_000,
-        );
-      if (this.#recordSessionLifecycleEvents) {
-        this.#recordEvent('session.started', 'session', this.sessionId, {
-          harness: options.harness ?? 'other',
-          role: options.role ?? 'implementer',
-        });
-      }
-    });
+    try {
+      immediateTransaction(this.#database, () => {
+        this.#database
+          .prepare(
+            `INSERT INTO agents (name, harness, role, created_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET
+               harness = excluded.harness,
+               role = excluded.role,
+               last_seen_at = excluded.last_seen_at`,
+          )
+          .run(this.agentName, options.harness ?? 'other', options.role ?? 'implementer', now, now);
+        this.#database
+          .prepare(
+            `INSERT INTO sessions
+              (id, agent_name, process_id, started_at, last_heartbeat_at, expires_at, status)
+             VALUES (?, ?, ?, ?, ?, ?, 'active')`,
+          )
+          .run(
+            this.sessionId,
+            this.agentName,
+            process.pid,
+            now,
+            now,
+            now + this.config.sessionTtlSeconds * 1_000,
+          );
+        if (this.#recordSessionLifecycleEvents) {
+          this.#recordEvent('session.started', 'session', this.sessionId, {
+            harness: options.harness ?? 'other',
+            role: options.role ?? 'implementer',
+          });
+        }
+      });
+    } catch (error) {
+      this.#database.close();
+      this.#closed = true;
+      throw error;
+    }
   }
 
   static open(options: CoordinatorOptions): Coordinator {
@@ -457,38 +487,54 @@ export class Coordinator {
 
   close(options: { releaseClaims?: boolean } = {}): void {
     if (this.#closed) return;
-    immediateTransaction(this.#database, () => {
-      this.#database
-        .prepare(
-          'DELETE FROM message_deliveries WHERE reserved_by_session = ? AND delivered_at IS NULL',
-        )
-        .run(this.sessionId);
-      if (options.releaseClaims) {
-        this.#database.prepare('DELETE FROM path_claims WHERE session_id = ?').run(this.sessionId);
+    try {
+      immediateTransaction(this.#database, () => {
         this.#database
           .prepare(
-            `UPDATE tasks SET claimed_by_session = NULL, lease_expires_at = NULL
-             WHERE claimed_by_session = ? AND status = 'in_progress'`,
+            'DELETE FROM message_deliveries WHERE reserved_by_session = ? AND delivered_at IS NULL',
           )
           .run(this.sessionId);
-      }
-      this.#database
-        .prepare("UPDATE sessions SET status = 'closed', expires_at = ? WHERE id = ?")
-        .run(this.#clock(), this.sessionId);
-      if (this.#recordSessionLifecycleEvents) {
-        this.#recordEvent('session.closed', 'session', this.sessionId, {
-          releasedClaims: options.releaseClaims ?? false,
-        });
-      }
-    });
-    this.#database.close();
-    this.#closed = true;
+        if (options.releaseClaims) {
+          this.#database
+            .prepare('DELETE FROM path_claims WHERE session_id = ?')
+            .run(this.sessionId);
+          this.#database
+            .prepare(
+              `UPDATE tasks SET claimed_by_session = NULL, lease_expires_at = NULL
+               WHERE claimed_by_session = ? AND status = 'in_progress'`,
+            )
+            .run(this.sessionId);
+        }
+        this.#database
+          .prepare("UPDATE sessions SET status = 'closed', expires_at = ? WHERE id = ?")
+          .run(this.#clock(), this.sessionId);
+        if (this.#recordSessionLifecycleEvents) {
+          this.#recordEvent('session.closed', 'session', this.sessionId, {
+            releasedClaims: options.releaseClaims ?? false,
+          });
+        }
+      });
+    } finally {
+      this.#database.close();
+      this.#closed = true;
+    }
   }
 
-  listAgents(): Agent[] {
-    return (
-      this.#database.prepare('SELECT * FROM agents ORDER BY last_seen_at DESC, name').all() as Row[]
-    ).map(mapAgent);
+  listAgents(options: { activeOnly?: boolean } = {}): Agent[] {
+    const rows = options.activeOnly
+      ? (this.#database
+          .prepare(
+            `SELECT DISTINCT agent.*
+             FROM agents agent
+             JOIN sessions session ON session.agent_name = agent.name
+             WHERE session.status = 'active' AND session.expires_at > ?
+             ORDER BY agent.last_seen_at DESC, agent.name`,
+          )
+          .all(this.#clock()) as Row[])
+      : (this.#database
+          .prepare('SELECT * FROM agents ORDER BY last_seen_at DESC, name')
+          .all() as Row[]);
+    return rows.map(mapAgent);
   }
 
   createTask(input: CreateTaskInput): Task {
@@ -499,11 +545,18 @@ export class Coordinator {
       throw new SameTreeError('INVALID_INPUT', 'Task descriptions cannot exceed 20000 characters.');
     }
     const priority = input.priority ?? 'normal';
+    const assignee = input.assignee ?? this.agentName;
+    if (assignee !== this.agentName) {
+      throw new SameTreeError(
+        'USER_AUTHORIZATION_REQUIRED',
+        'Agents may create task records only for their own user-defined scope. Ask the user to instruct the target agent directly.',
+        { requestedAssignee: assignee },
+      );
+    }
     const dependencies = [...new Set(input.dependencies ?? [])];
     const now = this.#clock();
 
     return immediateTransaction(this.#database, () => {
-      if (input.assignee) this.#requireAgent(input.assignee);
       for (const dependency of dependencies) this.#task(dependency);
 
       this.#database
@@ -512,26 +565,52 @@ export class Coordinator {
             (id, title, description, status, priority, assignee, created_at, updated_at)
            VALUES (?, ?, ?, 'ready', ?, ?, ?, ?)`,
         )
-        .run(id, title, description, priority, input.assignee ?? null, now, now);
+        .run(id, title, description, priority, assignee, now, now);
       const addDependency = this.#database.prepare(
         'INSERT INTO task_dependencies (task_id, depends_on) VALUES (?, ?)',
       );
       for (const dependency of dependencies) addDependency.run(id, dependency);
-      this.#recordEvent('task.created', 'task', id, { dependencies, priority });
+      this.#recordEvent('task.created', 'task', id, { assignee, dependencies, priority });
       return this.#task(id);
     });
   }
 
-  listTasks(options: { status?: TaskStatus } = {}): Task[] {
-    const rows = options.status
-      ? (this.#database
-          .prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at')
-          .all(options.status) as Row[])
-      : (this.#database.prepare('SELECT * FROM tasks ORDER BY created_at').all() as Row[]);
+  listTasks(options: ListTasksOptions = {}): Task[] {
+    const limit = options.limit ?? 25;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new SameTreeError('INVALID_INPUT', 'Task list limit must be between 1 and 100.');
+    }
+    const conditions: string[] = [];
+    const parameters: Array<number | string> = [];
+    if (options.status) {
+      conditions.push('status = ?');
+      parameters.push(options.status);
+    } else if (!options.includeTerminal) {
+      conditions.push("status NOT IN ('done', 'cancelled')");
+    }
+    if (options.after) {
+      const cursor = this.#database
+        .prepare('SELECT created_at, id FROM tasks WHERE id = ?')
+        .get(options.after) as Row | undefined;
+      if (!cursor) {
+        throw new SameTreeError('NOT_FOUND', `Task cursor '${options.after}' does not exist.`);
+      }
+      conditions.push('(created_at > ? OR (created_at = ? AND id > ?))');
+      parameters.push(
+        numberValue(cursor, 'created_at'),
+        numberValue(cursor, 'created_at'),
+        stringValue(cursor, 'id'),
+      );
+    }
+    parameters.push(limit);
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const rows = this.#database
+      .prepare(`SELECT * FROM tasks ${where} ORDER BY created_at, id LIMIT ?`)
+      .all(...parameters) as Row[];
     return rows.map((row) => mapTask(row, this.#dependencies(stringValue(row, 'id'))));
   }
 
-  claimTask(taskId: string): Task {
+  claimTask(taskId: string, authorization: UserAuthorizedTaskInput = {}): Task {
     const now = this.#clock();
     return immediateTransaction(this.#database, () => {
       const task = this.#task(taskId);
@@ -546,31 +625,33 @@ export class Coordinator {
         });
       }
 
-      if (task.status === 'ready' && task.assignee && task.assignee !== this.agentName) {
+      if (task.assignee && task.assignee !== this.agentName) {
         throw new SameTreeError(
-          'TASK_UNAVAILABLE',
-          `Task '${taskId}' is assigned to ${task.assignee}.`,
-          { assignee: task.assignee },
+          'USER_AUTHORIZATION_REQUIRED',
+          `Task '${taskId}' is assigned to ${task.assignee}; only an explicitly user-authorized takeover may reassign it.`,
+          { assignee: task.assignee, currentRevision: task.revision },
         );
       }
 
-      if (
-        task.status === 'in_progress' &&
-        task.leaseExpiresAt !== null &&
-        task.leaseExpiresAt > now &&
-        task.assignee !== this.agentName
-      ) {
-        throw new SameTreeError(
-          'TASK_UNAVAILABLE',
-          `Task '${taskId}' is leased by ${task.assignee}.`,
-          {
-            assignee: task.assignee,
-            leaseExpiresAt: task.leaseExpiresAt,
-          },
-        );
+      let adoptionReason: string | undefined;
+      if (!task.assignee) {
+        if (!authorization.userAuthorized) {
+          throw new SameTreeError(
+            'USER_AUTHORIZATION_REQUIRED',
+            `Task '${taskId}' is an unassigned legacy record. Adopt it only after the user explicitly adds it to your scope.`,
+            { currentRevision: task.revision },
+          );
+        }
+        if (authorization.expectedRevision !== task.revision) {
+          throw new SameTreeError(
+            'TASK_UNAVAILABLE',
+            `Task '${taskId}' changed from revision ${authorization.expectedRevision ?? 'unknown'} to ${task.revision}.`,
+            { currentRevision: task.revision },
+          );
+        }
+        adoptionReason = requireText(authorization.reason ?? '', 'Adoption reason', 2_000);
       }
 
-      const takeover = task.status === 'in_progress' && task.assignee !== this.agentName;
       this.#database
         .prepare(
           `UPDATE tasks SET
@@ -585,8 +666,11 @@ export class Coordinator {
           now,
           taskId,
         );
-      this.#recordEvent(takeover ? 'task.taken_over' : 'task.claimed', 'task', taskId, {
+      this.#recordEvent(task.assignee ? 'task.claimed' : 'task.adopted', 'task', taskId, {
         previousAssignee: task.assignee,
+        ...(adoptionReason
+          ? { previousRevision: task.revision, reason: adoptionReason, userAuthorized: true }
+          : {}),
       });
       return this.#task(taskId);
     });
@@ -621,39 +705,38 @@ export class Coordinator {
           { currentRevision: task.revision },
         );
       }
-      if (
-        task.status !== 'in_progress' ||
-        !task.assignee ||
-        task.leaseExpiresAt === null ||
-        task.leaseExpiresAt <= now
-      ) {
+      if (task.status === 'done' || task.status === 'cancelled') {
         throw new SameTreeError(
           'TASK_UNAVAILABLE',
-          `Task '${taskId}' does not have an active execution lease; use normal task claiming instead.`,
+          `Task '${taskId}' is ${task.status} and cannot be reassigned.`,
+        );
+      }
+      if (!task.assignee) {
+        throw new SameTreeError(
+          'TASK_UNAVAILABLE',
+          `Task '${taskId}' is unassigned; use user-authorized task claiming to adopt it.`,
+          { currentRevision: task.revision },
         );
       }
       if (task.assignee === this.agentName) {
         throw new SameTreeError('INVALID_INPUT', `Task '${taskId}' is already assigned to you.`);
       }
       const blockers = this.#unfinishedDependencies(taskId);
-      if (blockers.length > 0) {
-        throw new SameTreeError('TASK_BLOCKED', `Task '${taskId}' has unfinished dependencies.`, {
-          dependencies: blockers,
-        });
-      }
+      const startExecution = task.status !== 'blocked' && blockers.length === 0;
 
       const previousAssignee = task.assignee;
       const claims = this.#transferClaims(claimIds, previousAssignee, now, 'TASK_UNAVAILABLE');
       this.#database
         .prepare(
           `UPDATE tasks SET assignee = ?, claimed_by_session = ?, lease_expires_at = ?,
-             status = 'in_progress', revision = revision + 1, updated_at = ?
+             status = ?, revision = revision + 1, updated_at = ?
            WHERE id = ?`,
         )
         .run(
           this.agentName,
-          this.sessionId,
-          now + this.config.taskLeaseSeconds * 1_000,
+          startExecution ? this.sessionId : null,
+          startExecution ? now + this.config.taskLeaseSeconds * 1_000 : null,
+          startExecution ? 'in_progress' : task.status,
           now,
           taskId,
         );
@@ -663,6 +746,8 @@ export class Coordinator {
         previousLeaseExpiresAt: task.leaseExpiresAt,
         previousRevision: task.revision,
         claimIds,
+        blockers,
+        newStatus: startExecution ? 'in_progress' : task.status,
         reason,
         userAuthorized: true,
       });
@@ -1073,6 +1158,9 @@ export class Coordinator {
     const id = createId('handoff');
     const summary = requireText(input.summary, 'Handoff summary', 20_000);
     const claimIds = [...new Set(input.claimIds ?? [])];
+    if (claimIds.length > 100) {
+      throw new SameTreeError('INVALID_INPUT', 'Transfer at most 100 claims in one handoff.');
+    }
     const now = this.#clock();
     const expiresAt = now + this.config.handoffTtlSeconds * 1_000;
     let contextJson: string;
@@ -1147,9 +1235,12 @@ export class Coordinator {
     const rows = options.pendingOnly
       ? (this.#database
           .prepare(
-            `SELECT * FROM handoffs
-             WHERE to_agent = ? AND status = 'offered' AND expires_at > ?
-             ORDER BY created_at DESC`,
+            `SELECT handoff.* FROM handoffs handoff
+             JOIN tasks task ON task.id = handoff.task_id
+             WHERE handoff.to_agent = ? AND handoff.status = 'offered'
+               AND handoff.expires_at > ? AND task.revision = handoff.task_revision
+               AND task.assignee = handoff.from_agent AND task.status = 'in_progress'
+             ORDER BY handoff.created_at DESC`,
           )
           .all(this.agentName, now) as Row[])
       : (this.#database
@@ -1162,7 +1253,20 @@ export class Coordinator {
     return rows.map((row) => mapHandoff(row, now));
   }
 
-  respondToHandoff(handoffId: string, accept: boolean): Handoff {
+  respondToHandoff(
+    handoffId: string,
+    accept: boolean,
+    authorization: UserAuthorizedHandoffInput = {},
+  ): Handoff {
+    if (accept && !authorization.userAuthorized) {
+      throw new SameTreeError(
+        'USER_AUTHORIZATION_REQUIRED',
+        'Accepting a handoff changes agent scope and requires explicit user authorization.',
+      );
+    }
+    const reason = accept
+      ? requireText(authorization.reason ?? '', 'Handoff authorization reason', 2_000)
+      : undefined;
     const now = this.#clock();
     return immediateTransaction(this.#database, () => {
       const row = this.#database.prepare('SELECT * FROM handoffs WHERE id = ?').get(handoffId) as
@@ -1233,7 +1337,10 @@ export class Coordinator {
         this.#transferClaims(claimIds, stringValue(row, 'from_agent'), now);
       }
 
-      this.#recordEvent(`handoff.${status}`, 'handoff', handoffId, { taskId: task.id });
+      this.#recordEvent(`handoff.${status}`, 'handoff', handoffId, {
+        taskId: task.id,
+        ...(accept ? { reason, userAuthorized: true } : {}),
+      });
       return mapHandoff({ ...row, status, responded_at: now }, now);
     });
   }
@@ -1259,7 +1366,7 @@ export class Coordinator {
     };
   }
 
-  acknowledgePolicy(hash: string): PolicyDocument {
+  acknowledgePolicy(hash: string): PolicyAcknowledgement {
     const policy = this.getPolicy();
     if (policy.hash !== hash) {
       throw new SameTreeError(
@@ -1283,12 +1390,19 @@ export class Coordinator {
       const acknowledgement = this.#database
         .prepare('SELECT acknowledged_at FROM policy_acks WHERE policy_hash = ? AND agent_name = ?')
         .get(hash, this.agentName) as Row;
-      return { ...policy, acknowledgedAt: numberValue(acknowledgement, 'acknowledged_at') };
+      return {
+        hash,
+        acknowledgedAt: numberValue(acknowledgement, 'acknowledged_at'),
+        newlyAcknowledged: inserted === 1,
+      };
     });
   }
 
   events(options: { after?: number; limit?: number } = {}): CoordinationEvent[] {
-    const limit = Math.min(Math.max(options.limit ?? 100, 1), 1_000);
+    const limit = options.limit ?? 25;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new SameTreeError('INVALID_INPUT', 'Event limit must be between 1 and 1000.');
+    }
     return (
       this.#database
         .prepare('SELECT * FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?')
@@ -1305,8 +1419,18 @@ export class Coordinator {
     }));
   }
 
-  snapshot(): CoordinationSnapshot {
+  snapshot(options: SnapshotOptions = {}): CoordinationSnapshot {
+    const git = readGitWorktreeContext(this.repository.root);
     return this.#database.transaction(() => {
+      const taskRows = options.includeTerminalTasks
+        ? (this.#database.prepare('SELECT * FROM tasks ORDER BY created_at, id').all() as Row[])
+        : (this.#database
+            .prepare(
+              `SELECT * FROM tasks
+               WHERE status NOT IN ('done', 'cancelled')
+               ORDER BY created_at, id`,
+            )
+            .all() as Row[]);
       const agentRow = this.#database
         .prepare('SELECT * FROM agents WHERE name = ?')
         .get(this.agentName);
@@ -1327,8 +1451,11 @@ export class Coordinator {
         .get(this.agentName, this.agentName, this.agentName) as Row;
       const handoffs = this.#database
         .prepare(
-          `SELECT COUNT(*) AS count FROM handoffs
-           WHERE to_agent = ? AND status = 'offered' AND expires_at > ?`,
+          `SELECT COUNT(*) AS count FROM handoffs handoff
+           JOIN tasks task ON task.id = handoff.task_id
+           WHERE handoff.to_agent = ? AND handoff.status = 'offered'
+             AND handoff.expires_at > ? AND task.revision = handoff.task_revision
+             AND task.assignee = handoff.from_agent AND task.status = 'in_progress'`,
         )
         .get(this.agentName, this.#clock()) as Row;
       const lastEvent = this.#database
@@ -1336,10 +1463,11 @@ export class Coordinator {
         .get() as Row;
 
       return {
+        git,
         agent: mapAgent(agentRow as Row),
         session: mapSession(sessionRow as Row),
-        agents: this.listAgents(),
-        tasks: this.listTasks(),
+        agents: this.listAgents({ activeOnly: !options.includeInactiveAgents }),
+        tasks: taskRows.map((row) => mapTask(row, this.#dependencies(stringValue(row, 'id')))),
         claims: this.listClaims(),
         unreadMessages: numberValue(unread, 'count'),
         pendingHandoffs: numberValue(handoffs, 'count'),

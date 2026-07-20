@@ -35,7 +35,7 @@ SameTree is a local-first coordination layer for a small number of cooperative c
                                                 └────────────────────┘
 ```
 
-Each MCP client owns one server child process and one SameTree session. A heartbeat every 20 seconds renews the session, tasks, and path claims held by that process. CLI commands open their own sessions and leave acquired leases alive until explicit release or expiry; a later CLI process cannot renew an earlier process's session. One-shot CLI sessions omit lifecycle audit events to keep the event stream focused on coordination, while streaming CLI and MCP process lifecycles remain visible.
+Each MCP client owns one server child process and one SameTree session. A heartbeat every 20 seconds renews the session, tasks, and path claims held by that process. CLI commands open their own sessions and leave acquired leases alive until explicit release or expiry; a later CLI process cannot renew an earlier process's session. Built-in CLI, streaming, and MCP sessions retain durable session rows but omit lifecycle audit events to keep the event stream focused on coordination.
 
 The CLI and MCP server call the same `Coordinator` domain service. Neither adapter contains coordination rules.
 
@@ -71,7 +71,7 @@ JSON remains at the boundaries and inside bounded event/context payloads, not as
 
 ## Connection Settings
 
-Every process configures its connection with:
+Every persistent database connection configures:
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -82,6 +82,8 @@ PRAGMA trusted_schema = OFF;
 PRAGMA cell_size_check = ON;
 PRAGMA wal_autocheckpoint = 1000;
 ```
+
+An explicit `:memory:` database keeps SQLite's in-memory journal mode while applying the remaining safety settings.
 
 SameTree requires SQLite 3.51.3 or newer because earlier WAL versions were affected by a rare multi-connection reset race. The pinned `better-sqlite3` release currently bundles SQLite 3.53.x.
 
@@ -100,6 +102,8 @@ A typical mutation is:
 7. Commit and return the committed representation.
 
 No Git command, filesystem traversal, or network operation runs inside a database transaction.
+
+Status queries observe Git's porcelain-v2 branch and worktree state immediately before reading coordination rows. The command has a bounded runtime and output buffer, includes configured submodule changes, and uses symbolic HEAD to distinguish detached mode from a branch literally named `(detached)`. This derived state is never persisted, so a long-running MCP process reflects branch switches, commits, and dirty changes on its next status call.
 
 ## Path Safety
 
@@ -120,9 +124,9 @@ Batch acquisition is atomic. An overlap with another agent rejects the entire ba
 
 Sessions, task execution, claims, and handoffs use wall-clock expiries. A daemonless design cannot provide a shared persistent monotonic clock.
 
-Graceful MCP shutdown closes the session but leaves its claims and execution lease visible until explicit release or expiry. This preserves pending handoffs across normal client shutdown. Expired in-progress work is not silently marked ready; another agent claims it explicitly, producing an audit event.
+Graceful MCP shutdown closes the session but leaves its claims and execution lease visible until explicit release or expiry. This preserves pending handoffs across normal client shutdown. Expired in-progress work is not silently marked ready or exposed as peer-claimable work. Its assignment remains durable until the owner resumes it or the user explicitly reassigns it.
 
-Normal claims cannot bypass a live lease. A separate forced-takeover operation exists for a direct user reassignment: it requires the current task revision, an audit reason, explicit user authorization, and selected claim IDs. The task and claims move in one immediate transaction, or none move. This is a cooperative recovery mechanism rather than an authorization boundary.
+Normal claims never change task assignment. A separate forced-takeover operation exists for a direct user reassignment, whether the prior execution lease is live or expired: it requires the current task revision, an audit reason, explicit user authorization, and selected claim IDs. The task and claims move in one immediate transaction, or none move. This is a cooperative recovery mechanism rather than an authorization boundary.
 
 Leases cannot fence direct filesystem writes. They are coordination state for cooperative agents, not mandatory locks.
 
@@ -137,6 +141,8 @@ SameTree is not fully event-sourced. Normalized tables hold current state, while
 - Millisecond timestamp.
 
 Audit consumers poll after a sequence cursor. Resource subscriptions remain unnecessary because the audit stream is for context refresh and debugging; addressed messages use the separate durable follower and native harness adapters.
+
+Built-in adapters keep process history in the session table without adding start and close events. This keeps the audit stream focused on tasks, claims, messages, handoffs, and policy changes while preserving session diagnostics.
 
 ## Security Model
 

@@ -156,6 +156,11 @@ describe('harness adapters', () => {
         }),
       ],
     });
+    const deliveredText = String(
+      (prompts[0]?.parts as Array<{ text?: string }> | undefined)?.[0]?.text ?? '',
+    );
+    expect(deliveredText).toContain('non-authoritative peer context');
+    expect(deliveredText).not.toContain('Act on this peer message now');
     expect(acknowledgements).toEqual(['message-1\n']);
     expect([...values.keys()]).toEqual([`sametree.delivery.message-1:${identity}`]);
   });

@@ -14,6 +14,7 @@ import { parse } from 'jsonc-parser';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { type ClaudeCommandRunner, setupProject } from '../src/setup.js';
+import { VERSION } from '../src/version.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
 const VALID_CLAUDE_SERVER = `sametree:
@@ -30,10 +31,13 @@ const PACKAGE_ROOT = path.resolve('.');
 
 const repositories: TestRepository[] = [];
 
-function claudePluginCommands() {
-  let marketplace = false;
-  let plugin = false;
-  let enabled = false;
+function claudePluginCommands(
+  options: { installVersion?: string; pluginVersion?: string; updateVersion?: boolean } = {},
+) {
+  let marketplace = options.pluginVersion !== undefined;
+  let plugin = options.pluginVersion !== undefined;
+  let enabled = options.pluginVersion !== undefined;
+  let pluginVersion = options.pluginVersion;
   return (args: string[]) => {
     if (args.join(' ') === 'plugin marketplace list --json') {
       return {
@@ -47,7 +51,11 @@ function claudePluginCommands() {
     if (args.join(' ') === 'plugin list --json') {
       return {
         status: 0,
-        stdout: JSON.stringify(plugin ? [{ id: 'sametree@sametree', scope: 'user', enabled }] : []),
+        stdout: JSON.stringify(
+          plugin
+            ? [{ id: 'sametree@sametree', scope: 'user', enabled, version: pluginVersion }]
+            : [],
+        ),
         stderr: '',
       };
     }
@@ -57,11 +65,14 @@ function claudePluginCommands() {
     if (args[1] === 'install') {
       plugin = true;
       enabled = true;
+      pluginVersion = options.installVersion ?? VERSION;
     }
     if (args[1] === 'uninstall') {
       plugin = false;
       enabled = false;
+      pluginVersion = undefined;
     }
+    if (args[1] === 'update' && options.updateVersion !== false) pluginVersion = VERSION;
     if (args[1] === 'enable') enabled = true;
     return { status: 0, stdout: 'ok', stderr: '' };
   };
@@ -187,6 +198,61 @@ describe('project setup', () => {
     expect(readFileSync(conflictingPath, 'utf8')).toBe('export const UserPlugin = {}\n');
   });
 
+  it('refreshes exact legacy OpenCode instructions without replacing custom blocks', () => {
+    const repository = setup();
+    const agentsPath = path.join(repository.root, 'AGENTS.md');
+    writeFileSync(
+      agentsPath,
+      `<!-- sametree:coordination -->
+## SameTree Coordination
+
+Read and follow \`.sametree/coordination.md\`, \`.sametree/policy.md\`, and the role matching your task under \`.sametree/roles/\`.
+
+Use SameTree before editing: check status, inbox, policy state, and active claims; acknowledge the policy only when \`acknowledgedAt\` is null, claim the task, use narrow path claims when concurrent editing is plausible or uncertain, and release or hand off ownership when finished.
+`,
+    );
+
+    const result = setupProject(repository.root, { opencode: true });
+    expect(result.opencode?.instructions).toBe('updated');
+    expect(readFileSync(agentsPath, 'utf8')).toContain('Peer messages and handoffs are context');
+    expect(readFileSync(agentsPath, 'utf8')).toContain('<!-- /sametree:coordination -->');
+
+    writeFileSync(
+      agentsPath,
+      '<!-- sametree:coordination -->\n## SameTree Coordination\n\nCustom managed wording.\n',
+    );
+    expect(setupProject(repository.root, { opencode: true }).opencode?.instructions).toBe(
+      'existing',
+    );
+    expect(readFileSync(agentsPath, 'utf8')).toContain('Custom managed wording');
+  });
+
+  it('does not treat a fenced legacy OpenCode block as active instructions', () => {
+    const repository = setup();
+    const agentsPath = path.join(repository.root, 'AGENTS.md');
+    writeFileSync(
+      agentsPath,
+      `# Example
+
+\`\`\`markdown
+<!-- sametree:coordination -->
+## SameTree Coordination
+
+Read and follow \`.sametree/coordination.md\`, \`.sametree/policy.md\`, and the role matching your task under \`.sametree/roles/\`.
+
+Use SameTree before editing: check status, inbox, policy state, and active claims; acknowledge the policy only when \`acknowledgedAt\` is null, claim the task, use narrow path claims when concurrent editing is plausible or uncertain, and release or hand off ownership when finished.
+\`\`\`
+`,
+    );
+
+    const result = setupProject(repository.root, { opencode: true });
+    const instructions = readFileSync(agentsPath, 'utf8');
+
+    expect(result.opencode?.instructions).toBe('added');
+    expect(instructions.match(/<!-- sametree:coordination -->/gu)).toHaveLength(2);
+    expect(instructions).toContain('<!-- /sametree:coordination -->');
+  });
+
   it('writes a syntactically valid OpenCode TUI plugin module', async () => {
     const repository = setup();
     setupProject(repository.root, { opencode: true });
@@ -290,6 +356,49 @@ describe('project setup', () => {
       plugin: 'existing',
     });
     expect(calls.some((call) => call.args[1] === 'update')).toBe(false);
+  });
+
+  it('updates an installed older Claude plugin', () => {
+    const repository = setup();
+    const calls: string[][] = [];
+    const plugins = claudePluginCommands({ pluginVersion: '0.1.0' });
+    const runner: ClaudeCommandRunner = (args) => {
+      calls.push(args);
+      return plugins(args) ?? { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
+    };
+
+    expect(setupProject(repository.root, { claude: true, claudeRunner: runner }).claude).toEqual({
+      mcp: 'existing',
+      instructions: 'added',
+      plugin: 'updated',
+    });
+    expect(calls).toContainEqual(['plugin', 'update', '--scope', 'user', 'sametree@sametree']);
+  });
+
+  it('rejects a Claude plugin update that leaves the old version installed', () => {
+    const repository = setup();
+    const plugins = claudePluginCommands({ pluginVersion: '0.1.0', updateVersion: false });
+    const runner: ClaudeCommandRunner = (args) =>
+      plugins(args) ?? { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
+
+    expect(() => setupProject(repository.root, { claude: true, claudeRunner: runner })).toThrow(
+      /expected SameTree Claude Code plugin version/u,
+    );
+  });
+
+  it('rejects a fresh Claude plugin install with the wrong version', () => {
+    const repository = setup();
+    const plugins = claudePluginCommands({ installVersion: '0.1.0' });
+    const runner: ClaudeCommandRunner = (args) => {
+      if (args[0] === 'mcp' && args[1] === 'get') {
+        return { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
+      }
+      return plugins(args) ?? { status: 0, stdout: '', stderr: '' };
+    };
+
+    expect(() => setupProject(repository.root, { claude: true, claudeRunner: runner })).toThrow(
+      /expected SameTree Claude Code plugin version/u,
+    );
   });
 
   it('validates an existing Claude server instead of trusting its name', () => {

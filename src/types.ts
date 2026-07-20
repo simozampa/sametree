@@ -89,7 +89,22 @@ export interface PolicyDocument {
   acknowledgedAt: number | null;
 }
 
+export interface PolicyAcknowledgement {
+  hash: string;
+  acknowledgedAt: number;
+  newlyAcknowledged: boolean;
+}
+
+export interface GitWorktreeContext {
+  root: string;
+  branch: string | null;
+  commit: string | null;
+  detached: boolean;
+  dirty: boolean;
+}
+
 export interface CoordinationSnapshot {
+  git: GitWorktreeContext;
   agent: Agent;
   session: Session;
   agents: Agent[];

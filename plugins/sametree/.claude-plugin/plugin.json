@@ -1,7 +1,7 @@
 {
   "name": "sametree",
   "displayName": "SameTree",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Automatic SameTree coordination and peer message delivery",
   "author": {
     "name": "SameTree maintainers"

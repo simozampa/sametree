@@ -33,6 +33,22 @@ afterEach(() => {
 });
 
 describe('Coordinator', () => {
+  it('supports an explicit in-memory database without requiring WAL', () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const coordinator = Coordinator.open({
+      cwd: repository.root,
+      agent: 'memory-agent',
+      databasePath: ':memory:',
+    });
+    coordinators.push(coordinator);
+
+    expect(coordinator.createTask({ title: 'Memory task' })).toMatchObject({
+      assignee: 'memory-agent',
+      status: 'ready',
+    });
+  });
+
   it('can omit lifecycle events while retaining a durable closed session', () => {
     const repository = createTestRepository();
     repositories.push(repository);
@@ -61,6 +77,76 @@ describe('Coordinator', () => {
     database.close();
   });
 
+  it('keeps status compact while preserving opt-in history', () => {
+    const { open } = setup();
+    const historical = open('historical');
+    const completed = historical.claimTask(historical.createTask({ title: 'Completed work' }).id);
+    historical.updateTask(completed.id, { status: 'done' });
+    historical.close();
+    const observer = open('observer');
+
+    const current = observer.snapshot();
+    expect(current.agents.map((agent) => agent.name)).toEqual(['observer']);
+    expect(current.tasks).toEqual([]);
+
+    const history = observer.snapshot({
+      includeInactiveAgents: true,
+      includeTerminalTasks: true,
+    });
+    expect(history.agents.map((agent) => agent.name)).toEqual(
+      expect.arrayContaining(['historical', 'observer']),
+    );
+    expect(history.tasks).toEqual([expect.objectContaining({ id: completed.id, status: 'done' })]);
+  });
+
+  it('pages task history with stable task cursors', () => {
+    const { open } = setup(() => 1_000);
+    const author = open('author');
+    const created = [
+      author.createTask({ title: 'One' }),
+      author.createTask({ title: 'Two' }),
+      author.createTask({ title: 'Three' }),
+      author.createTask({ title: 'Four' }),
+    ];
+
+    const first = author.listTasks({ limit: 2 });
+    const cursor = first.at(-1)?.id;
+    if (!cursor) throw new Error('Expected a task cursor.');
+    const second = author.listTasks({ after: cursor, limit: 2 });
+
+    expect([...first, ...second].map((task) => task.id).sort()).toEqual(
+      created.map((task) => task.id).sort(),
+    );
+    expect(new Set([...first, ...second].map((task) => task.id)).size).toBe(4);
+  });
+
+  it('does not silently truncate status tasks and rejects invalid page limits', () => {
+    const { open } = setup();
+    const author = open('author');
+    for (let index = 0; index < 101; index += 1) {
+      author.createTask({ title: `Visible task ${index}` });
+    }
+
+    expect(author.snapshot().tasks).toHaveLength(101);
+    expect(() => author.listTasks({ limit: 101 })).toThrowError(
+      expect.objectContaining({ code: 'INVALID_INPUT' }),
+    );
+    expect(() => author.events({ limit: 1_001 })).toThrowError(
+      expect.objectContaining({ code: 'INVALID_INPUT' }),
+    );
+  });
+
+  it('limits direct event reads to 25 rows by default', () => {
+    const { open } = setup();
+    const author = open('author');
+    for (let index = 0; index < 30; index += 1) {
+      author.createTask({ title: `Task ${index}` });
+    }
+
+    expect(author.events()).toHaveLength(25);
+    expect(author.events({ limit: 30 })).toHaveLength(30);
+  });
+
   it('enforces task dependencies and active leases', () => {
     const { open } = setup();
     const author = open('author');
@@ -81,23 +167,53 @@ describe('Coordinator', () => {
 
     expect(claimed.assignee).toBe('author');
     expect(() => reviewer.claimTask(implementation.id)).toThrowError(
-      expect.objectContaining({ code: 'TASK_UNAVAILABLE' }),
+      expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
     );
   });
 
-  it('preserves ready assignments and requires a claim before updates', () => {
+  it('creates self-owned task records and rejects peer assignment', () => {
     const { open } = setup();
     const author = open('author');
     const reviewer = open('reviewer');
     const assigned = author.createTask({ title: 'Assigned work', assignee: 'author' });
-    const unassigned = author.createTask({ title: 'Unassigned work' });
+    const implicit = author.createTask({ title: 'Implicit self-assignment' });
+
+    expect(implicit.assignee).toBe('author');
+    expect(() =>
+      author.createTask({ title: 'Peer assignment', assignee: 'reviewer' }),
+    ).toThrowError(expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }));
 
     expect(() => reviewer.claimTask(assigned.id)).toThrowError(
-      expect.objectContaining({ code: 'TASK_UNAVAILABLE' }),
+      expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
     );
     expect(() =>
-      reviewer.updateTask(unassigned.id, { description: 'Taken without a claim' }),
+      reviewer.updateTask(implicit.id, { description: 'Taken without a claim' }),
     ).toThrowError(expect.objectContaining({ code: 'NOT_ASSIGNED' }));
+  });
+
+  it('requires direct user authorization to adopt a legacy unassigned task', () => {
+    const { repository, open } = setup();
+    const author = open('author');
+    const database = new Database(resolveRepository(repository.root).databasePath);
+    database
+      .prepare(
+        `INSERT INTO tasks
+          (id, title, description, status, priority, assignee, revision, created_at, updated_at)
+         VALUES ('task_legacy', 'Legacy task', '', 'ready', 'normal', NULL, 1, 1, 1)`,
+      )
+      .run();
+    database.close();
+
+    expect(() => author.claimTask('task_legacy')).toThrowError(
+      expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
+    );
+    expect(
+      author.claimTask('task_legacy', {
+        expectedRevision: 1,
+        reason: 'The user explicitly assigned this legacy task.',
+        userAuthorized: true,
+      }),
+    ).toMatchObject({ assignee: 'author', status: 'in_progress' });
   });
 
   it('checks dependencies on every transition into progress', () => {
@@ -181,7 +297,7 @@ describe('Coordinator', () => {
     ).toThrowError(expect.objectContaining({ code: 'TASK_UNAVAILABLE' }));
   });
 
-  it('uses normal task claiming instead of forced takeover after lease expiry', () => {
+  it('requires user-authorized takeover after lease expiry', () => {
     let now = Date.now();
     const { open } = setup(() => now);
     const owner = open('owner');
@@ -189,14 +305,64 @@ describe('Coordinator', () => {
     const active = owner.claimTask(owner.createTask({ title: 'Expired takeover' }).id);
     now += 901_000;
 
-    expect(() =>
+    expect(() => replacement.claimTask(active.id)).toThrowError(
+      expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
+    );
+    expect(
       replacement.forceTakeoverTask(active.id, {
         expectedRevision: active.revision,
-        reason: 'This lease has already expired.',
+        reason: 'The user reassigned this expired work.',
         userAuthorized: true,
-      }),
-    ).toThrowError(expect.objectContaining({ code: 'TASK_UNAVAILABLE' }));
-    expect(replacement.claimTask(active.id).assignee).toBe('replacement');
+      }).task.assignee,
+    ).toBe('replacement');
+  });
+
+  it('reassigns blocked work without incorrectly starting execution', () => {
+    const { open } = setup();
+    const owner = open('owner');
+    const replacement = open('replacement');
+    const active = owner.claimTask(owner.createTask({ title: 'Blocked takeover' }).id);
+    const blocked = owner.updateTask(active.id, { status: 'blocked' });
+
+    const takeover = replacement.forceTakeoverTask(blocked.id, {
+      expectedRevision: blocked.revision,
+      reason: 'The user reassigned investigation of the blocker.',
+      userAuthorized: true,
+    });
+
+    expect(takeover.task).toMatchObject({
+      assignee: 'replacement',
+      status: 'blocked',
+      leaseExpiresAt: null,
+    });
+    const ready = replacement.updateTask(blocked.id, { status: 'ready' });
+    expect(replacement.claimTask(ready.id)).toMatchObject({
+      assignee: 'replacement',
+      status: 'in_progress',
+    });
+  });
+
+  it('reassigns dependency-blocked ready work without starting execution', () => {
+    const { open } = setup();
+    const owner = open('owner');
+    const replacement = open('replacement');
+    const prerequisite = owner.createTask({ title: 'Prerequisite' });
+    const dependent = owner.createTask({
+      title: 'Waiting takeover',
+      dependencies: [prerequisite.id],
+    });
+
+    const takeover = replacement.forceTakeoverTask(dependent.id, {
+      expectedRevision: dependent.revision,
+      reason: 'The user reassigned the waiting task.',
+      userAuthorized: true,
+    });
+
+    expect(takeover.task).toMatchObject({
+      assignee: 'replacement',
+      status: 'ready',
+      leaseExpiresAt: null,
+    });
   });
 
   it('rejects a forced partial claim transfer that creates overlap', () => {
@@ -396,10 +562,63 @@ describe('Coordinator', () => {
       context: { commit: 'abc123' },
       claimIds: [claim.id],
     });
-    reviewer.respondToHandoff(offer.id, true);
+    expect(() => reviewer.respondToHandoff(offer.id, true)).toThrowError(
+      expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
+    );
+    reviewer.respondToHandoff(offer.id, true, {
+      reason: 'The user moved parser ownership to the reviewer.',
+      userAuthorized: true,
+    });
 
     expect(reviewer.listTasks().find((item) => item.id === task.id)?.assignee).toBe('reviewer');
     expect(reviewer.listClaims().find((item) => item.id === claim.id)?.agentName).toBe('reviewer');
+  });
+
+  it('rejects oversized handoff offers before they become unacceptible', () => {
+    const { open } = setup();
+    const author = open('author');
+    open('reviewer');
+    const task = author.claimTask(author.createTask({ title: 'Bound handoff claims' }).id);
+    const first = author.acquireClaims(
+      Array.from({ length: 100 }, (_, index) => ({ path: `src/claim-${index}.ts` })),
+    );
+    const last = author.acquireClaims([{ path: 'src/claim-100.ts' }]);
+
+    expect(() =>
+      author.offerHandoff({
+        taskId: task.id,
+        to: 'reviewer',
+        summary: 'Too many claims.',
+        claimIds: [...first, ...last].map((claim) => claim.id),
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'INVALID_INPUT' }));
+    expect(author.listHandoffs()).toEqual([]);
+  });
+
+  it('does not report handoffs made stale by another accepted transfer as pending', () => {
+    const { open } = setup();
+    const author = open('author');
+    const first = open('first-reviewer');
+    const second = open('second-reviewer');
+    const task = author.claimTask(author.createTask({ title: 'Competing handoffs' }).id);
+    const firstOffer = author.offerHandoff({
+      taskId: task.id,
+      to: 'first-reviewer',
+      summary: 'First offer.',
+    });
+    author.offerHandoff({
+      taskId: task.id,
+      to: 'second-reviewer',
+      summary: 'Second offer.',
+    });
+
+    first.respondToHandoff(firstOffer.id, true, {
+      reason: 'The user selected the first reviewer.',
+      userAuthorized: true,
+    });
+
+    expect(second.listHandoffs({ pendingOnly: true })).toEqual([]);
+    expect(second.snapshot().pendingHandoffs).toBe(0);
   });
 
   it('rejects partial transfers that would create cross-agent claim overlap', () => {
@@ -418,9 +637,12 @@ describe('Coordinator', () => {
       claimIds: [nested.id],
     });
 
-    expect(() => reviewer.respondToHandoff(offer.id, true)).toThrowError(
-      expect.objectContaining({ code: 'HANDOFF_CONFLICT' }),
-    );
+    expect(() =>
+      reviewer.respondToHandoff(offer.id, true, {
+        reason: 'The user authorized this transfer.',
+        userAuthorized: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'HANDOFF_CONFLICT' }));
     expect(author.listTasks().find((item) => item.id === task.id)?.assignee).toBe('author');
   });
 
@@ -441,7 +663,12 @@ describe('Coordinator', () => {
 
     author.close();
 
-    expect(reviewer.respondToHandoff(offer.id, true).status).toBe('accepted');
+    expect(
+      reviewer.respondToHandoff(offer.id, true, {
+        reason: 'The user asked the reviewer to continue after the author exited.',
+        userAuthorized: true,
+      }).status,
+    ).toBe('accepted');
   });
 
   it('rejects a handoff when its task revision becomes stale', () => {
@@ -457,9 +684,12 @@ describe('Coordinator', () => {
     });
     author.updateTask(task.id, { description: 'The contract changed.' });
 
-    expect(() => reviewer.respondToHandoff(offer.id, true)).toThrowError(
-      expect.objectContaining({ code: 'HANDOFF_CONFLICT' }),
-    );
+    expect(() =>
+      reviewer.respondToHandoff(offer.id, true, {
+        reason: 'The user authorized the original handoff.',
+        userAuthorized: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'HANDOFF_CONFLICT' }));
   });
 
   it('does not offer terminal tasks for handoff', () => {
@@ -529,8 +759,16 @@ describe('Coordinator', () => {
 
     expect(policy.acknowledgedAt).toBeNull();
     const acknowledged = author.acknowledgePolicy(policy.hash);
-    expect(acknowledged.acknowledgedAt).not.toBeNull();
-    expect(author.acknowledgePolicy(policy.hash).acknowledgedAt).toBe(acknowledged.acknowledgedAt);
+    expect(acknowledged).toMatchObject({ hash: policy.hash, newlyAcknowledged: true });
+    expect(Object.keys(acknowledged).sort()).toEqual([
+      'acknowledgedAt',
+      'hash',
+      'newlyAcknowledged',
+    ]);
+    expect(author.acknowledgePolicy(policy.hash)).toEqual({
+      ...acknowledged,
+      newlyAcknowledged: false,
+    });
     expect(
       author.events({ after: 0 }).filter((event) => event.kind === 'policy.acknowledged'),
     ).toHaveLength(1);

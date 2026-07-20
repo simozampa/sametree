@@ -1,3 +1,6 @@
+import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -12,14 +15,42 @@ import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
 const clients: Client[] = [];
+const temporaryDirectories: string[] = [];
 const mcpPath = path.resolve('dist/mcp.js');
 
 afterEach(async () => {
   for (const client of clients.splice(0)) await client.close();
   for (const repository of repositories.splice(0)) repository.cleanup();
+  for (const directory of temporaryDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 describe('MCP server', () => {
+  it('reports startup failures as complete structured errors', async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'sametree-mcp-error-'));
+    temporaryDirectories.push(directory);
+    const result = await new Promise<{ code: number | null; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, [mcpPath], {
+        cwd: directory,
+        env: { ...getDefaultEnvironment(), SAMETREE_AGENT: 'invalid-root' },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+        stderr += chunk;
+      });
+      child.once('error', reject);
+      child.once('close', (code) => resolve({ code, stderr }));
+    });
+
+    expect(result.code).not.toBe(0);
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      error: { code: 'NOT_GIT_REPOSITORY' },
+      ok: false,
+    });
+  });
+
   it('negotiates tools and returns structured coordination state over stdio', async () => {
     const repository = createTestRepository();
     repositories.push(repository);
@@ -46,8 +77,14 @@ describe('MCP server', () => {
     );
     expect(response.isError).not.toBe(true);
     expect(response.structuredContent).toMatchObject({
-      result: { agent: { name: 'mcp-agent', harness: 'opencode' } },
+      result: {
+        agent: { name: 'mcp-agent', harness: 'opencode' },
+        git: { branch: 'main', commit: null, root: repository.root },
+      },
     });
+    const content = response.content as Array<{ text?: string; type: string }>;
+    const text = content.find((item) => item.type === 'text')?.text;
+    expect(text).not.toContain('\n');
   });
 
   it('assigns distinct identities when clients do not provide agent names', async () => {
@@ -92,6 +129,37 @@ describe('MCP server', () => {
     expect(firstStatus.result.agent.name).toMatch(/^opencode-\d+$/u);
     expect(secondStatus.result.agent.name).toMatch(/^opencode-\d+$/u);
     expect(secondStatus.result.agent.name).not.toBe(firstStatus.result.agent.name);
+  });
+
+  it('does not let one MCP agent assign work to another', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const peer = Coordinator.open({ cwd: repository.root, agent: 'peer' });
+    peer.close();
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [mcpPath],
+      cwd: repository.root,
+      env: {
+        ...getDefaultEnvironment(),
+        SAMETREE_AGENT: 'author',
+        SAMETREE_HARNESS: 'opencode',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'sametree-test', version: '1.0.0' });
+    clients.push(client);
+    await client.connect(transport);
+
+    const response = await client.callTool({
+      name: 'sametree_task_create',
+      arguments: { title: 'Assign a peer', assignee: 'peer' },
+    });
+
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toMatchObject({
+      result: { error: { code: 'USER_AUTHORIZATION_REQUIRED' }, ok: false },
+    });
   });
 
   it('forcibly takes over active work through an explicit MCP call', async () => {

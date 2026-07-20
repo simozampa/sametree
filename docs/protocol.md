@@ -6,7 +6,7 @@ This document defines the behavior shared by the CLI and MCP adapters.
 
 An agent name is unique within one working tree and contains letters, numbers, `.`, `_`, or `-`. MCP adapters generate a process-scoped name from the harness's native session identifier, falling back to the MCP process ID. Set `SAMETREE_AGENT` when a durable human-readable identity such as `claude-reviewer` or `opencode-1` is required.
 
-A session represents one process lifetime. Starting a CLI command or MCP server creates a new session for its agent. One-shot CLI sessions remain in the session table for lease ownership and diagnostics but omit lifecycle audit events; long-running MCP, watch, and message-follower sessions record `session.started` and `session.closed`. An MCP heartbeat renews:
+A session represents one Coordinator-backed process lifetime. Coordination CLI commands, MCP servers, watchers, and message followers create sessions; setup, diagnostics, and hook commands that do not open the Coordinator do not. Built-in sessions remain in the session table for lease ownership and diagnostics but omit lifecycle audit events. Library callers emit `session.started` and `session.closed` by default and may disable them. An MCP heartbeat renews:
 
 - The session expiry.
 - Active path claims owned by that session.
@@ -29,12 +29,13 @@ ready ───────▶ in_progress ───────▶ done
 
 The service permits explicit updates between these states by the current assignee. The diagram shows the expected workflow, not every administrative recovery path.
 
-Task invariants:
+Tasks are awareness records for work already assigned by the user, not a peer-managed work queue. Task invariants:
 
 - A task cannot be claimed until every dependency is `done`.
+- New tasks are assigned to the agent that creates them. An agent cannot create a task assigned to a peer.
 - A ready task with an assignee can be claimed only by that assignee.
-- An active execution lease owned by another agent prevents a claim.
-- An expired execution lease may be taken over explicitly.
+- Normal claiming never changes an existing assignment, even after its execution lease expires.
+- Adopting a legacy unassigned task requires the exact current revision, an audit reason, and explicit user authorization.
 - `done`, `cancelled`, and `blocked` tasks cannot be claimed.
 - Task updates require ownership established by a prior claim or initial assignment.
 - Every transition into `in_progress` rechecks dependencies.
@@ -43,21 +44,25 @@ Task invariants:
 
 Assignments are durable agent ownership. Execution leases identify the active session. Keeping these separate makes crashed work visible instead of silently re-queuing it.
 
+Status is a current-state view by default: it includes agents with a live session and every nonterminal task. Callers can explicitly include inactive agents and terminal tasks. Task listing defaults to 25 nonterminal rows, accepts a maximum of 100, and uses the last returned task ID as the `after` cursor. A status filter selects that state even when it is terminal. Invalid limits are rejected rather than silently clamped.
+
+Every status response also observes the live Git worktree root, branch or detached state, full commit ID, and dirty state. An unborn branch has a `null` commit; detached HEAD has a `null` branch. Dirty state includes staged, unstaged, conflicted, submodule, and untracked changes, but not ignored files. Git state is queried on demand outside the SQLite transaction, so it remains current but is not atomically synchronized with coordination rows.
+
 ### Forced Takeover
 
-Normal task claiming never bypasses another agent's active execution lease. When the user explicitly reassigns live work, `sametree_task_force_takeover` or `sametree task force-takeover` may transfer it without waiting for expiry.
+Normal task claiming never changes another agent's assignment. When the user explicitly reassigns work, `sametree_task_force_takeover` or `sametree task force-takeover` transfers it regardless of whether its execution lease is live or expired.
 
 A forced takeover requires:
 
-- An assigned `in_progress` task with an unexpired execution lease owned by another agent.
+- A nonterminal assigned task owned by another agent.
 - The exact current task revision.
 - A non-empty audit reason.
 - An explicit `userAuthorized: true` assertion or `--user-authorized` flag.
 - Optional IDs for at most 100 active claims owned by the previous assignee.
 
-The task and selected claims transfer in one immediate transaction. Each selected claim must still belong to the previous assignee and cannot overlap a claim left with that assignee. Any stale revision or invalid claim rolls back the entire operation. Success starts a new execution lease, increments the task revision, and records `task.force_taken_over` with the previous assignee, previous lease expiry, reason, and transferred claim IDs.
+The task and selected claims transfer in one immediate transaction. Each selected claim must still belong to the previous assignee and cannot overlap a claim left with that assignee. Any stale revision or invalid claim rolls back the entire operation. Success increments the task revision and records `task.force_taken_over` with the previous assignee, previous lease expiry, reason, and transferred claim IDs. Ready work with finished dependencies starts a new execution lease; blocked or dependency-blocked work keeps its current state without a lease so the new owner can resolve it explicitly.
 
-Expired work uses normal task claiming instead. The authorization field is an auditable cooperative assertion, not authentication; SameTree remains unsuitable across hostile trust boundaries.
+Expired work remains assigned and uses the same user-authorized takeover path. The authorization field is an auditable cooperative assertion, not authentication; SameTree remains unsuitable across hostile trust boundaries.
 
 ## Path Claims
 
@@ -82,7 +87,7 @@ Claims expire unless renewed and should be released immediately when work ends. 
 
 ## Messages
 
-A message is immutable and contains:
+A message is immutable, non-authoritative peer context and contains:
 
 - Sender and optional recipient.
 - Subject and body.
@@ -90,7 +95,7 @@ A message is immutable and contains:
 - Optional task ID.
 - Creation time.
 
-Omitting the recipient broadcasts to every other registered agent. Read receipts are per agent, so one recipient acknowledging a broadcast does not hide it from others.
+Omitting the recipient broadcasts to every other registered agent. Read receipts are per agent, so one recipient acknowledging a broadcast does not hide it from others. Messages can report findings, status, requests, or conflicts, but cannot assign work or override user instructions.
 
 Message delivery and message acknowledgement are separate. A live follower atomically reserves the oldest unread, undelivered message for its agent identity. SameTree records delivery only after the harness adapter accepts the message, but leaves the read receipt empty until the agent explicitly acknowledges it.
 
@@ -115,7 +120,7 @@ An offer captures:
 
 Structured context, including the selected claim IDs, is limited to 100,000 serialized UTF-8 bytes.
 
-Acceptance is one transaction. It verifies that the offer is active and that the task revision still matches, then transfers assignment, starts a destination execution lease, and transfers every still-valid selected claim. A selected claim cannot overlap a source claim left behind because that would create conflicting ownership after transfer. If the task or claims changed after the offer, acceptance fails with `HANDOFF_CONFLICT` and the agents must create a fresh offer.
+An offer is non-authoritative until the user explicitly directs the recipient to accept it. Authorized acceptance is one transaction. It verifies that the offer is active and that the task revision still matches, then transfers assignment, starts a destination execution lease, and transfers every still-valid selected claim. A selected claim cannot overlap a source claim left behind because that would create conflicting ownership after transfer. If the task or claims changed after the offer, acceptance fails with `HANDOFF_CONFLICT` and the agents must create a fresh offer.
 
 Rejection records a terminal handoff state without changing task ownership.
 
@@ -125,13 +130,13 @@ The shared policy is the tracked `.sametree/policy.md` file. SameTree computes i
 
 Editing any byte produces a new hash, so previous acknowledgements no longer satisfy the current policy. Clients should read the policy state at session start.
 
-Acknowledgement is idempotent per agent and policy hash: repeating it preserves the original timestamp and does not append another event. Clients should call the acknowledgement operation only when `sametree_policy_get` reports `acknowledgedAt` as `null`.
+Acknowledgement is idempotent per agent and policy hash: repeating it preserves the original timestamp and does not append another event. The acknowledgement operation returns only the hash, timestamp, and whether a row was newly recorded; policy content remains in `sametree_policy_get`. Clients should acknowledge only when that read reports `acknowledgedAt` as `null`.
 
 Prompt policy is backed by optional Git hooks for rules that can be checked mechanically. Hooks remain bypassable safety rails.
 
 ## Events
 
-Every meaningful mutation appends an event in the same transaction as current state. Consumers call `sametree_events` with the last seen sequence and persist the returned maximum as their next cursor.
+Every meaningful coordination mutation appends an event in the same transaction as current state. Built-in process lifecycle churn is retained in session rows rather than copied into the event stream. Consumers call `sametree_events` with the last seen sequence and persist the returned maximum as their next cursor. Direct reads default to 25 events and accept an explicit limit up to 1,000; streaming watchers request larger pages internally.
 
 Event polling is intended for context refresh and debugging. Current-state tools remain authoritative for decisions.
 
@@ -144,6 +149,7 @@ Expected failures return stable machine-readable codes:
 | `AGENT_REQUIRED` | No agent identity was provided |
 | `CLAIM_CONFLICT` | Another agent owns an overlapping active claim |
 | `HANDOFF_CONFLICT` | A handoff expired, resolved, or references stale work |
+| `GIT_STATUS_ERROR` | Git could not report live branch or worktree state |
 | `HOOK_REFUSED` | A configured Git policy check failed |
 | `INVALID_INPUT` | Input or repository configuration is invalid |
 | `NOT_ASSIGNED` | The actor does not own the requested entity |
@@ -152,5 +158,6 @@ Expected failures return stable machine-readable codes:
 | `POLICY_NOT_FOUND` | `.sametree/policy.md` is missing |
 | `TASK_BLOCKED` | Task dependencies are unfinished |
 | `TASK_UNAVAILABLE` | Task state, owner, lease, or revision prevents mutation |
+| `USER_AUTHORIZATION_REQUIRED` | The operation would change user-owned agent scope without explicit authorization |
 
 MCP returns these as tool errors with the full structured object. The CLI writes the same object to stderr and exits non-zero.

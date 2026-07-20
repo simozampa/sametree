@@ -9,7 +9,7 @@ import { errorResult } from './errors.js';
 import { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 import { initializeProject } from './project.js';
 import { setupProject } from './setup.js';
-import type { Harness, TaskPriority, TaskStatus } from './types.js';
+import type { Harness, PathClaim, TaskPriority, TaskStatus } from './types.js';
 import { VERSION } from './version.js';
 import { followMessages, watchEvents } from './watch.js';
 
@@ -42,6 +42,10 @@ function objectJson(value: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+function claimReceipts(claims: PathClaim[]) {
+  return claims.map(({ id, path, kind, expiresAt }) => ({ id, path, kind, expiresAt }));
+}
+
 function openCoordinator(
   command: Command,
   coordinatorOptions: { recordSessionLifecycleEvents?: boolean } = {},
@@ -58,18 +62,29 @@ function openCoordinator(
 
 function runWithCoordinator<T>(command: Command, operation: (coordinator: Coordinator) => T): void {
   const coordinator = openCoordinator(command, { recordSessionLifecycleEvents: false });
+  let operationFailed = false;
+  let operationError: unknown;
   try {
     print(operation(coordinator));
-  } finally {
-    coordinator.close();
+  } catch (error) {
+    operationFailed = true;
+    operationError = error;
   }
+  let closeError: unknown;
+  try {
+    coordinator.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (operationFailed) throw operationError;
+  if (closeError !== undefined) throw closeError;
 }
 
 async function runStreaming(
   command: Command,
   operation: (coordinator: Coordinator, signal: AbortSignal) => Promise<unknown>,
 ): Promise<void> {
-  const coordinator = openCoordinator(command);
+  const coordinator = openCoordinator(command, { recordSessionLifecycleEvents: false });
   const controller = new AbortController();
   const abort = () => {
     controller.abort();
@@ -77,13 +92,24 @@ async function runStreaming(
   };
   process.once('SIGINT', abort);
   process.once('SIGTERM', abort);
+  let operationFailed = false;
+  let operationError: unknown;
   try {
     await operation(coordinator, controller.signal);
-  } finally {
-    process.removeListener('SIGINT', abort);
-    process.removeListener('SIGTERM', abort);
-    coordinator.close();
+  } catch (error) {
+    operationFailed = true;
+    operationError = error;
   }
+  process.removeListener('SIGINT', abort);
+  process.removeListener('SIGTERM', abort);
+  let closeError: unknown;
+  try {
+    coordinator.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (operationFailed) throw operationError;
+  if (closeError !== undefined) throw closeError;
 }
 
 function stdinConfirmations(signal: AbortSignal) {
@@ -148,9 +174,16 @@ program
 
 program
   .command('status')
-  .description('Show agents, work, claims, and unread coordination state.')
-  .action((_options: unknown, command: Command) => {
-    runWithCoordinator(command, (coordinator) => coordinator.snapshot());
+  .description('Show live Git state, active agents, current work, claims, and unread state.')
+  .option('--all-agents', 'include inactive registered agents')
+  .option('--all-tasks', 'include done and cancelled tasks')
+  .action((options: { allAgents?: boolean; allTasks?: boolean }, command: Command) => {
+    runWithCoordinator(command, (coordinator) =>
+      coordinator.snapshot({
+        includeInactiveAgents: options.allAgents ?? false,
+        includeTerminalTasks: options.allTasks ?? false,
+      }),
+    );
   });
 
 program
@@ -206,22 +239,52 @@ task
       'cancelled',
     ]),
   )
-  .action((options: { status?: TaskStatus }, command: Command) => {
-    runWithCoordinator(command, (coordinator) =>
-      coordinator.listTasks(options.status ? { status: options.status } : {}),
-    );
-  });
+  .option('--all', 'include done and cancelled tasks')
+  .option('--after <task-id>', 'continue after this task cursor')
+  .option('--limit <number>', 'maximum tasks', integer, 25)
+  .action(
+    (
+      options: { after?: string; all?: boolean; limit: number; status?: TaskStatus },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.listTasks({
+          ...(options.status ? { status: options.status } : {}),
+          ...(options.after ? { after: options.after } : {}),
+          includeTerminal: options.all ?? false,
+          limit: options.limit,
+        }),
+      );
+    },
+  );
 
 task
   .command('claim <task-id>')
-  .description('Claim ready work or explicitly take over an expired lease.')
-  .action((taskId: string, _options: unknown, command: Command) => {
-    runWithCoordinator(command, (coordinator) => coordinator.claimTask(taskId));
-  });
+  .description('Start or renew assigned work; never take over a peer task implicitly.')
+  .option('--revision <number>', 'expected revision for a legacy unassigned task', integer)
+  .option('--reason <text>', 'audit reason for adopting a legacy unassigned task')
+  .option('--user-authorized', 'confirm that the user explicitly added this task to your scope')
+  .action(
+    (
+      taskId: string,
+      options: { reason?: string; revision?: number; userAuthorized?: true },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.claimTask(taskId, {
+          ...(options.revision !== undefined ? { expectedRevision: options.revision } : {}),
+          ...(options.reason !== undefined ? { reason: options.reason } : {}),
+          ...(options.userAuthorized !== undefined
+            ? { userAuthorized: options.userAuthorized }
+            : {}),
+        }),
+      );
+    },
+  );
 
 task
   .command('force-takeover <task-id>')
-  .description('Reassign active work after the user explicitly authorizes it.')
+  .description('Reassign another agent’s work after the user explicitly authorizes it.')
   .requiredOption('--revision <number>', 'expected current task revision', integer)
   .requiredOption('--reason <text>', 'audit reason for bypassing the active lease')
   .requiredOption('--user-authorized', 'confirm that the user explicitly authorized this takeover')
@@ -287,12 +350,14 @@ claim
   .option('--ttl <seconds>', 'lease duration', integer)
   .action((paths: string[], options: { tree?: boolean; ttl?: number }, command: Command) => {
     runWithCoordinator(command, (coordinator) =>
-      coordinator.acquireClaims(
-        paths.map((claimedPath) => ({
-          path: claimedPath,
-          ...(options.tree ? { kind: 'tree' as const } : {}),
-        })),
-        options.ttl,
+      claimReceipts(
+        coordinator.acquireClaims(
+          paths.map((claimedPath) => ({
+            path: claimedPath,
+            ...(options.tree ? { kind: 'tree' as const } : {}),
+          })),
+          options.ttl,
+        ),
       ),
     );
   });
@@ -439,9 +504,18 @@ handoff
 
 handoff
   .command('accept <handoff-id>')
-  .action((handoffId: string, _options: unknown, command: Command) => {
-    runWithCoordinator(command, (coordinator) => coordinator.respondToHandoff(handoffId, true));
-  });
+  .requiredOption('--reason <text>', 'audit reason for the user-authorized scope transfer')
+  .requiredOption('--user-authorized', 'confirm that the user explicitly authorized this handoff')
+  .action(
+    (handoffId: string, options: { reason: string; userAuthorized: true }, command: Command) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.respondToHandoff(handoffId, true, {
+          reason: options.reason,
+          userAuthorized: options.userAuthorized,
+        }),
+      );
+    },
+  );
 
 handoff
   .command('reject <handoff-id>')
@@ -462,7 +536,7 @@ policy.command('ack <hash>').action((hash: string, _options: unknown, command: C
 program
   .command('events')
   .option('--after <sequence>', 'event cursor', integer, 0)
-  .option('--limit <number>', 'maximum events', integer, 100)
+  .option('--limit <number>', 'maximum events', integer, 25)
   .action((options: { after: number; limit: number }, command: Command) => {
     runWithCoordinator(command, (coordinator) => coordinator.events(options));
   });

@@ -65,11 +65,16 @@ describe('CLI', () => {
     repositories.push(repository);
 
     const result = await runCli(repository.root, 'cli-agent', ['status']);
-    const output = JSON.parse(result.stdout) as { agent: { name: string }; claims: unknown[] };
+    const output = JSON.parse(result.stdout) as {
+      agent: { name: string };
+      claims: unknown[];
+      git: { branch: string | null; commit: string | null; root: string };
+    };
 
     expect(result).toMatchObject({ code: 0, stderr: '' });
     expect(output.agent.name).toBe('cli-agent');
     expect(output.claims).toEqual([]);
+    expect(output.git).toMatchObject({ branch: 'main', commit: null, root: repository.root });
   });
 
   it('runs doctor without an agent or session registration', async () => {
@@ -117,6 +122,25 @@ describe('CLI', () => {
     expect(sessions).toEqual([{ status: 'closed' }]);
   });
 
+  it('rejects peer task assignment', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const peer = Coordinator.open({ cwd: repository.root, agent: 'peer' });
+    peer.close();
+
+    const result = await runCli(repository.root, 'author', [
+      'task',
+      'create',
+      '--title',
+      'Assign a peer',
+      '--assignee',
+      'peer',
+    ]);
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain('USER_AUTHORIZATION_REQUIRED');
+  });
+
   it('grants exactly one of two competing process claims', async () => {
     const repository = createTestRepository();
     repositories.push(repository);
@@ -129,6 +153,39 @@ describe('CLI', () => {
     expect(results.filter((result) => result.code === 0)).toHaveLength(1);
     const failure = results.find((result) => result.code !== 0);
     expect(failure?.stderr).toContain('CLAIM_CONFLICT');
+  });
+
+  it('opens a fresh database concurrently without leaking lock errors', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const results = await Promise.all(
+      Array.from({ length: 6 }, (_, index) =>
+        runCli(repository.root, `starter-${index}`, [
+          'claim',
+          'acquire',
+          `src/startup-${index}.ts`,
+        ]),
+      ),
+    );
+
+    for (const result of results) expect(result).toMatchObject({ code: 0, stderr: '' });
+    const database = new Database(resolveRepository(repository.root).databasePath, {
+      readonly: true,
+    });
+    expect(database.pragma('journal_mode', { simple: true })).toBe('wal');
+    database.close();
+  });
+
+  it('returns a compact claim acquisition receipt', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const result = await runCli(repository.root, 'claimant', ['claim', 'acquire', 'src/api.ts']);
+    const output = JSON.parse(result.stdout) as Array<Record<string, unknown>>;
+
+    expect(result).toMatchObject({ code: 0, stderr: '' });
+    expect(Object.keys(output[0] ?? {}).sort()).toEqual(['expiresAt', 'id', 'kind', 'path']);
   });
 
   it('forcibly takes over active work with explicit user authorization', async () => {
@@ -202,20 +259,25 @@ describe('CLI', () => {
     expect(error.error.code).toBe('INTERNAL_ERROR');
   });
 
-  it('emits watch events as JSON Lines', async () => {
+  it('keeps streaming session rows without lifecycle events', async () => {
     const repository = createTestRepository();
     repositories.push(repository);
 
     const result = await runCli(repository.root, 'cli-observer', ['watch', '--once', '--json']);
-    const events = result.stdout
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line) as { kind: string });
+    const database = new Database(resolveRepository(repository.root).databasePath, {
+      readonly: true,
+    });
+    const events = database
+      .prepare('SELECT kind FROM events WHERE actor = ? ORDER BY sequence')
+      .all('cli-observer');
+    const sessions = database
+      .prepare('SELECT status FROM sessions WHERE agent_name = ?')
+      .all('cli-observer');
+    database.close();
 
-    expect(result).toMatchObject({ code: 0, stderr: '' });
-    expect(events).toEqual(
-      expect.arrayContaining([expect.objectContaining({ kind: 'session.started' })]),
-    );
+    expect(result).toMatchObject({ code: 0, stderr: '', stdout: '' });
+    expect(events).toEqual([]);
+    expect(sessions).toEqual([{ status: 'closed' }]);
   });
 
   it('rejects conflicting watch cursors', async () => {
