@@ -33,8 +33,21 @@ describe('Git hooks', () => {
     execFileSync('git', ['add', 'shared.ts'], { cwd: repository.root });
     owner.acquireClaims([{ path: 'shared.ts' }]);
 
+    expect(
+      checkPreCommit(
+        committer.listClaims(),
+        committer.agentName,
+        repository.root,
+        'worktree_sibling',
+      ),
+    ).toEqual({ changedLines: 1, stagedFiles: ['shared.ts'] });
     expect(() =>
-      checkPreCommit(committer.listClaims(), committer.agentName, repository.root),
+      checkPreCommit(
+        committer.listClaims(),
+        committer.agentName,
+        repository.root,
+        committer.worktreeId,
+      ),
     ).toThrowError(expect.objectContaining({ code: 'HOOK_REFUSED' }));
   });
 

@@ -749,7 +749,12 @@ hooks.command('install').action((_options: unknown, command: Command) => {
 const hook = program.command('hook', { hidden: true });
 hook.command('pre-commit').action((_options: unknown, command: Command) => {
   runWithCoordinator(command, (coordinator) =>
-    checkPreCommit(coordinator.listClaims(), coordinator.agentName, coordinator.repository.root),
+    checkPreCommit(
+      coordinator.listClaims(),
+      coordinator.agentName,
+      coordinator.repository.root,
+      coordinator.worktreeId,
+    ),
   );
 });
 hook
