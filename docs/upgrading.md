@@ -34,7 +34,7 @@ Use the returned ID for every additional member:
 
 ```bash
 sametree --cwd /path/to/holo-server \
-  workspace add workspace_... --member holo-server --fresh
+  workspace add Product --member holo-server --fresh
 
 sametree --cwd /path/to/studio workspace status
 sametree --cwd /path/to/studio workspace members
@@ -46,6 +46,8 @@ Exactly one state mode is mandatory:
 
 - `--fresh` leaves the member's prior standalone tasks, agents, messages, claims, and history outside the workspace. Existing shared workspace state is unaffected.
 - `--import-current` copies current standalone state into the workspace, preserves entity IDs, remaps rows to the new member, and gives imported events new workspace-global sequences.
+
+Add and relink accept the exact workspace ID or a unique workspace name. Use the ID when names are duplicated. The command always joins its current `--cwd`; path-like workspace arguments are rejected with guidance. Create and add initialize missing `.sametree/` files, while `sametree setup` remains required for harness integration.
 
 Import aborts on agent-name, session, task, claim, message, handoff, event, repository, worktree, member-name, or path identity collisions. Combining independently active repositories often exposes agent-name collisions; resolve the plan before retrying rather than editing databases manually.
 
@@ -80,7 +82,7 @@ Exact stock 0.1.1 and 0.1.2 policy and coordination files are refreshed with wor
 
 `sametree workspace leave` retires the current member after its live sessions stop. It removes local bindings but preserves shared history and does not copy shared changes back to the standalone database.
 
-`sametree workspace prune` conservatively retires members whose recorded root or private Git identity is definitely stale. `sametree workspace relink <workspace-id> --member <name>` restores a moved worktree only when its original private and common Git identities still match. Use `git worktree move` when moving linked worktrees; a clone or replacement worktree cannot assume an old member identity.
+`sametree workspace prune` conservatively retires members whose recorded root or private Git identity is definitely stale. `sametree workspace relink <workspace-id-or-name> --member <name>` restores a moved worktree only when its original private and common Git identities still match. Use `git worktree move` when moving linked worktrees; a clone or replacement worktree cannot assume an old member identity.
 
 Unavailable members remain visible for historical task and claim filtering and make `workspace doctor` report a warning.
 

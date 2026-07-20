@@ -131,6 +131,15 @@ describe('generated state paths', () => {
     );
   });
 
+  it('explains how to create a missing SameTree configuration', () => {
+    const repository = createTestRepository({ initialize: false });
+    repositories.push(repository);
+
+    expect(() => Coordinator.open({ cwd: repository.root, agent: 'agent' })).toThrow(
+      /run 'sametree init' in this repository first/u,
+    );
+  });
+
   it('refuses symlink ancestors in explicit database paths', () => {
     const repository = createTestRepository();
     repositories.push(repository);

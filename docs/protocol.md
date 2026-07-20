@@ -11,12 +11,12 @@ Explicit workspace lifecycle is CLI/library-only:
 ```bash
 sametree workspace create <name> --member <name> (--fresh | --import-current)
 sametree workspace cancel-create
-sametree workspace add <workspace-id> --member <name> (--fresh | --import-current)
+sametree workspace add <workspace-id-or-name> --member <name> (--fresh | --import-current)
 sametree workspace status
 sametree workspace members
 sametree workspace leave
 sametree workspace prune
-sametree workspace relink <workspace-id> --member <existing-name>
+sametree workspace relink <workspace-id-or-name> --member <existing-name>
 sametree workspace doctor
 ```
 
@@ -26,7 +26,7 @@ If creation fails before a member is recorded, retrying the exact create command
 
 `leave` and `prune` mark members unavailable while preserving their tasks, claims, sessions, and events. Leave requires no live home-member session. Prune retires only members whose recorded Git identity is definitely stale. Relink restores a retired member only when its original private and common Git directories still match, as after `git worktree move`; it cannot attach a replacement clone.
 
-The lifecycle commands do not create agent sessions. SameTree does not create repositories, branches, or worktrees. A custom registry selected with `SAMETREE_WORKSPACE_REGISTRY` must be inherited by every CLI, MCP, adapter, and hook process.
+Create and add initialize missing `.sametree/` project files in the current member but do not configure harness integrations; run `sametree setup` separately where Claude Code or OpenCode will run. Other lifecycle commands do not create agent sessions. Workspace names cannot start with `.` or contain path separators. Add and relink accept an exact ID or unique workspace name; duplicate names require the ID, and path-like arguments are rejected because `--cwd` selects the joining worktree. SameTree does not create repositories, branches, or worktrees. A custom registry selected with `SAMETREE_WORKSPACE_REGISTRY` must be inherited by every CLI, MCP, adapter, and hook process.
 
 ## Identity and Sessions
 

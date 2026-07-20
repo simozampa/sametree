@@ -34,6 +34,7 @@ import {
   removeRegisteredWorkspace,
   resolveRepositoryWorkspaceBinding,
   resolveWorkspaceBinding,
+  validateWorkspaceName,
   type WorkspaceContext,
   type WorkspaceRegistryOptions,
   writePendingWorkspaceCreation,
@@ -1002,6 +1003,7 @@ export function createWorkspace(
   options: WorkspaceServiceOptions = {},
 ): WorkspaceJoinResult {
   assertJoinMode(input.mode);
+  const workspaceName = validateWorkspaceName(input.name);
   const repository = resolveRepository(cwd);
   const releaseWorktreeLock = acquireWorkspaceOperationLock(repository, 2_500);
   let releaseRegistryLock: (() => void) | undefined;
@@ -1027,7 +1029,7 @@ export function createWorkspace(
         2_500,
       );
       const workspace = readRegisteredWorkspace(existing.workspaceId, options);
-      if (workspace.name !== input.name) {
+      if (workspace.name !== workspaceName) {
         throw new SameTreeError(
           'WORKSPACE_ERROR',
           'Repository is already assigned to another workspace.',
@@ -1047,13 +1049,13 @@ export function createWorkspace(
       pendingCreation ??
       writePendingWorkspaceCreation(repository, {
         workspaceId: createId('workspace'),
-        workspaceName: input.name,
+        workspaceName,
         memberName: input.memberName,
         mode: input.mode,
         createdAt: options.now ?? Date.now(),
       });
     if (
-      pending.workspaceName !== input.name ||
+      pending.workspaceName !== workspaceName ||
       pending.memberName !== input.memberName ||
       pending.mode !== input.mode
     ) {

@@ -12,6 +12,7 @@ import { setupProject } from './setup.js';
 import type { Harness, PathClaim, TaskPriority, TaskStatus } from './types.js';
 import { VERSION } from './version.js';
 import { followMessages, watchEvents } from './watch.js';
+import { resolveRegisteredWorkspace, validateWorkspaceName } from './workspace.js';
 import {
   addWorkspaceMember,
   cancelWorkspaceCreation,
@@ -261,44 +262,53 @@ workspace
       command: Command,
     ) => {
       const globals = command.optsWithGlobals<GlobalOptions>();
-      print(
-        createWorkspace(
+      const mode = workspaceJoinMode(options);
+      const workspaceName = validateWorkspaceName(name);
+      const initialization = initializeProject(globals.cwd);
+      print({
+        ...createWorkspace(
           globals.cwd,
-          { name, memberName: options.member, mode: workspaceJoinMode(options) },
+          { name: workspaceName, memberName: options.member, mode },
           {
             ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
           },
         ),
-      );
+        initialization,
+      });
     },
   );
 
 workspace
-  .command('add <workspace-id>')
+  .command('add <workspace>')
   .description('Add this worktree to an existing local workspace.')
   .requiredOption('--member <name>', 'workspace member name')
   .option('--fresh', 'leave standalone state as a recoverable backup')
   .option('--import-current', 'import current standalone coordination state')
   .action(
     (
-      workspaceId: string,
+      workspaceReference: string,
       options: { fresh?: boolean; importCurrent?: boolean; member: string },
       command: Command,
     ) => {
       const globals = command.optsWithGlobals<GlobalOptions>();
-      print(
-        addWorkspaceMember(
+      const mode = workspaceJoinMode(options);
+      const registryOptions = {
+        ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+      };
+      const registered = resolveRegisteredWorkspace(workspaceReference, registryOptions);
+      const initialization = initializeProject(globals.cwd);
+      print({
+        ...addWorkspaceMember(
           globals.cwd,
           {
-            workspaceId,
+            workspaceId: registered.id,
             memberName: options.member,
-            mode: workspaceJoinMode(options),
+            mode,
           },
-          {
-            ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
-          },
+          registryOptions,
         ),
-      );
+        initialization,
+      });
     },
   );
 
@@ -351,15 +361,19 @@ workspace.command('prune').action((_options: unknown, command: Command) => {
 });
 
 workspace
-  .command('relink <workspace-id>')
+  .command('relink <workspace>')
   .requiredOption('--member <name>', 'existing workspace member name')
-  .action((workspaceId: string, options: { member: string }, command: Command) => {
+  .action((workspaceReference: string, options: { member: string }, command: Command) => {
     const globals = command.optsWithGlobals<GlobalOptions>();
+    const registryOptions = {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    };
+    const registered = resolveRegisteredWorkspace(workspaceReference, registryOptions);
     print(
       relinkWorkspace(
         globals.cwd,
-        { workspaceId, memberName: options.member },
-        { ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}) },
+        { workspaceId: registered.id, memberName: options.member },
+        registryOptions,
       ),
     );
   });

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
@@ -145,6 +146,89 @@ describe('CLI', () => {
       ok: true,
       databasePath: expect.stringContaining(result.workspace.id),
     });
+  });
+
+  it('initializes members, resolves workspace names, and explains path-like references', async () => {
+    const studio = createTestRepository({ initialize: false });
+    const server = createTestRepository({ initialize: false });
+    const invalid = createTestRepository({ initialize: false });
+    const invalidName = createTestRepository({ initialize: false });
+    repositories.push(studio, server, invalid, invalidName);
+    const registry = path.join(studio.root, '.workspace-registry');
+
+    const created = await runCli(studio.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'create',
+      'Product',
+      '--member',
+      'studio',
+      '--fresh',
+    ]);
+    const added = await runCli(server.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'add',
+      'Product',
+      '--member',
+      'holo-server',
+      '--fresh',
+    ]);
+    const pathLike = await runCli(invalid.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'add',
+      '../holo-server',
+      '--member',
+      'invalid',
+      '--fresh',
+    ]);
+    const pathLikeName = await runCli(invalidName.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'create',
+      '.Product',
+      '--member',
+      'invalid-name',
+      '--fresh',
+    ]);
+
+    expect(created).toMatchObject({ code: 0, stderr: '' });
+    expect(added).toMatchObject({ code: 0, stderr: '' });
+    expect(JSON.parse(added.stdout)).toMatchObject({
+      workspace: { name: 'Product' },
+      member: { name: 'holo-server' },
+      initialization: { created: expect.arrayContaining(['.sametree/config.json']) },
+    });
+    expect(existsSync(path.join(studio.root, '.sametree', 'config.json'))).toBe(true);
+    expect(existsSync(path.join(server.root, '.sametree', 'config.json'))).toBe(true);
+    expect(pathLike.code).toBe(1);
+    expect(JSON.parse(pathLike.stderr)).toMatchObject({
+      error: {
+        code: 'INVALID_INPUT',
+        message: expect.stringContaining('looks like a path'),
+      },
+    });
+    expect(existsSync(path.join(invalid.root, '.sametree', 'config.json'))).toBe(false);
+    expect(pathLikeName.code).toBe(1);
+    expect(JSON.parse(pathLikeName.stderr)).toMatchObject({
+      error: { code: 'INVALID_INPUT', message: expect.stringContaining('cannot start') },
+    });
+    expect(existsSync(path.join(invalidName.root, '.sametree', 'config.json'))).toBe(false);
+
+    const coordinator = Coordinator.open({
+      cwd: server.root,
+      agent: 'server-agent',
+      workspaceRegistryRoot: registry,
+    });
+    expect(coordinator.acquireClaims([{ member: 'studio', path: 'src/shared.ts' }])).toHaveLength(
+      1,
+    );
+    coordinator.close();
   });
 
   it('requires an explicit workspace state mode', async () => {

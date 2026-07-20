@@ -347,6 +347,51 @@ export function listRegisteredWorkspaces(
     .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
 }
 
+export function resolveRegisteredWorkspace(
+  reference: string,
+  options: WorkspaceRegistryOptions = {},
+): RegisteredWorkspace {
+  const value = reference.trim();
+  if (!value) throw new SameTreeError('INVALID_INPUT', 'Workspace ID or name is required.');
+  if (identifierSchema.safeParse(value).success) {
+    const byId = findRegisteredWorkspace(value, options);
+    if (byId) return byId;
+  }
+  if (value.startsWith('.') || /[\\/]/u.test(value)) {
+    throw new SameTreeError(
+      'INVALID_INPUT',
+      "That looks like a path; pass the workspace ID or name. Run 'sametree workspace status' in a bound repository to find it.",
+      { reference },
+    );
+  }
+  const workspaces = listRegisteredWorkspaces(options);
+  const byName = workspaces.filter((workspace) => workspace.name === value);
+  if (byName.length === 1) return byName[0] as RegisteredWorkspace;
+  if (byName.length > 1) {
+    throw new SameTreeError(
+      'INVALID_INPUT',
+      `Workspace name '${value}' is ambiguous; pass a workspace ID instead.`,
+      { workspaceIds: byName.map((workspace) => workspace.id) },
+    );
+  }
+  throw new SameTreeError('NOT_FOUND', `Workspace '${value}' is not registered.`);
+}
+
+export function validateWorkspaceName(name: string): string {
+  const value = name.trim();
+  if (!value || value.length > 100) {
+    throw new SameTreeError('INVALID_INPUT', 'Workspace name must contain 1 to 100 characters.');
+  }
+  if (value.startsWith('.') || /[\\/]/u.test(value)) {
+    throw new SameTreeError(
+      'INVALID_INPUT',
+      "Workspace names cannot start with '.' or contain path separators.",
+      { name },
+    );
+  }
+  return value;
+}
+
 export function bindWorktree(
   repository: RepositoryContext,
   input: BindWorktreeInput,

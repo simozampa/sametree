@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -10,6 +10,7 @@ import {
   bindWorktree,
   readRegisteredWorkspace,
   registerWorkspace,
+  resolveRegisteredWorkspace,
   resolveWorkspaceBinding,
 } from '../src/workspace.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
@@ -52,6 +53,26 @@ afterEach(() => {
 });
 
 describe('workspace registry', () => {
+  it('resolves IDs and unique names without treating paths as workspace references', () => {
+    const registryRoot = path.join(temporaryDirectory('sametree-registry-parent-'), 'workspaces');
+    const first = registerWorkspace(
+      { id: 'workspace_first', name: 'Product', createdAt: 1 },
+      { registryRoot },
+    );
+    const second = registerWorkspace(
+      { id: 'workspace_second', name: 'Product', createdAt: 2 },
+      { registryRoot },
+    );
+
+    expect(resolveRegisteredWorkspace(first.id, { registryRoot })).toEqual(first);
+    expect(() => resolveRegisteredWorkspace('Product', { registryRoot })).toThrow(/ambiguous/u);
+    expect(() => resolveRegisteredWorkspace('../product', { registryRoot })).toThrow(
+      /looks like a path/u,
+    );
+    writeFileSync(path.join(second.directory, 'workspace.json'), '{ invalid');
+    expect(resolveRegisteredWorkspace(first.id, { registryRoot })).toEqual(first);
+  });
+
   it('does not create registry state for an unbound legacy repository', () => {
     const repository = createTestRepository();
     repositories.push(repository);

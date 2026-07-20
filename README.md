@@ -65,20 +65,20 @@ When upgrading, stop every active agent first, back up coordination databases, i
 
 ## Multi-Repository Workspace
 
-Standalone mode needs no extra setup. To share coordination across repositories or linked worktrees, create an explicit workspace from its first member and add each other member by using the returned workspace ID:
+Standalone mode needs no extra setup. To share coordination across repositories or linked worktrees, create an explicit workspace from its first member and add each other member using its unique workspace name or returned ID. Create and add initialize missing `.sametree/` project files automatically; run `sametree setup` separately in every member that needs Claude Code or OpenCode integration.
 
 ```bash
 cd /path/to/studio
 sametree workspace create "Product" --member studio --import-current
 
 cd /path/to/holo-server
-sametree workspace add workspace_... --member holo-server --fresh
+sametree workspace add Product --member holo-server --fresh
 
 sametree workspace status
 sametree workspace doctor
 ```
 
-Exactly one of `--fresh` or `--import-current` is required. Fresh mode leaves existing standalone history outside the workspace. Import mode copies current standalone coordination into the shared database while preserving the source as a recoverable snapshot; ID or agent-name collisions abort the import.
+Exactly one of `--fresh` or `--import-current` is required. Fresh mode leaves existing standalone history outside the workspace. Import mode copies current standalone coordination into the shared database while preserving the source as a recoverable snapshot; ID or agent-name collisions abort the import. Workspace names cannot start with `.` or contain path separators, and duplicate names require the ID. `workspace add` targets the current `--cwd`; a path argument is rejected with guidance rather than interpreted as another worktree.
 
 The default registry is `$XDG_DATA_HOME/sametree/workspaces`, falling back to `~/.local/share/sametree/workspaces`. To use another local path, export `SAMETREE_WORKSPACE_REGISTRY` before starting every CLI, harness, monitor, plugin, and hook process. All members must be locally accessible on one machine. SameTree coordinates state; it does not create worktrees, copy files, merge branches, or synchronize checkouts.
 
