@@ -325,6 +325,8 @@ function copyStandaloneState(
         'id',
         'agent_name',
         'home_worktree_id',
+        'started_head_descriptor',
+        'started_branch',
         'process_id',
         'started_at',
         'last_heartbeat_at',

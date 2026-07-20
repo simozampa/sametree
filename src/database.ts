@@ -98,6 +98,7 @@ const WORKSPACE_SCHEMA = `
     root TEXT NOT NULL UNIQUE,
     private_git_directory TEXT NOT NULL UNIQUE,
     head_descriptor TEXT NOT NULL,
+    branch TEXT,
     available INTEGER NOT NULL CHECK(available IN (0, 1)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -372,17 +373,17 @@ function insertMember(
     database
       .prepare(
         `UPDATE worktrees SET
-           root = ?, head_descriptor = ?, available = 1, updated_at = ?
+           root = ?, available = 1, updated_at = ?
          WHERE id = ?`,
       )
-      .run(repository.root, repository.head.descriptor, now, member.worktreeId);
+      .run(repository.root, now, member.worktreeId);
   } else {
     database
       .prepare(
         `INSERT INTO worktrees
-          (id, repository_id, name, root, private_git_directory, head_descriptor,
+          (id, repository_id, name, root, private_git_directory, head_descriptor, branch,
            available, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
       )
       .run(
         member.worktreeId,
@@ -391,6 +392,7 @@ function insertMember(
         repository.root,
         repository.privateGitDirectory,
         repository.head.descriptor,
+        repository.head.branch,
         now,
         now,
       );
@@ -408,6 +410,17 @@ function migrateWorkspaceSchema(
   if (!tableHasColumn(database, 'repositories', 'ignore_case')) {
     database.exec(
       'ALTER TABLE repositories ADD COLUMN ignore_case INTEGER NOT NULL DEFAULT 0 CHECK(ignore_case IN (0, 1))',
+    );
+  }
+  if (!tableHasColumn(database, 'worktrees', 'branch')) {
+    database.exec('ALTER TABLE worktrees ADD COLUMN branch TEXT');
+    database.exec(
+      `UPDATE worktrees SET branch =
+         CASE
+           WHEN head_descriptor LIKE 'ref: refs/heads/%'
+           THEN substr(head_descriptor, length('ref: refs/heads/') + 1)
+           ELSE NULL
+         END`,
     );
   }
 
@@ -483,6 +496,22 @@ function migrateWorkspaceSchema(
       'ALTER TABLE sessions ADD COLUMN home_worktree_id TEXT REFERENCES worktrees(id) ON DELETE RESTRICT',
     );
     database.prepare('UPDATE sessions SET home_worktree_id = ?').run(member.worktreeId);
+  }
+  if (!tableHasColumn(database, 'sessions', 'started_head_descriptor')) {
+    database.exec('ALTER TABLE sessions ADD COLUMN started_head_descriptor TEXT');
+    database.exec(
+      `UPDATE sessions SET started_head_descriptor = (
+         SELECT head_descriptor FROM worktrees WHERE id = sessions.home_worktree_id
+       )`,
+    );
+  }
+  if (!tableHasColumn(database, 'sessions', 'started_branch')) {
+    database.exec('ALTER TABLE sessions ADD COLUMN started_branch TEXT');
+    database.exec(
+      `UPDATE sessions SET started_branch = (
+         SELECT branch FROM worktrees WHERE id = sessions.home_worktree_id
+       )`,
+    );
   }
   if (!tableHasColumn(database, 'path_claims', 'worktree_id')) {
     database.exec(

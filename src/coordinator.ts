@@ -8,7 +8,12 @@ import { loadConfig, POLICY_FILE, type SameTreeConfig } from './config.js';
 import { databaseWorktreeId, immediateTransaction, openDatabase } from './database.js';
 import { inspectDatabase } from './doctor.js';
 import { SameTreeError } from './errors.js';
-import { type RepositoryContext, readGitWorktreeContext, resolveRepository } from './git.js';
+import {
+  type RepositoryContext,
+  readGitHeadContext,
+  readGitWorktreeContext,
+  resolveRepository,
+} from './git.js';
 import { claimsOverlap, normalizeClaim } from './paths.js';
 import type {
   Agent,
@@ -16,6 +21,7 @@ import type {
   CoordinationEvent,
   CoordinationMember,
   CoordinationSnapshot,
+  CoordinationWarning,
   CoordinationWorkspace,
   DoctorReport,
   Handoff,
@@ -170,6 +176,10 @@ function mapSession(row: Row): Session {
     agentName: stringValue(row, 'agent_name'),
     homeWorktreeId: stringValue(row, 'home_worktree_id'),
     homeMember: stringValue(row, 'worktree_name'),
+    startedHeadDescriptor: stringValue(row, 'started_head_descriptor'),
+    startedBranch: nullableString(row, 'started_branch'),
+    currentBranch: nullableString(row, 'current_branch'),
+    branchChanged: nullableString(row, 'started_branch') !== nullableString(row, 'current_branch'),
     processId: numberValue(row, 'process_id'),
     startedAt: numberValue(row, 'started_at'),
     lastHeartbeatAt: numberValue(row, 'last_heartbeat_at'),
@@ -195,7 +205,7 @@ function mapTask(row: Row, dependencies: string[], members: string[]): Task {
   };
 }
 
-function mapClaim(row: Row): PathClaim {
+function mapClaim(row: Row, warnings: CoordinationWarning[] = []): PathClaim {
   return {
     id: stringValue(row, 'id'),
     worktreeId: stringValue(row, 'worktree_id'),
@@ -206,6 +216,7 @@ function mapClaim(row: Row): PathClaim {
     agentName: stringValue(row, 'agent_name'),
     expiresAt: numberValue(row, 'expires_at'),
     createdAt: numberValue(row, 'created_at'),
+    warnings,
   };
 }
 
@@ -325,19 +336,22 @@ export class Coordinator {
           this.#database
             .prepare(
               `INSERT INTO sessions
-                (id, agent_name, home_worktree_id, process_id, started_at,
-                 last_heartbeat_at, expires_at, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
+                (id, agent_name, home_worktree_id, started_head_descriptor, started_branch,
+                 process_id, started_at, last_heartbeat_at, expires_at, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
             )
             .run(
               this.sessionId,
               this.agentName,
               this.worktreeId,
+              this.repository.head.descriptor,
+              this.repository.head.branch,
               process.pid,
               now,
               now,
               now + this.config.sessionTtlSeconds * 1_000,
             );
+          this.#refreshWorktreeHead(now);
           if (this.#recordSessionLifecycleEvents) {
             this.#recordEvent('session.started', 'session', this.sessionId, {
               harness: options.harness ?? 'other',
@@ -390,6 +404,62 @@ export class Coordinator {
       );
   }
 
+  #refreshWorktreeHead(
+    now = this.#clock(),
+    worktreeId = this.worktreeId,
+    privateGitDirectory = this.repository.privateGitDirectory,
+  ): void {
+    const head = readGitHeadContext(privateGitDirectory);
+    const stored = this.#database
+      .prepare('SELECT name, head_descriptor, branch FROM worktrees WHERE id = ?')
+      .get(worktreeId) as Row;
+    const previousDescriptor = stringValue(stored, 'head_descriptor');
+    const previousBranch = nullableString(stored, 'branch');
+    if (previousDescriptor === head.descriptor && previousBranch === head.branch) return;
+
+    this.#database
+      .prepare(
+        `UPDATE worktrees SET head_descriptor = ?, branch = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(head.descriptor, head.branch, now, worktreeId);
+    if (previousBranch !== head.branch) {
+      this.#recordEvent(
+        'worktree.branch_changed',
+        'worktree',
+        worktreeId,
+        {
+          member: stringValue(stored, 'name'),
+          previousBranch,
+          branch: head.branch,
+          previousHeadDescriptor: previousDescriptor,
+          headDescriptor: head.descriptor,
+        },
+        worktreeId,
+      );
+    }
+  }
+
+  #refreshWorkspaceHeads(now = this.#clock()): void {
+    const worktrees = this.#database
+      .prepare(
+        `SELECT id, private_git_directory FROM worktrees
+         WHERE available = 1 ORDER BY id`,
+      )
+      .all() as Row[];
+    for (const worktree of worktrees) {
+      try {
+        this.#refreshWorktreeHead(
+          now,
+          stringValue(worktree, 'id'),
+          stringValue(worktree, 'private_git_directory'),
+        );
+      } catch (error) {
+        if (!(error instanceof SameTreeError) || error.code !== 'GIT_STATUS_ERROR') throw error;
+      }
+    }
+  }
+
   #requireAgent(name: string): void {
     const found = this.#database.prepare('SELECT 1 FROM agents WHERE name = ?').get(name);
     if (!found) throw new SameTreeError('NOT_FOUND', `Agent '${name}' is not registered.`);
@@ -399,6 +469,7 @@ export class Coordinator {
     id: string;
     ignoreCase: boolean;
     name: string;
+    repositoryId: string;
     root: string;
   } {
     const requestedMember = member === undefined ? undefined : requireText(member, 'Member', 100);
@@ -406,7 +477,7 @@ export class Coordinator {
       ? (this.#database
           .prepare(
             `SELECT worktree.id, worktree.name, worktree.root, worktree.available,
-                    worktree.private_git_directory
+                    worktree.private_git_directory, worktree.repository_id
              FROM worktrees worktree
              WHERE worktree.name = ?`,
           )
@@ -414,7 +485,7 @@ export class Coordinator {
       : (this.#database
           .prepare(
             `SELECT worktree.id, worktree.name, worktree.root, worktree.available,
-                    worktree.private_git_directory
+                    worktree.private_git_directory, worktree.repository_id
              FROM worktrees worktree
              WHERE worktree.id = ?`,
           )
@@ -443,9 +514,40 @@ export class Coordinator {
     return {
       id,
       name: stringValue(row, 'name'),
+      repositoryId: stringValue(row, 'repository_id'),
       root,
       ignoreCase: targetRepository.ignoreCase,
     };
+  }
+
+  #linkedClaimWarnings(
+    claim: {
+      comparisonPath: string;
+      kind: ClaimKind;
+      member: string;
+      repositoryId: string;
+      worktreeId: string;
+    },
+    active: Row[],
+  ): CoordinationWarning[] {
+    return active
+      .filter(
+        (row) =>
+          stringValue(row, 'repository_id') === claim.repositoryId &&
+          stringValue(row, 'worktree_id') !== claim.worktreeId &&
+          claimsOverlap(claim, {
+            comparisonPath: stringValue(row, 'comparison_path'),
+            kind: stringValue(row, 'kind') as ClaimKind,
+          }),
+      )
+      .map((row) => ({
+        code: 'LINKED_WORKTREE_OVERLAP' as const,
+        message: `${claim.member}:${claim.comparisonPath} may conflict when integrated with ${stringValue(row, 'worktree_name')}:${stringValue(row, 'path')}.`,
+        member: claim.member,
+        worktreeId: claim.worktreeId,
+        conflictingClaimId: stringValue(row, 'id'),
+        conflictingMember: stringValue(row, 'worktree_name'),
+      }));
   }
 
   #dependencies(taskId: string): string[] {
@@ -679,6 +781,7 @@ export class Coordinator {
       if (renewed === 0) {
         throw new SameTreeError('TASK_UNAVAILABLE', 'This session expired and cannot be renewed.');
       }
+      this.#refreshWorktreeHead(now);
       this.#database
         .prepare('UPDATE agents SET last_seen_at = ? WHERE name = ?')
         .run(now, this.agentName);
@@ -694,7 +797,7 @@ export class Coordinator {
 
       const row = this.#database
         .prepare(
-          `SELECT session.*, worktree.name AS worktree_name
+          `SELECT session.*, worktree.name AS worktree_name, worktree.branch AS current_branch
            FROM sessions session
            JOIN worktrees worktree ON worktree.id = session.home_worktree_id
            WHERE session.id = ?`,
@@ -1102,6 +1205,7 @@ export class Coordinator {
         ),
         worktreeId: worktree.id,
         member: worktree.name,
+        repositoryId: worktree.repositoryId,
       };
     });
     const unique = requested.filter(
@@ -1120,7 +1224,7 @@ export class Coordinator {
       this.#database.prepare('DELETE FROM path_claims WHERE expires_at <= ?').run(now);
       const active = this.#database
         .prepare(
-          `SELECT claim.*, worktree.name AS worktree_name
+          `SELECT claim.*, worktree.name AS worktree_name, worktree.repository_id
            FROM path_claims claim
            JOIN worktrees worktree ON worktree.id = claim.worktree_id
            WHERE claim.expires_at > ?`,
@@ -1160,7 +1264,22 @@ export class Coordinator {
           this.#database
             .prepare('UPDATE path_claims SET session_id = ?, expires_at = ? WHERE id = ?')
             .run(this.sessionId, expiresAt, stringValue(own, 'id'));
-          results.push({ ...mapClaim(own), expiresAt });
+          results.push({
+            ...mapClaim(
+              own,
+              this.#linkedClaimWarnings(
+                {
+                  comparisonPath: claim.comparisonPath,
+                  kind: claim.kind,
+                  member: claim.member,
+                  repositoryId: claim.repositoryId,
+                  worktreeId: claim.worktreeId,
+                },
+                active,
+              ),
+            ),
+            expiresAt,
+          });
           continue;
         }
 
@@ -1193,11 +1312,35 @@ export class Coordinator {
           agentName: this.agentName,
           expiresAt,
           createdAt: now,
+          warnings: this.#linkedClaimWarnings(claim, active),
         });
+        active.push({
+          id,
+          path: claim.path,
+          comparison_path: claim.comparisonPath,
+          kind: claim.kind,
+          agent_name: this.agentName,
+          session_id: this.sessionId,
+          expires_at: expiresAt,
+          created_at: now,
+          worktree_id: claim.worktreeId,
+          worktree_name: claim.member,
+          repository_id: claim.repositoryId,
+        });
+      }
+      for (const result of results) {
+        const claim = unique.find(
+          (candidate) =>
+            candidate.worktreeId === result.worktreeId &&
+            candidate.comparisonPath === result.comparisonPath &&
+            candidate.kind === result.kind,
+        );
+        if (claim) result.warnings = this.#linkedClaimWarnings(claim, active);
       }
       this.#recordEvent('claim.acquired', 'claim', results.map((claim) => claim.id).join(','), {
         paths: results.map((claim) => ({ member: claim.member, path: claim.path })),
         expiresAt,
+        warnings: results.flatMap((claim) => claim.warnings),
       });
       return results;
     });
@@ -1207,7 +1350,7 @@ export class Coordinator {
     const rows = options.includeExpired
       ? (this.#database
           .prepare(
-            `SELECT claim.*, worktree.name AS worktree_name
+            `SELECT claim.*, worktree.name AS worktree_name, worktree.repository_id
              FROM path_claims claim
              JOIN worktrees worktree ON worktree.id = claim.worktree_id
              ORDER BY worktree.name, claim.path, claim.created_at`,
@@ -1215,14 +1358,28 @@ export class Coordinator {
           .all() as Row[])
       : (this.#database
           .prepare(
-            `SELECT claim.*, worktree.name AS worktree_name
+            `SELECT claim.*, worktree.name AS worktree_name, worktree.repository_id
              FROM path_claims claim
              JOIN worktrees worktree ON worktree.id = claim.worktree_id
              WHERE claim.expires_at > ?
              ORDER BY worktree.name, claim.path, claim.created_at`,
           )
           .all(this.#clock()) as Row[]);
-    return rows.map(mapClaim);
+    return rows.map((row) =>
+      mapClaim(
+        row,
+        this.#linkedClaimWarnings(
+          {
+            comparisonPath: stringValue(row, 'comparison_path'),
+            kind: stringValue(row, 'kind') as ClaimKind,
+            member: stringValue(row, 'worktree_name'),
+            repositoryId: stringValue(row, 'repository_id'),
+            worktreeId: stringValue(row, 'worktree_id'),
+          },
+          rows,
+        ),
+      ),
+    );
   }
 
   releaseClaims(input: { ids?: string[]; all?: boolean } = {}): { released: number } {
@@ -1730,6 +1887,7 @@ export class Coordinator {
   }
 
   snapshot(options: SnapshotOptions = {}): CoordinationSnapshot {
+    immediateTransaction(this.#database, () => this.#refreshWorkspaceHeads());
     const git = readGitWorktreeContext(this.repository.root, this.repository.privateGitDirectory);
     return this.#database.transaction(() => {
       const workspaceStatus = this.#workspaceStatus();
@@ -1747,12 +1905,31 @@ export class Coordinator {
         .get(this.agentName);
       const sessionRow = this.#database
         .prepare(
-          `SELECT session.*, worktree.name AS worktree_name
+          `SELECT session.*, worktree.name AS worktree_name, worktree.branch AS current_branch
            FROM sessions session
            JOIN worktrees worktree ON worktree.id = session.home_worktree_id
            WHERE session.id = ?`,
         )
         .get(this.sessionId);
+      const sessionRows = this.#database
+        .prepare(
+          `SELECT session.*, worktree.name AS worktree_name, worktree.branch AS current_branch
+           FROM sessions session
+           JOIN worktrees worktree ON worktree.id = session.home_worktree_id
+           WHERE session.status = 'active' AND session.expires_at > ?
+           ORDER BY session.started_at, session.id`,
+        )
+        .all(this.#clock()) as Row[];
+      const sessions = sessionRows.map(mapSession);
+      const branchWarnings: CoordinationWarning[] = sessions
+        .filter((session) => session.branchChanged)
+        .map((session) => ({
+          code: 'BRANCH_CHANGED',
+          message: `${session.agentName} started on ${session.startedBranch ?? 'detached HEAD'} while ${session.homeMember} is now on ${session.currentBranch ?? 'detached HEAD'}.`,
+          member: session.homeMember,
+          worktreeId: session.homeWorktreeId,
+          sessionId: session.id,
+        }));
       const unread = this.#database
         .prepare(
           `SELECT COUNT(*) AS count
@@ -1777,20 +1954,24 @@ export class Coordinator {
       const lastEvent = this.#database
         .prepare('SELECT MAX(sequence) AS sequence FROM events')
         .get() as Row;
+      const claims = this.listClaims();
+      const claimWarnings = claims.flatMap((claim) => claim.warnings);
 
       return {
         ...workspaceStatus,
         git,
         agent: mapAgent(agentRow as Row, this.#activeMembers(this.agentName, this.#clock())),
         session: mapSession(sessionRow as Row),
+        sessions,
         agents: this.listAgents({ activeOnly: !options.includeInactiveAgents }),
         tasks: taskRows.map((row) => {
           const id = stringValue(row, 'id');
           return mapTask(row, this.#dependencies(id), this.#taskMembers(id));
         }),
-        claims: this.listClaims(),
+        claims,
         unreadMessages: numberValue(unread, 'count'),
         pendingHandoffs: numberValue(handoffs, 'count'),
+        warnings: [...branchWarnings, ...claimWarnings],
         lastEventSequence: nullableNumber(lastEvent, 'sequence') ?? 0,
       };
     })();

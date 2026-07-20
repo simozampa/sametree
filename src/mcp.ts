@@ -53,12 +53,13 @@ function result(value: unknown) {
 }
 
 function claimReceipts(claims: PathClaim[]) {
-  return claims.map(({ id, member, path, kind, expiresAt }) => ({
+  return claims.map(({ id, member, path, kind, expiresAt, warnings }) => ({
     id,
     member,
     path,
     kind,
     expiresAt,
+    warnings,
   }));
 }
 

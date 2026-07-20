@@ -253,6 +253,7 @@ describe('CLI', () => {
       'kind',
       'member',
       'path',
+      'warnings',
     ]);
     expect(output[0]?.member).toBe(member);
   });

@@ -18,6 +18,10 @@ export interface Session {
   agentName: string;
   homeWorktreeId: string;
   homeMember: string;
+  startedHeadDescriptor: string;
+  startedBranch: string | null;
+  currentBranch: string | null;
+  branchChanged: boolean;
   processId: number;
   startedAt: number;
   lastHeartbeatAt: number;
@@ -50,6 +54,17 @@ export interface PathClaim {
   agentName: string;
   expiresAt: number;
   createdAt: number;
+  warnings: CoordinationWarning[];
+}
+
+export interface CoordinationWarning {
+  code: 'BRANCH_CHANGED' | 'LINKED_WORKTREE_OVERLAP';
+  message: string;
+  member: string;
+  worktreeId: string;
+  sessionId?: string;
+  conflictingClaimId?: string;
+  conflictingMember?: string;
 }
 
 export interface Message {
@@ -138,11 +153,13 @@ export interface CoordinationSnapshot {
   git: GitWorktreeContext;
   agent: Agent;
   session: Session;
+  sessions: Session[];
   agents: Agent[];
   tasks: Task[];
   claims: PathClaim[];
   unreadMessages: number;
   pendingHandoffs: number;
+  warnings: CoordinationWarning[];
   lastEventSequence: number;
 }
 

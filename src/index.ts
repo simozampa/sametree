@@ -33,6 +33,7 @@ export type {
   CoordinationEvent,
   CoordinationMember,
   CoordinationSnapshot,
+  CoordinationWarning,
   CoordinationWorkspace,
   DoctorReport,
   GitWorktreeContext,

@@ -195,4 +195,83 @@ describe('Git worktree context', () => {
     writeFileSync(`${repository.root}/untracked.txt`, 'change\n');
     expect(coordinator.snapshot().git).toMatchObject({ branch: 'main', dirty: true });
   });
+
+  it('records branch switches without disturbing active leases or normal commits', () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    git(repository.root, ['add', '.']);
+    git(repository.root, [
+      '-c',
+      'user.name=SameTree Test',
+      '-c',
+      'user.email=sametree@example.com',
+      'commit',
+      '-m',
+      'test: initialize repository',
+    ]);
+    let now = 1_000;
+    const coordinator = Coordinator.open({
+      cwd: repository.root,
+      agent: 'branch-observer',
+      clock: () => now,
+    });
+    coordinators.push(coordinator);
+    const task = coordinator.claimTask(coordinator.createTask({ title: 'Stay active' }).id);
+    const claim = coordinator.acquireClaims([{ path: 'src/active.ts' }])[0];
+
+    git(repository.root, ['checkout', '-b', 'feature']);
+    now = 2_000;
+    const switched = coordinator.snapshot();
+    expect(switched.session).toMatchObject({
+      startedBranch: 'main',
+      currentBranch: 'feature',
+      branchChanged: true,
+    });
+    expect(switched.warnings).toContainEqual(
+      expect.objectContaining({ code: 'BRANCH_CHANGED', member: path.basename(repository.root) }),
+    );
+    coordinator.heartbeat();
+    expect(coordinator.listTasks().find((item) => item.id === task.id)?.leaseExpiresAt).toBe(
+      902_000,
+    );
+    expect(coordinator.listClaims().find((item) => item.id === claim?.id)?.expiresAt).toBe(902_000);
+    expect(
+      coordinator
+        .events({ limit: 100 })
+        .filter((event) => event.kind === 'worktree.branch_changed'),
+    ).toHaveLength(1);
+
+    writeFileSync(`${repository.root}/feature.txt`, 'feature\n');
+    git(repository.root, ['add', 'feature.txt']);
+    git(repository.root, [
+      '-c',
+      'user.name=SameTree Test',
+      '-c',
+      'user.email=sametree@example.com',
+      'commit',
+      '-m',
+      'test: feature commit',
+    ]);
+    now = 3_000;
+    coordinator.heartbeat();
+    expect(
+      coordinator
+        .events({ limit: 100 })
+        .filter((event) => event.kind === 'worktree.branch_changed'),
+    ).toHaveLength(1);
+
+    git(repository.root, ['checkout', '--detach']);
+    now = 4_000;
+    coordinator.heartbeat();
+    expect(coordinator.snapshot().session).toMatchObject({
+      startedBranch: 'main',
+      currentBranch: null,
+      branchChanged: true,
+    });
+    expect(
+      coordinator
+        .events({ limit: 100 })
+        .filter((event) => event.kind === 'worktree.branch_changed'),
+    ).toHaveLength(2);
+  });
 });

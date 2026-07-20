@@ -40,6 +40,14 @@ function registryRoot(): string {
   return path.join(directory, 'workspaces');
 }
 
+function git(root: string, args: string[]): string {
+  return execFileSync('git', args, {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim();
+}
+
 function open(root: string, agent: string, workspaceRegistryRoot?: string): Coordinator {
   const coordinator = Coordinator.open({
     cwd: root,
@@ -286,6 +294,83 @@ describe('workspace operations', () => {
         .filter((claim) => claim.agentName === 'studio-agent')
         .map((claim) => claim.expiresAt),
     ).toEqual([902_000, 902_000, 902_000]);
+  });
+
+  it('warns instead of blocking matching claims in linked worktrees', () => {
+    const main = repository();
+    const registry = registryRoot();
+    git(main.root, ['add', '.']);
+    git(main.root, [
+      '-c',
+      'user.name=SameTree Test',
+      '-c',
+      'user.email=sametree@example.com',
+      'commit',
+      '-m',
+      'test: initialize repository',
+    ]);
+    const workspace = createWorkspace(
+      main.root,
+      { name: 'Product', memberName: 'main', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const linkedRoot = `${main.root}-linked`;
+    let mainAgent: Coordinator | undefined;
+    let linkedAgent: Coordinator | undefined;
+    try {
+      git(main.root, ['worktree', 'add', '-b', 'feature', linkedRoot]);
+      const linked = addWorkspaceMember(
+        linkedRoot,
+        { workspaceId: workspace.workspace.id, memberName: 'feature', mode: 'fresh' },
+        { registryRoot: registry },
+      );
+      expect(linked.member.repositoryId).toBe(workspace.member.repositoryId);
+      mainAgent = open(main.root, 'main-agent', registry);
+      linkedAgent = open(linkedRoot, 'feature-agent', registry);
+
+      git(linkedRoot, ['checkout', '-b', 'feature-2']);
+      const remoteBranch = mainAgent.snapshot();
+      expect(remoteBranch.sessions).toContainEqual(
+        expect.objectContaining({
+          agentName: 'feature-agent',
+          startedBranch: 'feature',
+          currentBranch: 'feature-2',
+          branchChanged: true,
+        }),
+      );
+      expect(remoteBranch.warnings).toContainEqual(
+        expect.objectContaining({ code: 'BRANCH_CHANGED', member: 'feature' }),
+      );
+
+      mainAgent.acquireClaims([{ member: 'main', path: 'src/shared.ts' }]);
+      const linkedClaim = linkedAgent.acquireClaims([
+        { member: 'feature', path: 'src/shared.ts' },
+      ])[0];
+      expect(linkedClaim?.warnings).toContainEqual(
+        expect.objectContaining({
+          code: 'LINKED_WORKTREE_OVERLAP',
+          member: 'feature',
+          conflictingMember: 'main',
+        }),
+      );
+      expect(linkedAgent.snapshot().warnings).toContainEqual(
+        expect.objectContaining({ code: 'LINKED_WORKTREE_OVERLAP' }),
+      );
+      const batch = mainAgent.acquireClaims([
+        { member: 'main', path: 'src/batch.ts' },
+        { member: 'feature', path: 'src/batch.ts' },
+      ]);
+      expect(batch).toHaveLength(2);
+      for (const claim of batch) {
+        expect(claim.warnings).toContainEqual(
+          expect.objectContaining({ code: 'LINKED_WORKTREE_OVERLAP' }),
+        );
+      }
+    } finally {
+      linkedAgent?.close();
+      mainAgent?.close();
+      git(main.root, ['worktree', 'remove', '--force', linkedRoot]);
+    }
   });
 
   it('scopes policy reads, acknowledgements, and events to a target member', () => {
