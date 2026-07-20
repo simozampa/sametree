@@ -8,6 +8,7 @@ export interface Agent {
   name: string;
   harness: Harness;
   role: string;
+  activeMembers: string[];
   createdAt: number;
   lastSeenAt: number;
 }
@@ -16,6 +17,7 @@ export interface Session {
   id: string;
   agentName: string;
   homeWorktreeId: string;
+  homeMember: string;
   processId: number;
   startedAt: number;
   lastHeartbeatAt: number;
@@ -35,6 +37,7 @@ export interface Task {
   createdAt: number;
   updatedAt: number;
   dependencies: string[];
+  members: string[];
 }
 
 export interface PathClaim {
@@ -82,7 +85,26 @@ export interface CoordinationEvent {
   entityType: string;
   entityId: string;
   payload: Record<string, unknown>;
+  worktreeId?: string | null;
+  member?: string | null;
   createdAt: number;
+}
+
+export interface CoordinationMember {
+  id: string;
+  name: string;
+  repositoryId: string;
+  repositoryName: string;
+  root: string;
+  available: boolean;
+}
+
+export interface CoordinationWorkspace {
+  id: string;
+  name: string;
+  implicit: boolean;
+  currentMemberId: string;
+  currentMember: string;
 }
 
 export interface PolicyDocument {
@@ -107,6 +129,8 @@ export interface GitWorktreeContext {
 }
 
 export interface CoordinationSnapshot {
+  workspace: CoordinationWorkspace;
+  members: CoordinationMember[];
   git: GitWorktreeContext;
   agent: Agent;
   session: Session;

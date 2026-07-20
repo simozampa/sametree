@@ -36,6 +36,10 @@ function collect(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
+function collectOptional(value: string, previous?: string[]): string[] {
+  return [...(previous ?? []), value];
+}
+
 function qualifiedClaim(value: string): { member: string; path: string } {
   const separator = value.indexOf(':');
   if (separator < 1 || separator === value.length - 1) {
@@ -317,6 +321,7 @@ task
   )
   .option('--assignee <agent>', 'initial assignee')
   .option('--depends-on <task-id>', 'dependency task ID', collect, [])
+  .option('--member <name>', 'affected workspace member', collectOptional)
   .action(
     (
       options: {
@@ -325,6 +330,7 @@ task
         priority: TaskPriority;
         assignee?: string;
         dependsOn: string[];
+        member?: string[];
       },
       command: Command,
     ) => {
@@ -335,6 +341,7 @@ task
           priority: options.priority,
           ...(options.assignee ? { assignee: options.assignee } : {}),
           dependencies: options.dependsOn,
+          members: options.member ?? [],
         }),
       );
     },
@@ -352,17 +359,25 @@ task
     ]),
   )
   .option('--all', 'include done and cancelled tasks')
+  .option('--member <name>', 'filter by affected workspace member')
   .option('--after <task-id>', 'continue after this task cursor')
   .option('--limit <number>', 'maximum tasks', integer, 25)
   .action(
     (
-      options: { after?: string; all?: boolean; limit: number; status?: TaskStatus },
+      options: {
+        after?: string;
+        all?: boolean;
+        limit: number;
+        member?: string;
+        status?: TaskStatus;
+      },
       command: Command,
     ) => {
       runWithCoordinator(command, (coordinator) =>
         coordinator.listTasks({
           ...(options.status ? { status: options.status } : {}),
           ...(options.after ? { after: options.after } : {}),
+          ...(options.member ? { member: options.member } : {}),
           includeTerminal: options.all ?? false,
           limit: options.limit,
         }),
@@ -431,6 +446,8 @@ task
   )
   .addOption(new Option('--priority <level>').choices(['low', 'normal', 'high', 'urgent']))
   .option('--description <text>')
+  .option('--member <name>', 'replace affected workspace members', collectOptional)
+  .option('--clear-members', 'remove every affected workspace member')
   .option('--revision <number>', 'expected current revision', integer)
   .action(
     (
@@ -440,15 +457,25 @@ task
         priority?: TaskPriority;
         description?: string;
         revision?: number;
+        member?: string[];
+        clearMembers?: boolean;
       },
       command: Command,
     ) => {
+      if (options.clearMembers && options.member !== undefined) {
+        throw new SameTreeError('INVALID_INPUT', 'Use --member or --clear-members, not both.');
+      }
       runWithCoordinator(command, (coordinator) =>
         coordinator.updateTask(taskId, {
           ...(options.status ? { status: options.status } : {}),
           ...(options.priority ? { priority: options.priority } : {}),
           ...(options.description !== undefined ? { description: options.description } : {}),
           ...(options.revision !== undefined ? { expectedRevision: options.revision } : {}),
+          ...(options.clearMembers
+            ? { members: [] }
+            : options.member !== undefined
+              ? { members: options.member }
+              : {}),
         }),
       );
     },

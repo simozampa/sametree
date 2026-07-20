@@ -93,6 +93,10 @@ describe('workspace operations', () => {
     const registry = registryRoot();
     const standalone = open(source.root, 'author');
     const task = standalone.createTask({ title: 'Import me' });
+    const taggedTask = standalone.createTask({
+      title: 'Import my member tag',
+      members: [path.basename(source.root)],
+    });
     standalone.close();
     const sourceDatabasePath = resolveRepository(source.root).databasePath;
     const sourceDatabase = new Database(sourceDatabasePath, { readonly: true });
@@ -109,7 +113,12 @@ describe('workspace operations', () => {
     expect(joined.imported).toBe(true);
 
     const workspaceCoordinator = open(source.root, 'observer', registry);
-    expect(workspaceCoordinator.listTasks().map((item) => item.id)).toContain(task.id);
+    expect(workspaceCoordinator.listTasks()).toContainEqual(
+      expect.objectContaining({ id: task.id, members: [] }),
+    );
+    expect(workspaceCoordinator.listTasks()).toContainEqual(
+      expect.objectContaining({ id: taggedTask.id, members: ['studio'] }),
+    );
     const workspaceDatabase = new Database(joined.workspace.databasePath, { readonly: true });
     expect(
       workspaceDatabase
@@ -151,7 +160,12 @@ describe('workspace operations', () => {
 
     const studioAgent = open(studio.root, 'studio-agent', registry);
     const serverAgent = open(server.root, 'server-agent', registry);
-    const task = studioAgent.createTask({ title: 'Cross-repository task' });
+    const task = studioAgent.createTask({
+      title: 'Cross-repository task',
+      members: ['studio', 'holo-server'],
+    });
+    const globalTask = studioAgent.createTask({ title: 'Workspace-global task' });
+    studioAgent.updateTask(globalTask.id, { members: ['holo-server'] });
     studioAgent.sendMessage({
       to: 'server-agent',
       subject: 'Workspace message',
@@ -159,7 +173,40 @@ describe('workspace operations', () => {
     });
 
     expect(serverAgent.listTasks().map((item) => item.id)).toContain(task.id);
+    expect(serverAgent.listTasks({ member: 'studio' })).toEqual([
+      expect.objectContaining({ id: task.id, members: ['holo-server', 'studio'] }),
+    ]);
+    expect(serverAgent.listTasks({ member: 'holo-server' }).map((item) => item.id)).toEqual(
+      expect.arrayContaining([task.id, globalTask.id]),
+    );
     expect(serverAgent.inbox().map((message) => message.subject)).toContain('Workspace message');
+    studioAgent.claimTask(task.id);
+    const handoff = studioAgent.offerHandoff({
+      taskId: task.id,
+      to: 'server-agent',
+      summary: 'Continue this workspace-global task.',
+    });
+    expect(serverAgent.listHandoffs().map((item) => item.id)).toContain(handoff.id);
+    const status = serverAgent.snapshot();
+    expect(status.workspace).toMatchObject({
+      id: workspace.workspace.id,
+      name: 'Product',
+      currentMember: 'holo-server',
+      implicit: false,
+    });
+    expect(status.session.homeMember).toBe('holo-server');
+    expect(status.agent.activeMembers).toEqual(['holo-server']);
+    expect(status.agents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'studio-agent', activeMembers: ['studio'] }),
+        expect.objectContaining({ name: 'server-agent', activeMembers: ['holo-server'] }),
+      ]),
+    );
+    expect(
+      serverAgent
+        .events({ limit: 100 })
+        .find((event) => event.kind === 'task.created' && event.entityId === task.id),
+    ).toMatchObject({ member: 'studio', worktreeId: workspace.member.id });
     expect(
       workspaceMembers(studio.root, { registryRoot: registry }).map((item) => item.name),
     ).toEqual(['holo-server', 'studio']);

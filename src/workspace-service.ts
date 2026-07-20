@@ -452,7 +452,10 @@ function copyStandaloneState(
       target,
       'task_worktrees',
       ['task_id', 'worktree_id'],
-      rows(source, 'tasks').map((row) => ({ task_id: row.id, worktree_id: member.worktreeId })),
+      rows(source, 'task_worktrees').map((row) => ({
+        task_id: row.task_id,
+        worktree_id: member.worktreeId,
+      })),
     );
     target
       .prepare(

@@ -113,10 +113,11 @@ server.registerTool(
       priority: z.enum(['low', 'normal', 'high', 'urgent']).optional(),
       assignee: z.string().optional(),
       dependencies: z.array(z.string()).max(100).optional(),
+      members: z.array(z.string().min(1)).max(100).optional(),
     },
     outputSchema,
   },
-  ({ title, description, priority, assignee, dependencies }) =>
+  ({ title, description, priority, assignee, dependencies, members }) =>
     execute(() =>
       coordinator.createTask({
         title,
@@ -124,6 +125,7 @@ server.registerTool(
         ...(priority !== undefined ? { priority } : {}),
         ...(assignee !== undefined ? { assignee } : {}),
         ...(dependencies !== undefined ? { dependencies } : {}),
+        ...(members !== undefined ? { members } : {}),
       }),
     ),
 );
@@ -139,17 +141,19 @@ server.registerTool(
       after: z.string().optional(),
       limit: z.number().int().min(1).max(100).optional(),
       includeTerminal: z.boolean().optional(),
+      member: z.string().min(1).optional(),
     },
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
-  ({ status, after, limit, includeTerminal }) =>
+  ({ status, after, limit, includeTerminal, member }) =>
     execute(() =>
       coordinator.listTasks({
         ...(status !== undefined ? { status } : {}),
         ...(after !== undefined ? { after } : {}),
         ...(limit !== undefined ? { limit } : {}),
         ...(includeTerminal !== undefined ? { includeTerminal } : {}),
+        ...(member !== undefined ? { member } : {}),
       }),
     ),
 );
@@ -216,16 +220,18 @@ server.registerTool(
       description: z.string().max(20_000).optional(),
       priority: z.enum(['low', 'normal', 'high', 'urgent']).optional(),
       expectedRevision: z.number().int().positive().optional(),
+      members: z.array(z.string().min(1)).max(100).optional(),
     },
     outputSchema,
   },
-  ({ taskId, status, description, priority, expectedRevision }) =>
+  ({ taskId, status, description, priority, expectedRevision, members }) =>
     execute(() =>
       coordinator.updateTask(taskId, {
         ...(status ? { status: status as TaskStatus } : {}),
         ...(description !== undefined ? { description } : {}),
         ...(priority ? { priority: priority as TaskPriority } : {}),
         ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+        ...(members !== undefined ? { members } : {}),
       }),
     ),
 );

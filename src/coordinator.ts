@@ -14,7 +14,9 @@ import type {
   Agent,
   ClaimKind,
   CoordinationEvent,
+  CoordinationMember,
   CoordinationSnapshot,
+  CoordinationWorkspace,
   DoctorReport,
   Handoff,
   Harness,
@@ -54,6 +56,7 @@ export interface CreateTaskInput {
   priority?: TaskPriority;
   assignee?: string;
   dependencies?: string[];
+  members?: string[];
 }
 
 export interface UpdateTaskInput {
@@ -61,6 +64,7 @@ export interface UpdateTaskInput {
   description?: string;
   priority?: TaskPriority;
   expectedRevision?: number;
+  members?: string[];
 }
 
 export interface ForceTakeoverTaskInput {
@@ -85,6 +89,7 @@ export interface ListTasksOptions {
   after?: string;
   includeTerminal?: boolean;
   limit?: number;
+  member?: string;
   status?: TaskStatus;
 }
 
@@ -148,11 +153,12 @@ function parseObject(value: unknown): Record<string, unknown> {
     : {};
 }
 
-function mapAgent(row: Row): Agent {
+function mapAgent(row: Row, activeMembers: string[] = []): Agent {
   return {
     name: stringValue(row, 'name'),
     harness: stringValue(row, 'harness') as Harness,
     role: stringValue(row, 'role'),
+    activeMembers,
     createdAt: numberValue(row, 'created_at'),
     lastSeenAt: numberValue(row, 'last_seen_at'),
   };
@@ -163,6 +169,7 @@ function mapSession(row: Row): Session {
     id: stringValue(row, 'id'),
     agentName: stringValue(row, 'agent_name'),
     homeWorktreeId: stringValue(row, 'home_worktree_id'),
+    homeMember: stringValue(row, 'worktree_name'),
     processId: numberValue(row, 'process_id'),
     startedAt: numberValue(row, 'started_at'),
     lastHeartbeatAt: numberValue(row, 'last_heartbeat_at'),
@@ -171,7 +178,7 @@ function mapSession(row: Row): Session {
   };
 }
 
-function mapTask(row: Row, dependencies: string[]): Task {
+function mapTask(row: Row, dependencies: string[], members: string[]): Task {
   return {
     id: stringValue(row, 'id'),
     title: stringValue(row, 'title'),
@@ -184,6 +191,7 @@ function mapTask(row: Row, dependencies: string[]): Task {
     createdAt: numberValue(row, 'created_at'),
     updatedAt: numberValue(row, 'updated_at'),
     dependencies,
+    members,
   };
 }
 
@@ -447,12 +455,94 @@ export class Coordinator {
     ).map((row) => stringValue(row, 'depends_on'));
   }
 
+  #taskMembers(taskId: string): string[] {
+    return (
+      this.#database
+        .prepare(
+          `SELECT worktree.name
+           FROM task_worktrees task_worktree
+           JOIN worktrees worktree ON worktree.id = task_worktree.worktree_id
+           WHERE task_worktree.task_id = ?
+           ORDER BY worktree.name`,
+        )
+        .all(taskId) as Row[]
+    ).map((row) => stringValue(row, 'name'));
+  }
+
+  #resolveTaskMembers(
+    members: string[],
+    options: { requireAvailable?: boolean } = {},
+  ): Array<{ id: string; name: string }> {
+    const names = [...new Set(members.map((member) => requireText(member, 'Member', 100)))];
+    if (names.length > 100) {
+      throw new SameTreeError('INVALID_INPUT', 'Associate at most 100 members with a task.');
+    }
+    return names.map((name) => {
+      const row = this.#database
+        .prepare('SELECT id, available FROM worktrees WHERE name = ?')
+        .get(name) as Row | undefined;
+      if (!row) throw new SameTreeError('NOT_FOUND', `Workspace member '${name}' was not found.`);
+      if ((options.requireAvailable ?? true) && numberValue(row, 'available') !== 1) {
+        throw new SameTreeError('WORKSPACE_ERROR', `Workspace member '${name}' is unavailable.`);
+      }
+      return { id: stringValue(row, 'id'), name };
+    });
+  }
+
+  #activeMembers(agentName: string, now: number): string[] {
+    return (
+      this.#database
+        .prepare(
+          `SELECT DISTINCT worktree.name
+           FROM sessions session
+           JOIN worktrees worktree ON worktree.id = session.home_worktree_id
+           WHERE session.agent_name = ? AND session.status = 'active' AND session.expires_at > ?
+           ORDER BY worktree.name`,
+        )
+        .all(agentName, now) as Row[]
+    ).map((row) => stringValue(row, 'name'));
+  }
+
+  #workspaceStatus(): { members: CoordinationMember[]; workspace: CoordinationWorkspace } {
+    const metadata = this.#database.prepare('SELECT * FROM workspace_metadata').get() as Row;
+    const members = (
+      this.#database
+        .prepare(
+          `SELECT worktree.*, repository.name AS repository_name
+           FROM worktrees worktree
+           JOIN repositories repository ON repository.id = worktree.repository_id
+           ORDER BY worktree.name, worktree.id`,
+        )
+        .all() as Row[]
+    ).map((row) => ({
+      id: stringValue(row, 'id'),
+      name: stringValue(row, 'name'),
+      repositoryId: stringValue(row, 'repository_id'),
+      repositoryName: stringValue(row, 'repository_name'),
+      root: stringValue(row, 'root'),
+      available: numberValue(row, 'available') === 1,
+    }));
+    const current = members.find((member) => member.id === this.worktreeId);
+    if (!current)
+      throw new SameTreeError('WORKSPACE_ERROR', 'Current workspace member is missing.');
+    return {
+      workspace: {
+        id: stringValue(metadata, 'id'),
+        name: stringValue(metadata, 'name'),
+        implicit: numberValue(metadata, 'implicit') === 1,
+        currentMemberId: current.id,
+        currentMember: current.name,
+      },
+      members,
+    };
+  }
+
   #task(taskId: string): Task {
     const row = this.#database.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as
       | Row
       | undefined;
     if (!row) throw new SameTreeError('NOT_FOUND', `Task '${taskId}' does not exist.`);
-    return mapTask(row, this.#dependencies(taskId));
+    return mapTask(row, this.#dependencies(taskId), this.#taskMembers(taskId));
   }
 
   #unfinishedDependencies(taskId: string): string[] {
@@ -601,7 +691,14 @@ export class Coordinator {
         )
         .run(taskExpiry, this.sessionId, now);
 
-      const row = this.#database.prepare('SELECT * FROM sessions WHERE id = ?').get(this.sessionId);
+      const row = this.#database
+        .prepare(
+          `SELECT session.*, worktree.name AS worktree_name
+           FROM sessions session
+           JOIN worktrees worktree ON worktree.id = session.home_worktree_id
+           WHERE session.id = ?`,
+        )
+        .get(this.sessionId);
       return mapSession(row as Row);
     });
   }
@@ -642,6 +739,7 @@ export class Coordinator {
   }
 
   listAgents(options: { activeOnly?: boolean } = {}): Agent[] {
+    const now = this.#clock();
     const rows = options.activeOnly
       ? (this.#database
           .prepare(
@@ -651,11 +749,14 @@ export class Coordinator {
              WHERE session.status = 'active' AND session.expires_at > ?
              ORDER BY agent.last_seen_at DESC, agent.name`,
           )
-          .all(this.#clock()) as Row[])
+          .all(now) as Row[])
       : (this.#database
           .prepare('SELECT * FROM agents ORDER BY last_seen_at DESC, name')
           .all() as Row[]);
-    return rows.map(mapAgent);
+    return rows.map((row) => {
+      const name = stringValue(row, 'name');
+      return mapAgent(row, this.#activeMembers(name, now));
+    });
   }
 
   createTask(input: CreateTaskInput): Task {
@@ -679,6 +780,7 @@ export class Coordinator {
 
     return immediateTransaction(this.#database, () => {
       for (const dependency of dependencies) this.#task(dependency);
+      const members = this.#resolveTaskMembers(input.members ?? []);
 
       this.#database
         .prepare(
@@ -691,7 +793,16 @@ export class Coordinator {
         'INSERT INTO task_dependencies (task_id, depends_on) VALUES (?, ?)',
       );
       for (const dependency of dependencies) addDependency.run(id, dependency);
-      this.#recordEvent('task.created', 'task', id, { assignee, dependencies, priority });
+      const addMember = this.#database.prepare(
+        'INSERT INTO task_worktrees (task_id, worktree_id) VALUES (?, ?)',
+      );
+      for (const member of members) addMember.run(id, member.id);
+      this.#recordEvent('task.created', 'task', id, {
+        assignee,
+        dependencies,
+        members: members.map((member) => member.name),
+        priority,
+      });
       return this.#task(id);
     });
   }
@@ -708,6 +819,14 @@ export class Coordinator {
       parameters.push(options.status);
     } else if (!options.includeTerminal) {
       conditions.push("status NOT IN ('done', 'cancelled')");
+    }
+    if (options.member !== undefined) {
+      const member = this.#resolveTaskMembers([options.member], { requireAvailable: false })[0];
+      if (!member) throw new SameTreeError('NOT_FOUND', 'Workspace member was not found.');
+      conditions.push(
+        'EXISTS (SELECT 1 FROM task_worktrees WHERE task_id = tasks.id AND worktree_id = ?)',
+      );
+      parameters.push(member.id);
     }
     if (options.after) {
       const cursor = this.#database
@@ -728,7 +847,10 @@ export class Coordinator {
     const rows = this.#database
       .prepare(`SELECT * FROM tasks ${where} ORDER BY created_at, id LIMIT ?`)
       .all(...parameters) as Row[];
-    return rows.map((row) => mapTask(row, this.#dependencies(stringValue(row, 'id'))));
+    return rows.map((row) => {
+      const id = stringValue(row, 'id');
+      return mapTask(row, this.#dependencies(id), this.#taskMembers(id));
+    });
   }
 
   claimTask(taskId: string, authorization: UserAuthorizedTaskInput = {}): Task {
@@ -925,6 +1047,8 @@ export class Coordinator {
         );
       }
       const active = status === 'in_progress';
+      const members =
+        input.members === undefined ? undefined : this.#resolveTaskMembers(input.members);
       this.#database
         .prepare(
           `UPDATE tasks SET
@@ -941,9 +1065,17 @@ export class Coordinator {
           this.#clock(),
           taskId,
         );
+      if (members) {
+        this.#database.prepare('DELETE FROM task_worktrees WHERE task_id = ?').run(taskId);
+        const addMember = this.#database.prepare(
+          'INSERT INTO task_worktrees (task_id, worktree_id) VALUES (?, ?)',
+        );
+        for (const member of members) addMember.run(taskId, member.id);
+      }
       this.#recordEvent('task.updated', 'task', taskId, {
         fromStatus: task.status,
         toStatus: status,
+        ...(members ? { members: members.map((member) => member.name) } : {}),
       });
       return this.#task(taskId);
     });
@@ -1561,7 +1693,12 @@ export class Coordinator {
     }
     return (
       this.#database
-        .prepare('SELECT * FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?')
+        .prepare(
+          `SELECT event.*, worktree.name AS worktree_name
+           FROM events event
+           LEFT JOIN worktrees worktree ON worktree.id = event.worktree_id
+           WHERE event.sequence > ? ORDER BY event.sequence LIMIT ?`,
+        )
         .all(options.after ?? 0, limit) as Row[]
     ).map((row) => ({
       sequence: numberValue(row, 'sequence'),
@@ -1571,6 +1708,8 @@ export class Coordinator {
       entityType: stringValue(row, 'entity_type'),
       entityId: stringValue(row, 'entity_id'),
       payload: parseObject(row.payload_json),
+      worktreeId: nullableString(row, 'worktree_id'),
+      member: nullableString(row, 'worktree_name'),
       createdAt: numberValue(row, 'created_at'),
     }));
   }
@@ -1578,6 +1717,7 @@ export class Coordinator {
   snapshot(options: SnapshotOptions = {}): CoordinationSnapshot {
     const git = readGitWorktreeContext(this.repository.root, this.repository.privateGitDirectory);
     return this.#database.transaction(() => {
+      const workspaceStatus = this.#workspaceStatus();
       const taskRows = options.includeTerminalTasks
         ? (this.#database.prepare('SELECT * FROM tasks ORDER BY created_at, id').all() as Row[])
         : (this.#database
@@ -1591,7 +1731,12 @@ export class Coordinator {
         .prepare('SELECT * FROM agents WHERE name = ?')
         .get(this.agentName);
       const sessionRow = this.#database
-        .prepare('SELECT * FROM sessions WHERE id = ?')
+        .prepare(
+          `SELECT session.*, worktree.name AS worktree_name
+           FROM sessions session
+           JOIN worktrees worktree ON worktree.id = session.home_worktree_id
+           WHERE session.id = ?`,
+        )
         .get(this.sessionId);
       const unread = this.#database
         .prepare(
@@ -1619,11 +1764,15 @@ export class Coordinator {
         .get() as Row;
 
       return {
+        ...workspaceStatus,
         git,
-        agent: mapAgent(agentRow as Row),
+        agent: mapAgent(agentRow as Row, this.#activeMembers(this.agentName, this.#clock())),
         session: mapSession(sessionRow as Row),
         agents: this.listAgents({ activeOnly: !options.includeInactiveAgents }),
-        tasks: taskRows.map((row) => mapTask(row, this.#dependencies(stringValue(row, 'id')))),
+        tasks: taskRows.map((row) => {
+          const id = stringValue(row, 'id');
+          return mapTask(row, this.#dependencies(id), this.#taskMembers(id));
+        }),
         claims: this.listClaims(),
         unreadMessages: numberValue(unread, 'count'),
         pendingHandoffs: numberValue(handoffs, 'count'),
