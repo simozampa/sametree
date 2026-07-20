@@ -12,7 +12,8 @@ export type ErrorCode =
   | 'POLICY_NOT_FOUND'
   | 'TASK_BLOCKED'
   | 'TASK_UNAVAILABLE'
-  | 'USER_AUTHORIZATION_REQUIRED';
+  | 'USER_AUTHORIZATION_REQUIRED'
+  | 'WORKSPACE_ERROR';
 
 /** An expected domain failure that adapters can render without a stack trace. */
 export class SameTreeError extends Error {

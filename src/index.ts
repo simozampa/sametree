@@ -48,3 +48,16 @@ export type {
 } from './types.js';
 export { VERSION } from './version.js';
 export { followMessages, formatEvent, formatMessage, watchEvents } from './watch.js';
+export {
+  type BindWorktreeInput,
+  bindWorktree,
+  type RegisteredWorkspace,
+  type RepositoryWorkspaceBinding,
+  readRegisteredWorkspace,
+  registerWorkspace,
+  resolveWorkspaceBinding,
+  type WorkspaceContext,
+  type WorkspaceRegistration,
+  type WorkspaceRegistryOptions,
+  type WorktreeWorkspaceBinding,
+} from './workspace.js';
