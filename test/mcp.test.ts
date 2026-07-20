@@ -11,6 +11,7 @@ import {
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Coordinator } from '../src/coordinator.js';
+import { addWorkspaceMember, createWorkspace } from '../src/workspace-service.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
@@ -85,6 +86,74 @@ describe('MCP server', () => {
     const content = response.content as Array<{ text?: string; type: string }>;
     const text = content.find((item) => item.type === 'text')?.text;
     expect(text).not.toContain('\n');
+  });
+
+  it('resolves a shared workspace and home member with a custom registry', async () => {
+    const studio = createTestRepository();
+    const server = createTestRepository();
+    repositories.push(studio, server);
+    const registryParent = mkdtempSync(path.join(tmpdir(), 'sametree-mcp-workspace-'));
+    temporaryDirectories.push(registryParent);
+    const registryRoot = path.join(registryParent, 'workspaces');
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot },
+    );
+    addWorkspaceMember(
+      server.root,
+      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { registryRoot },
+    );
+    const serverAgent = Coordinator.open({
+      cwd: server.root,
+      agent: 'server-agent',
+      workspaceRegistryRoot: registryRoot,
+    });
+    const task = serverAgent.createTask({
+      title: 'Visible through studio MCP',
+      members: ['holo-server'],
+    });
+    serverAgent.close();
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [mcpPath],
+      cwd: studio.root,
+      env: {
+        ...getDefaultEnvironment(),
+        SAMETREE_AGENT: 'mcp-studio',
+        SAMETREE_HARNESS: 'opencode',
+        SAMETREE_WORKSPACE_REGISTRY: registryRoot,
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'sametree-test', version: '1.0.0' });
+    clients.push(client);
+    await client.connect(transport);
+
+    const status = await client.callTool({ name: 'sametree_status', arguments: {} });
+    const tasks = await client.callTool({
+      name: 'sametree_task_list',
+      arguments: { member: 'holo-server' },
+    });
+    const policy = await client.callTool({
+      name: 'sametree_policy_get',
+      arguments: { member: 'holo-server' },
+    });
+
+    expect(status.structuredContent).toMatchObject({
+      result: {
+        workspace: { id: workspace.workspace.id, currentMember: 'studio' },
+        session: { homeMember: 'studio' },
+      },
+    });
+    expect(tasks.structuredContent).toMatchObject({
+      result: [expect.objectContaining({ id: task.id, members: ['holo-server'] })],
+    });
+    expect(policy.structuredContent).toMatchObject({
+      result: { member: 'holo-server', path: path.join(server.root, '.sametree', 'policy.md') },
+    });
   });
 
   it('assigns distinct identities when clients do not provide agent names', async () => {

@@ -3,10 +3,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { OPENCODE_TUI_PLUGIN } from '../src/adapters.js';
 
 const originalBun = Reflect.get(globalThis, 'Bun');
+const originalWorkspaceRegistry = process.env.SAMETREE_WORKSPACE_REGISTRY;
 
 afterEach(() => {
   if (originalBun === undefined) Reflect.deleteProperty(globalThis, 'Bun');
   else Reflect.set(globalThis, 'Bun', originalBun);
+  if (originalWorkspaceRegistry === undefined) delete process.env.SAMETREE_WORKSPACE_REGISTRY;
+  else process.env.SAMETREE_WORKSPACE_REGISTRY = originalWorkspaceRegistry;
 });
 
 describe('harness adapters', () => {
@@ -38,6 +41,7 @@ describe('harness adapters', () => {
     const acknowledgements: string[] = [];
     const prompts: Array<Record<string, unknown>> = [];
     const spawnArguments: string[][] = [];
+    let spawnEnvironment: Record<string, string | undefined> | undefined;
     let messagePersisted = true;
     let partPersisted = false;
     let postPromptChecks = 0;
@@ -54,8 +58,9 @@ describe('harness adapters', () => {
     });
 
     Reflect.set(globalThis, 'Bun', {
-      spawn: (args: string[]) => {
+      spawn: (args: string[], options: { env?: Record<string, string | undefined> }) => {
         spawnArguments.push(args);
+        spawnEnvironment = options.env;
         return {
           stdout,
           stdin: {
@@ -71,6 +76,7 @@ describe('harness adapters', () => {
       },
     });
 
+    process.env.SAMETREE_WORKSPACE_REGISTRY = '/workspace-registry';
     await module.default.tui({
       lifecycle: { signal: controller.signal, onDispose: () => undefined },
       state: {
@@ -138,8 +144,9 @@ describe('harness adapters', () => {
 
     await acknowledged;
     expect(spawnArguments[0]).toEqual(
-      expect.arrayContaining(['--harness', 'opencode', '--ack-stdin']),
+      expect.arrayContaining(['--agent', identity, '--harness', 'opencode', '--ack-stdin']),
     );
+    expect(spawnEnvironment?.SAMETREE_WORKSPACE_REGISTRY).toBe('/workspace-registry');
     expect(prompts).toHaveLength(1);
     expect(postPromptChecks).toBeGreaterThanOrEqual(2);
     expect(prompts[0]).toMatchObject({
