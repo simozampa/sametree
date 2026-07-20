@@ -111,11 +111,15 @@ export interface PolicyDocument {
   content: string;
   hash: string;
   path: string;
+  worktreeId: string;
+  member: string;
   acknowledgedAt: number | null;
 }
 
 export interface PolicyAcknowledgement {
   hash: string;
+  worktreeId: string;
+  member: string;
   acknowledgedAt: number;
   newlyAcknowledged: boolean;
 }

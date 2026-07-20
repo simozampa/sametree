@@ -679,13 +679,21 @@ handoff
 
 const policy = program.command('policy').description('Read and acknowledge shared instructions.');
 
-policy.command('show').action((_options: unknown, command: Command) => {
-  runWithCoordinator(command, (coordinator) => coordinator.getPolicy());
-});
+policy
+  .command('show')
+  .option('--member <name>', 'target workspace member')
+  .action((options: { member?: string }, command: Command) => {
+    runWithCoordinator(command, (coordinator) => coordinator.getPolicy(options.member));
+  });
 
-policy.command('ack <hash>').action((hash: string, _options: unknown, command: Command) => {
-  runWithCoordinator(command, (coordinator) => coordinator.acknowledgePolicy(hash));
-});
+policy
+  .command('ack <hash>')
+  .option('--member <name>', 'target workspace member')
+  .action((hash: string, options: { member?: string }, command: Command) => {
+    runWithCoordinator(command, (coordinator) =>
+      coordinator.acknowledgePolicy(hash, options.member),
+    );
+  });
 
 program
   .command('events')

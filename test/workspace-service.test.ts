@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -286,6 +286,51 @@ describe('workspace operations', () => {
         .filter((claim) => claim.agentName === 'studio-agent')
         .map((claim) => claim.expiresAt),
     ).toEqual([902_000, 902_000, 902_000]);
+  });
+
+  it('scopes policy reads, acknowledgements, and events to a target member', () => {
+    const studio = repository();
+    const server = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const serverMember = addWorkspaceMember(
+      server.root,
+      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    writeFileSync(
+      path.join(server.root, '.sametree', 'policy.md'),
+      '# Holo server policy\n',
+      'utf8',
+    );
+    const agent = open(studio.root, 'policy-agent', registry);
+
+    const local = agent.getPolicy();
+    const remote = agent.getPolicy('holo-server');
+    expect(remote).toMatchObject({
+      member: 'holo-server',
+      worktreeId: serverMember.member.id,
+      path: path.join(server.root, '.sametree', 'policy.md'),
+      acknowledgedAt: null,
+    });
+    expect(remote.hash).not.toBe(local.hash);
+    expect(agent.acknowledgePolicy(remote.hash, 'holo-server')).toMatchObject({
+      member: 'holo-server',
+      worktreeId: serverMember.member.id,
+      newlyAcknowledged: true,
+    });
+    expect(agent.getPolicy('holo-server').acknowledgedAt).not.toBeNull();
+    expect(agent.getPolicy().acknowledgedAt).toBeNull();
+    expect(
+      agent.events({ limit: 100 }).find((event) => event.kind === 'policy.acknowledged'),
+    ).toMatchObject({
+      member: 'holo-server',
+      worktreeId: serverMember.member.id,
+    });
   });
 
   it('refuses active imports and identity collisions without binding the source', () => {

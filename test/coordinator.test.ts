@@ -763,7 +763,9 @@ describe('Coordinator', () => {
     expect(Object.keys(acknowledged).sort()).toEqual([
       'acknowledgedAt',
       'hash',
+      'member',
       'newlyAcknowledged',
+      'worktreeId',
     ]);
     expect(author.acknowledgePolicy(policy.hash)).toEqual({
       ...acknowledged,
@@ -781,6 +783,10 @@ describe('Coordinator', () => {
     expect(
       author.events({ after: 0 }).filter((event) => event.kind === 'policy.acknowledged'),
     ).toHaveLength(2);
+    writeFileSync(policy.path, Buffer.from([0xff]));
+    const invalidUtf8 = author.getPolicy().hash;
+    writeFileSync(policy.path, Buffer.from([0xfe]));
+    expect(author.getPolicy().hash).not.toBe(invalidUtf8);
     expect(() => author.acknowledgePolicy('0'.repeat(64))).toThrow(SameTreeError);
   });
 

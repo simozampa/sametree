@@ -370,6 +370,7 @@ export class Coordinator {
     entityType: string,
     entityId: string,
     payload: Record<string, unknown> = {},
+    worktreeId = this.worktreeId,
   ): void {
     this.#database
       .prepare(
@@ -385,7 +386,7 @@ export class Coordinator {
         entityId,
         JSON.stringify(payload),
         this.#clock(),
-        this.worktreeId,
+        worktreeId,
       );
   }
 
@@ -1627,32 +1628,36 @@ export class Coordinator {
     });
   }
 
-  getPolicy(): PolicyDocument {
-    const policyPath = path.join(this.repository.root, POLICY_FILE);
+  getPolicy(member?: string): PolicyDocument {
+    const worktree = this.#claimWorktree(member);
+    const policyPath = path.join(worktree.root, POLICY_FILE);
     if (!existsSync(policyPath)) {
       throw new SameTreeError(
         'POLICY_NOT_FOUND',
         `No policy exists at ${policyPath}; run 'sametree init'.`,
       );
     }
-    const content = readFileSync(policyPath, 'utf8');
-    const hash = createHash('sha256').update(content).digest('hex');
+    const policyBytes = readFileSync(policyPath);
+    const content = policyBytes.toString('utf8');
+    const hash = createHash('sha256').update(policyBytes).digest('hex');
     const ack = this.#database
       .prepare(
         `SELECT acknowledged_at FROM policy_acks
          WHERE policy_hash = ? AND agent_name = ? AND worktree_id = ?`,
       )
-      .get(hash, this.agentName, this.worktreeId) as Row | undefined;
+      .get(hash, this.agentName, worktree.id) as Row | undefined;
     return {
       content,
       hash,
       path: policyPath,
+      worktreeId: worktree.id,
+      member: worktree.name,
       acknowledgedAt: ack ? numberValue(ack, 'acknowledged_at') : null,
     };
   }
 
-  acknowledgePolicy(hash: string): PolicyAcknowledgement {
-    const policy = this.getPolicy();
+  acknowledgePolicy(hash: string, member?: string): PolicyAcknowledgement {
+    const policy = this.getPolicy(member);
     if (policy.hash !== hash) {
       throw new SameTreeError(
         'INVALID_INPUT',
@@ -1670,16 +1675,26 @@ export class Coordinator {
            VALUES (?, ?, ?, ?)
            ON CONFLICT(policy_hash, agent_name, worktree_id) DO NOTHING`,
         )
-        .run(hash, this.agentName, this.worktreeId, acknowledgedAt).changes;
-      if (inserted === 1) this.#recordEvent('policy.acknowledged', 'policy', hash);
+        .run(hash, this.agentName, policy.worktreeId, acknowledgedAt).changes;
+      if (inserted === 1) {
+        this.#recordEvent(
+          'policy.acknowledged',
+          'policy',
+          hash,
+          { member: policy.member },
+          policy.worktreeId,
+        );
+      }
       const acknowledgement = this.#database
         .prepare(
           `SELECT acknowledged_at FROM policy_acks
            WHERE policy_hash = ? AND agent_name = ? AND worktree_id = ?`,
         )
-        .get(hash, this.agentName, this.worktreeId) as Row;
+        .get(hash, this.agentName, policy.worktreeId) as Row;
       return {
         hash,
+        worktreeId: policy.worktreeId,
+        member: policy.member,
         acknowledgedAt: numberValue(acknowledgement, 'acknowledged_at'),
         newlyAcknowledged: inserted === 1,
       };

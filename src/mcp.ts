@@ -433,10 +433,11 @@ server.registerTool(
   {
     title: 'Read shared policy',
     description: 'Read the current versioned policy and this agent’s acknowledgement state.',
+    inputSchema: { member: z.string().min(1).optional() },
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
-  () => execute(() => coordinator.getPolicy()),
+  ({ member }) => execute(() => coordinator.getPolicy(member)),
 );
 
 server.registerTool(
@@ -445,11 +446,11 @@ server.registerTool(
     title: 'Acknowledge shared policy',
     description:
       'Record that this agent read the exact policy content when sametree_policy_get reports acknowledgedAt as null.',
-    inputSchema: { hash: z.string().length(64) },
+    inputSchema: { hash: z.string().length(64), member: z.string().min(1).optional() },
     outputSchema,
     annotations: { idempotentHint: true },
   },
-  ({ hash }) => execute(() => coordinator.acknowledgePolicy(hash)),
+  ({ hash, member }) => execute(() => coordinator.acknowledgePolicy(hash, member)),
 );
 
 server.registerTool(
