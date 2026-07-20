@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -162,6 +163,82 @@ describe('workspace operations', () => {
     expect(
       workspaceMembers(studio.root, { registryRoot: registry }).map((item) => item.name),
     ).toEqual(['holo-server', 'studio']);
+  });
+
+  it('qualifies claims by member and renews cross-member batches', () => {
+    const studio = repository();
+    const server = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const serverMember = addWorkspaceMember(
+      server.root,
+      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    let now = 1_000;
+    const studioAgent = Coordinator.open({
+      cwd: studio.root,
+      agent: 'studio-agent',
+      clock: () => now,
+      workspaceRegistryRoot: registry,
+    });
+    const serverAgent = Coordinator.open({
+      cwd: server.root,
+      agent: 'server-agent',
+      clock: () => now,
+      workspaceRegistryRoot: registry,
+    });
+    coordinators.push(studioAgent, serverAgent);
+    execFileSync('git', ['config', 'core.ignorecase', 'true'], { cwd: server.root });
+
+    const metadata = new Database(workspace.workspace.databasePath);
+    metadata
+      .prepare('UPDATE repositories SET ignore_case = 0 WHERE id = ?')
+      .run(serverMember.member.repositoryId);
+    metadata.close();
+
+    const studioPath = studioAgent.acquireClaims([{ member: 'studio', path: 'src/shared.ts' }])[0];
+    const serverPath = serverAgent.acquireClaims([
+      { member: 'holo-server', path: 'src/shared.ts' },
+    ])[0];
+    expect(studioPath?.worktreeId).not.toBe(serverPath?.worktreeId);
+    serverAgent.acquireClaims([{ member: 'holo-server', path: 'src/Case.ts' }]);
+    expect(() =>
+      studioAgent.acquireClaims([{ member: 'holo-server', path: 'src/case.ts' }]),
+    ).toThrow(/overlaps/u);
+
+    const crossMember = studioAgent.acquireClaims(
+      [
+        { member: 'studio', path: 'src/studio.ts' },
+        { member: 'holo-server', path: 'src/server.ts' },
+      ],
+      30,
+    );
+    expect(crossMember.map((claim) => claim.member)).toEqual(['studio', 'holo-server']);
+    expect(() =>
+      serverAgent.acquireClaims([
+        { member: 'holo-server', path: 'src/server.ts' },
+        { member: 'studio', path: 'src/atomic-free.ts' },
+      ]),
+    ).toThrow(/holo-server:src\/server.ts overlaps/u);
+    expect(
+      studioAgent
+        .listClaims()
+        .some((claim) => claim.path === 'src/atomic-free.ts' && claim.agentName === 'server-agent'),
+    ).toBe(false);
+
+    now = 2_000;
+    studioAgent.heartbeat();
+    expect(
+      studioAgent
+        .listClaims()
+        .filter((claim) => claim.agentName === 'studio-agent')
+        .map((claim) => claim.expiresAt),
+    ).toEqual([902_000, 902_000, 902_000]);
   });
 
   it('refuses active imports and identity collisions without binding the source', () => {

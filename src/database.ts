@@ -86,6 +86,7 @@ const WORKSPACE_SCHEMA = `
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 100),
     common_git_directory TEXT NOT NULL UNIQUE,
+    ignore_case INTEGER NOT NULL DEFAULT 0 CHECK(ignore_case IN (0, 1)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   ) STRICT;
@@ -325,16 +326,23 @@ function insertMember(
       });
     }
     database
-      .prepare('UPDATE repositories SET updated_at = ? WHERE id = ?')
-      .run(now, member.repositoryId);
+      .prepare('UPDATE repositories SET ignore_case = ?, updated_at = ? WHERE id = ?')
+      .run(repository.ignoreCase ? 1 : 0, now, member.repositoryId);
   } else {
     database
       .prepare(
         `INSERT INTO repositories
-          (id, name, common_git_directory, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)`,
+          (id, name, common_git_directory, ignore_case, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(member.repositoryId, member.repositoryName, repository.commonGitDirectory, now, now);
+      .run(
+        member.repositoryId,
+        member.repositoryName,
+        repository.commonGitDirectory,
+        repository.ignoreCase ? 1 : 0,
+        now,
+        now,
+      );
   }
 
   const storedWorktree = database
@@ -397,6 +405,11 @@ function migrateWorkspaceSchema(
 ): void {
   const hadTaskWorktrees = tableExists(database, 'task_worktrees');
   database.exec(WORKSPACE_SCHEMA);
+  if (!tableHasColumn(database, 'repositories', 'ignore_case')) {
+    database.exec(
+      'ALTER TABLE repositories ADD COLUMN ignore_case INTEGER NOT NULL DEFAULT 0 CHECK(ignore_case IN (0, 1))',
+    );
+  }
 
   const metadata = database.prepare('SELECT * FROM workspace_metadata LIMIT 1').get() as
     | { id: string; implicit: number; name: string }
@@ -531,24 +544,21 @@ function migrateWorkspaceSchema(
       SELECT RAISE(ABORT, 'sessions require a home worktree');
     END;
 
-    CREATE TRIGGER IF NOT EXISTS claims_require_session_worktree_insert
+    DROP TRIGGER IF EXISTS claims_require_session_worktree_insert;
+    DROP TRIGGER IF EXISTS claims_require_session_worktree_update;
+
+    CREATE TRIGGER claims_require_session_worktree_insert
     BEFORE INSERT ON path_claims
-    WHEN NEW.worktree_id IS NULL OR NOT EXISTS (
-      SELECT 1 FROM sessions
-      WHERE id = NEW.session_id AND home_worktree_id = NEW.worktree_id
-    )
+    WHEN NEW.worktree_id IS NULL
     BEGIN
-      SELECT RAISE(ABORT, 'claims must match their session worktree');
+      SELECT RAISE(ABORT, 'claims require a target worktree');
     END;
 
-    CREATE TRIGGER IF NOT EXISTS claims_require_session_worktree_update
+    CREATE TRIGGER claims_require_session_worktree_update
     BEFORE UPDATE ON path_claims
-    WHEN NEW.worktree_id IS NULL OR NOT EXISTS (
-      SELECT 1 FROM sessions
-      WHERE id = NEW.session_id AND home_worktree_id = NEW.worktree_id
-    )
+    WHEN NEW.worktree_id IS NULL
     BEGIN
-      SELECT RAISE(ABORT, 'claims must match their session worktree');
+      SELECT RAISE(ABORT, 'claims require a target worktree');
     END;
   `);
 }

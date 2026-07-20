@@ -78,16 +78,24 @@ describe('database workspace migration', () => {
          VALUES ('session', 'agent', ?, 1, 1, 1, 2, 'active')`,
       )
       .run(worktree.id);
+    database
+      .prepare(
+        `INSERT INTO path_claims
+          (id, path, comparison_path, kind, agent_name, session_id,
+           expires_at, created_at, worktree_id)
+         VALUES ('claim', 'src', 'src', 'tree', 'agent', 'session', 2, 1, 'worktree_other')`,
+      )
+      .run();
     expect(() =>
       database
         .prepare(
           `INSERT INTO path_claims
             (id, path, comparison_path, kind, agent_name, session_id,
              expires_at, created_at, worktree_id)
-           VALUES ('claim', 'src', 'src', 'tree', 'agent', 'session', 2, 1, 'worktree_other')`,
+           VALUES ('claim_null', 'test', 'test', 'tree', 'agent', 'session', 2, 1, NULL)`,
         )
         .run(),
-    ).toThrow(/claims must match their session worktree/u);
+    ).toThrow(/claims require a target worktree/u);
     database.close();
 
     expect(context.databasePath).toBe(

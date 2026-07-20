@@ -50,7 +50,13 @@ function result(value: unknown) {
 }
 
 function claimReceipts(claims: PathClaim[]) {
-  return claims.map(({ id, path, kind, expiresAt }) => ({ id, path, kind, expiresAt }));
+  return claims.map(({ id, member, path, kind, expiresAt }) => ({
+    id,
+    member,
+    path,
+    kind,
+    expiresAt,
+  }));
 }
 
 function execute(operation: () => unknown) {
@@ -231,7 +237,13 @@ server.registerTool(
     description: 'Atomically acquire exact-file or recursive-directory cooperative leases.',
     inputSchema: {
       paths: z
-        .array(z.object({ path: z.string(), kind: z.enum(['exact', 'tree']).optional() }))
+        .array(
+          z.object({
+            path: z.string(),
+            kind: z.enum(['exact', 'tree']).optional(),
+            member: z.string().min(1).optional(),
+          }),
+        )
         .min(1)
         .max(100),
       ttlSeconds: z.number().int().min(30).max(86_400).optional(),
@@ -242,7 +254,11 @@ server.registerTool(
     execute(() =>
       claimReceipts(
         coordinator.acquireClaims(
-          paths.map(({ path, kind }) => ({ path, ...(kind !== undefined ? { kind } : {}) })),
+          paths.map(({ path, kind, member }) => ({
+            path,
+            ...(kind !== undefined ? { kind } : {}),
+            ...(member !== undefined ? { member } : {}),
+          })),
           ttlSeconds,
         ),
       ),

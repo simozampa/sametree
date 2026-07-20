@@ -36,6 +36,14 @@ function collect(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
+function qualifiedClaim(value: string): { member: string; path: string } {
+  const separator = value.indexOf(':');
+  if (separator < 1 || separator === value.length - 1) {
+    throw new SameTreeError('INVALID_INPUT', "Use --at with '<member>:<path>'.");
+  }
+  return { member: value.slice(0, separator), path: value.slice(separator + 1) };
+}
+
 function integer(value: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed)) throw new Error(`Expected an integer, received '${value}'.`);
@@ -61,7 +69,13 @@ function workspaceJoinMode(options: {
 }
 
 function claimReceipts(claims: PathClaim[]) {
-  return claims.map(({ id, path, kind, expiresAt }) => ({ id, path, kind, expiresAt }));
+  return claims.map(({ id, member, path, kind, expiresAt }) => ({
+    id,
+    member,
+    path,
+    kind,
+    expiresAt,
+  }));
 }
 
 function openCoordinator(
@@ -443,22 +457,37 @@ task
 const claim = program.command('claim').description('Coordinate cooperative path leases.');
 
 claim
-  .command('acquire <paths...>')
+  .command('acquire [paths...]')
   .option('--tree', 'claim every path recursively')
+  .option('--member <name>', 'target workspace member')
+  .option('--at <member:path>', 'claim a member-qualified path', collect, [])
   .option('--ttl <seconds>', 'lease duration', integer)
-  .action((paths: string[], options: { tree?: boolean; ttl?: number }, command: Command) => {
-    runWithCoordinator(command, (coordinator) =>
-      claimReceipts(
-        coordinator.acquireClaims(
-          paths.map((claimedPath) => ({
-            path: claimedPath,
-            ...(options.tree ? { kind: 'tree' as const } : {}),
-          })),
-          options.ttl,
+  .action(
+    (
+      paths: string[],
+      options: { at: string[]; member?: string; tree?: boolean; ttl?: number },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        claimReceipts(
+          coordinator.acquireClaims(
+            [
+              ...paths.map((claimedPath) => ({
+                path: claimedPath,
+                ...(options.tree ? { kind: 'tree' as const } : {}),
+                ...(options.member !== undefined ? { member: options.member } : {}),
+              })),
+              ...options.at.map((value) => ({
+                ...qualifiedClaim(value),
+                ...(options.tree ? { kind: 'tree' as const } : {}),
+              })),
+            ],
+            options.ttl,
+          ),
         ),
-      ),
-    );
-  });
+      );
+    },
+  );
 
 claim
   .command('list')

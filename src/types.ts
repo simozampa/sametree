@@ -15,6 +15,7 @@ export interface Agent {
 export interface Session {
   id: string;
   agentName: string;
+  homeWorktreeId: string;
   processId: number;
   startedAt: number;
   lastHeartbeatAt: number;
@@ -38,6 +39,8 @@ export interface Task {
 
 export interface PathClaim {
   id: string;
+  worktreeId: string;
+  member: string;
   path: string;
   comparisonPath: string;
   kind: ClaimKind;

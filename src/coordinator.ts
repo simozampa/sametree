@@ -96,6 +96,7 @@ export interface SnapshotOptions {
 export interface AcquireClaimInput {
   path: string;
   kind?: ClaimKind;
+  member?: string;
 }
 
 function createId(prefix: string): string {
@@ -161,6 +162,7 @@ function mapSession(row: Row): Session {
   return {
     id: stringValue(row, 'id'),
     agentName: stringValue(row, 'agent_name'),
+    homeWorktreeId: stringValue(row, 'home_worktree_id'),
     processId: numberValue(row, 'process_id'),
     startedAt: numberValue(row, 'started_at'),
     lastHeartbeatAt: numberValue(row, 'last_heartbeat_at'),
@@ -188,6 +190,8 @@ function mapTask(row: Row, dependencies: string[]): Task {
 function mapClaim(row: Row): PathClaim {
   return {
     id: stringValue(row, 'id'),
+    worktreeId: stringValue(row, 'worktree_id'),
+    member: stringValue(row, 'worktree_name'),
     path: stringValue(row, 'path'),
     comparisonPath: stringValue(row, 'comparison_path'),
     kind: stringValue(row, 'kind') as ClaimKind,
@@ -382,6 +386,59 @@ export class Coordinator {
     if (!found) throw new SameTreeError('NOT_FOUND', `Agent '${name}' is not registered.`);
   }
 
+  #claimWorktree(member?: string): {
+    id: string;
+    ignoreCase: boolean;
+    name: string;
+    root: string;
+  } {
+    const requestedMember = member === undefined ? undefined : requireText(member, 'Member', 100);
+    const row = requestedMember
+      ? (this.#database
+          .prepare(
+            `SELECT worktree.id, worktree.name, worktree.root, worktree.available,
+                    worktree.private_git_directory
+             FROM worktrees worktree
+             WHERE worktree.name = ?`,
+          )
+          .get(requestedMember) as Row | undefined)
+      : (this.#database
+          .prepare(
+            `SELECT worktree.id, worktree.name, worktree.root, worktree.available,
+                    worktree.private_git_directory
+             FROM worktrees worktree
+             WHERE worktree.id = ?`,
+          )
+          .get(this.worktreeId) as Row | undefined);
+    if (!row) {
+      throw new SameTreeError(
+        'NOT_FOUND',
+        `Workspace member '${requestedMember ?? this.worktreeId}' was not found.`,
+      );
+    }
+    if (numberValue(row, 'available') !== 1) {
+      throw new SameTreeError(
+        'WORKSPACE_ERROR',
+        `Workspace member '${stringValue(row, 'name')}' is unavailable.`,
+      );
+    }
+    const id = stringValue(row, 'id');
+    const root = stringValue(row, 'root');
+    const targetRepository = resolveRepository(root);
+    if (targetRepository.privateGitDirectory !== stringValue(row, 'private_git_directory')) {
+      throw new SameTreeError(
+        'WORKSPACE_ERROR',
+        `Workspace member '${stringValue(row, 'name')}' moved and must be relinked.`,
+      );
+    }
+    return {
+      id,
+      name: stringValue(row, 'name'),
+      root,
+      ignoreCase: targetRepository.ignoreCase,
+    };
+  }
+
   #dependencies(taskId: string): string[] {
     return (
       this.#database
@@ -424,8 +481,10 @@ export class Coordinator {
     const selectedClaims = selectedIds.map((claimId) => {
       const claim = this.#database
         .prepare(
-          `SELECT * FROM path_claims
-           WHERE id = ? AND agent_name = ? AND expires_at > ?`,
+          `SELECT claim.*, worktree.name AS worktree_name
+           FROM path_claims claim
+           JOIN worktrees worktree ON worktree.id = claim.worktree_id
+           WHERE claim.id = ? AND claim.agent_name = ? AND claim.expires_at > ?`,
         )
         .get(claimId, fromAgent, now) as Row | undefined;
       if (!claim) {
@@ -437,12 +496,18 @@ export class Coordinator {
       return claim;
     });
     const sourceClaims = this.#database
-      .prepare('SELECT * FROM path_claims WHERE agent_name = ? AND expires_at > ?')
+      .prepare(
+        `SELECT claim.*, worktree.name AS worktree_name
+         FROM path_claims claim
+         JOIN worktrees worktree ON worktree.id = claim.worktree_id
+         WHERE claim.agent_name = ? AND claim.expires_at > ?`,
+      )
       .all(fromAgent, now) as Row[];
     for (const selected of selectedClaims) {
       const overlap = sourceClaims.find(
         (candidate) =>
           !selectedIds.includes(stringValue(candidate, 'id')) &&
+          stringValue(candidate, 'worktree_id') === stringValue(selected, 'worktree_id') &&
           claimsOverlap(
             {
               comparisonPath: stringValue(selected, 'comparison_path'),
@@ -893,19 +958,26 @@ export class Coordinator {
       throw new SameTreeError('INVALID_INPUT', 'Claim TTL must be between 30 and 86400 seconds.');
     }
 
-    const requested = inputs.map((input) =>
-      normalizeClaim(
-        this.repository.root,
-        input.path,
-        input.kind ?? (input.path.endsWith('/') ? 'tree' : 'exact'),
-        this.repository.ignoreCase,
-      ),
-    );
+    const requested = inputs.map((input) => {
+      const worktree = this.#claimWorktree(input.member);
+      return {
+        ...normalizeClaim(
+          worktree.root,
+          input.path,
+          input.kind ?? (input.path.endsWith('/') ? 'tree' : 'exact'),
+          worktree.ignoreCase,
+        ),
+        worktreeId: worktree.id,
+        member: worktree.name,
+      };
+    });
     const unique = requested.filter(
       (claim, index, all) =>
         all.findIndex(
           (candidate) =>
-            candidate.comparisonPath === claim.comparisonPath && candidate.kind === claim.kind,
+            candidate.comparisonPath === claim.comparisonPath &&
+            candidate.kind === claim.kind &&
+            candidate.worktreeId === claim.worktreeId,
         ) === index,
     );
     const now = this.#clock();
@@ -914,7 +986,12 @@ export class Coordinator {
     return immediateTransaction(this.#database, () => {
       this.#database.prepare('DELETE FROM path_claims WHERE expires_at <= ?').run(now);
       const active = this.#database
-        .prepare('SELECT * FROM path_claims WHERE expires_at > ?')
+        .prepare(
+          `SELECT claim.*, worktree.name AS worktree_name
+           FROM path_claims claim
+           JOIN worktrees worktree ON worktree.id = claim.worktree_id
+           WHERE claim.expires_at > ?`,
+        )
         .all(now) as Row[];
 
       // One agent may intentionally hold a broad claim plus narrower claims for handoff.
@@ -922,6 +999,7 @@ export class Coordinator {
         const conflict = active.find(
           (row) =>
             stringValue(row, 'agent_name') !== this.agentName &&
+            stringValue(row, 'worktree_id') === claim.worktreeId &&
             claimsOverlap(claim, {
               comparisonPath: stringValue(row, 'comparison_path'),
               kind: stringValue(row, 'kind') as ClaimKind,
@@ -930,7 +1008,7 @@ export class Coordinator {
         if (conflict) {
           throw new SameTreeError(
             'CLAIM_CONFLICT',
-            `${claim.path} overlaps ${stringValue(conflict, 'agent_name')}'s active claim.`,
+            `${claim.member}:${claim.path} overlaps ${stringValue(conflict, 'agent_name')}'s active claim.`,
             { conflictingClaim: mapClaim(conflict) },
           );
         }
@@ -941,6 +1019,7 @@ export class Coordinator {
         const own = active.find(
           (row) =>
             stringValue(row, 'agent_name') === this.agentName &&
+            stringValue(row, 'worktree_id') === claim.worktreeId &&
             stringValue(row, 'comparison_path') === claim.comparisonPath &&
             stringValue(row, 'kind') === claim.kind,
         );
@@ -969,10 +1048,12 @@ export class Coordinator {
             this.sessionId,
             expiresAt,
             now,
-            this.worktreeId,
+            claim.worktreeId,
           );
         results.push({
           id,
+          worktreeId: claim.worktreeId,
+          member: claim.member,
           path: claim.path,
           comparisonPath: claim.comparisonPath,
           kind: claim.kind,
@@ -982,7 +1063,7 @@ export class Coordinator {
         });
       }
       this.#recordEvent('claim.acquired', 'claim', results.map((claim) => claim.id).join(','), {
-        paths: results.map((claim) => claim.path),
+        paths: results.map((claim) => ({ member: claim.member, path: claim.path })),
         expiresAt,
       });
       return results;
@@ -992,10 +1073,21 @@ export class Coordinator {
   listClaims(options: { includeExpired?: boolean } = {}): PathClaim[] {
     const rows = options.includeExpired
       ? (this.#database
-          .prepare('SELECT * FROM path_claims ORDER BY path, created_at')
+          .prepare(
+            `SELECT claim.*, worktree.name AS worktree_name
+             FROM path_claims claim
+             JOIN worktrees worktree ON worktree.id = claim.worktree_id
+             ORDER BY worktree.name, claim.path, claim.created_at`,
+          )
           .all() as Row[])
       : (this.#database
-          .prepare('SELECT * FROM path_claims WHERE expires_at > ? ORDER BY path, created_at')
+          .prepare(
+            `SELECT claim.*, worktree.name AS worktree_name
+             FROM path_claims claim
+             JOIN worktrees worktree ON worktree.id = claim.worktree_id
+             WHERE claim.expires_at > ?
+             ORDER BY worktree.name, claim.path, claim.created_at`,
+          )
           .all(this.#clock()) as Row[]);
     return rows.map(mapClaim);
   }

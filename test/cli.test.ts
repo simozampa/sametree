@@ -237,11 +237,24 @@ describe('CLI', () => {
     const repository = createTestRepository();
     repositories.push(repository);
 
-    const result = await runCli(repository.root, 'claimant', ['claim', 'acquire', 'src/api.ts']);
+    const member = path.basename(repository.root);
+    const result = await runCli(repository.root, 'claimant', [
+      'claim',
+      'acquire',
+      '--at',
+      `${member}:src/api.ts`,
+    ]);
     const output = JSON.parse(result.stdout) as Array<Record<string, unknown>>;
 
     expect(result).toMatchObject({ code: 0, stderr: '' });
-    expect(Object.keys(output[0] ?? {}).sort()).toEqual(['expiresAt', 'id', 'kind', 'path']);
+    expect(Object.keys(output[0] ?? {}).sort()).toEqual([
+      'expiresAt',
+      'id',
+      'kind',
+      'member',
+      'path',
+    ]);
+    expect(output[0]?.member).toBe(member);
   });
 
   it('forcibly takes over active work with explicit user authorization', async () => {
