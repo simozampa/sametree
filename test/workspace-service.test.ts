@@ -1,0 +1,319 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
+import Database from 'better-sqlite3';
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { Coordinator } from '../src/coordinator.js';
+import { openDatabase } from '../src/database.js';
+import { resolveRepository } from '../src/git.js';
+import {
+  acquireWorkspaceOperationLock,
+  bindWorktree,
+  listRegisteredWorkspaces,
+  registerWorkspace,
+  resolveWorkspaceBinding,
+} from '../src/workspace.js';
+import {
+  addWorkspaceMember,
+  createWorkspace,
+  workspaceMembers,
+  workspaceStatus,
+} from '../src/workspace-service.js';
+import { createTestRepository, type TestRepository } from './helpers.js';
+
+const repositories: TestRepository[] = [];
+const coordinators: Coordinator[] = [];
+const temporaryDirectories: string[] = [];
+
+function repository(): TestRepository {
+  const created = createTestRepository();
+  repositories.push(created);
+  return created;
+}
+
+function registryRoot(): string {
+  const directory = mkdtempSync(path.join(tmpdir(), 'sametree-workspace-service-'));
+  temporaryDirectories.push(directory);
+  return path.join(directory, 'workspaces');
+}
+
+function open(root: string, agent: string, workspaceRegistryRoot?: string): Coordinator {
+  const coordinator = Coordinator.open({
+    cwd: root,
+    agent,
+    ...(workspaceRegistryRoot ? { workspaceRegistryRoot } : {}),
+  });
+  coordinators.push(coordinator);
+  return coordinator;
+}
+
+afterEach(() => {
+  for (const coordinator of coordinators.splice(0)) coordinator.close();
+  for (const repository of repositories.splice(0)) repository.cleanup();
+  for (const directory of temporaryDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+describe('workspace operations', () => {
+  it('creates a fresh workspace while preserving standalone state', () => {
+    const source = repository();
+    const registry = registryRoot();
+    const standalone = open(source.root, 'standalone');
+    const task = standalone.createTask({ title: 'Preserved only as backup' });
+    standalone.close();
+
+    const joined = createWorkspace(
+      source.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry, now: 1_000 },
+    );
+    expect(joined).toMatchObject({ mode: 'fresh', imported: false });
+    expect(joined.sourceDatabasePath).toBe(resolveRepository(source.root).databasePath);
+    expect(workspaceStatus(source.root, { registryRoot: registry })).toMatchObject({
+      bound: true,
+      member: { name: 'studio', available: true },
+      members: [{ name: 'studio' }],
+    });
+
+    const workspaceCoordinator = open(source.root, 'workspace-agent', registry);
+    expect(workspaceCoordinator.listTasks({ includeTerminal: true })).toEqual([]);
+    const backup = new Database(joined.sourceDatabasePath, { readonly: true });
+    expect(backup.prepare('SELECT id FROM tasks WHERE id = ?').get(task.id)).toEqual({
+      id: task.id,
+    });
+    backup.close();
+  });
+
+  it('imports standalone IDs and records original event sequences idempotently', () => {
+    const source = repository();
+    const registry = registryRoot();
+    const standalone = open(source.root, 'author');
+    const task = standalone.createTask({ title: 'Import me' });
+    standalone.close();
+    const sourceDatabasePath = resolveRepository(source.root).databasePath;
+    const sourceDatabase = new Database(sourceDatabasePath, { readonly: true });
+    const sourceEvent = sourceDatabase
+      .prepare("SELECT id, sequence FROM events WHERE entity_id = ? AND kind = 'task.created'")
+      .get(task.id) as { id: string; sequence: number };
+    sourceDatabase.close();
+
+    const joined = createWorkspace(
+      source.root,
+      { name: 'Product', memberName: 'studio', mode: 'import-current' },
+      { registryRoot: registry, now: 1_000 },
+    );
+    expect(joined.imported).toBe(true);
+
+    const workspaceCoordinator = open(source.root, 'observer', registry);
+    expect(workspaceCoordinator.listTasks().map((item) => item.id)).toContain(task.id);
+    const workspaceDatabase = new Database(joined.workspace.databasePath, { readonly: true });
+    expect(
+      workspaceDatabase
+        .prepare(
+          `SELECT source_sequence FROM event_import_sources
+           WHERE event_id = ?`,
+        )
+        .get(sourceEvent.id),
+    ).toEqual({ source_sequence: sourceEvent.sequence });
+    workspaceDatabase.close();
+
+    expect(
+      addWorkspaceMember(
+        source.root,
+        {
+          workspaceId: joined.workspace.id,
+          memberName: 'studio',
+          mode: 'import-current',
+        },
+        { registryRoot: registry, now: 2_000 },
+      ),
+    ).toMatchObject({ imported: false, member: { id: joined.member.id } });
+  });
+
+  it('shares tasks and messages across sibling repository members', () => {
+    const studio = repository();
+    const server = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    addWorkspaceMember(
+      server.root,
+      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+
+    const studioAgent = open(studio.root, 'studio-agent', registry);
+    const serverAgent = open(server.root, 'server-agent', registry);
+    const task = studioAgent.createTask({ title: 'Cross-repository task' });
+    studioAgent.sendMessage({
+      to: 'server-agent',
+      subject: 'Workspace message',
+      body: 'Visible across members.',
+    });
+
+    expect(serverAgent.listTasks().map((item) => item.id)).toContain(task.id);
+    expect(serverAgent.inbox().map((message) => message.subject)).toContain('Workspace message');
+    expect(
+      workspaceMembers(studio.root, { registryRoot: registry }).map((item) => item.name),
+    ).toEqual(['holo-server', 'studio']);
+  });
+
+  it('refuses active imports and identity collisions without binding the source', () => {
+    const studio = repository();
+    const server = repository();
+    const active = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const existing = open(studio.root, 'same-agent', registry);
+    existing.close();
+
+    const source = open(server.root, 'same-agent');
+    source.createTask({ title: 'Conflicting state' });
+    source.close();
+    expect(() =>
+      addWorkspaceMember(
+        server.root,
+        { workspaceId: workspace.workspace.id, memberName: 'server', mode: 'import-current' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/identity 'same-agent' already exists/u);
+    expect(
+      resolveWorkspaceBinding(resolveRepository(server.root), { registryRoot: registry }),
+    ).toBeNull();
+    expect(workspaceMembers(studio.root, { registryRoot: registry })).toHaveLength(1);
+
+    const activeAgent = open(active.root, 'active-agent');
+    expect(() =>
+      addWorkspaceMember(
+        active.root,
+        { workspaceId: workspace.workspace.id, memberName: 'active', mode: 'import-current' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/Stop active standalone sessions/u);
+    expect(
+      resolveWorkspaceBinding(resolveRepository(active.root), { registryRoot: registry }),
+    ).toBeNull();
+    activeAgent.close();
+  });
+
+  it('preflights member ID collisions without mutating the existing member', () => {
+    const studio = repository();
+    const server = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+
+    const serverContext = resolveRepository(server.root);
+    openDatabase(serverContext).close();
+    const source = new Database(serverContext.databasePath);
+    source.pragma('foreign_keys = OFF');
+    source.prepare('UPDATE repositories SET id = ?').run(workspace.member.repositoryId);
+    source
+      .prepare('UPDATE worktrees SET id = ?, repository_id = ?')
+      .run(workspace.member.id, workspace.member.repositoryId);
+    source.close();
+
+    expect(() =>
+      addWorkspaceMember(
+        server.root,
+        { workspaceId: workspace.workspace.id, memberName: 'server', mode: 'import-current' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/Repository identity .* already exists/u);
+    expect(workspaceMembers(studio.root, { registryRoot: registry })).toEqual([
+      expect.objectContaining({ id: workspace.member.id, name: 'studio' }),
+    ]);
+    expect(resolveWorkspaceBinding(serverContext, { registryRoot: registry })).toBeNull();
+    const unlocked = new Database(serverContext.databasePath);
+    expect(() => unlocked.exec('BEGIN IMMEDIATE; ROLLBACK;')).not.toThrow();
+    unlocked.close();
+  });
+
+  it('rejects unverified bindings, alternate databases, and session starts during joins', () => {
+    const orphan = repository();
+    const registry = registryRoot();
+    const context = resolveRepository(orphan.root);
+    const registered = registerWorkspace(
+      { id: 'workspace_orphan', name: 'Orphan', createdAt: 1 },
+      { registryRoot: registry },
+    );
+    bindWorktree(
+      context,
+      {
+        workspaceId: registered.id,
+        repositoryId: 'repository_orphan',
+        repositoryName: 'Orphan',
+        worktreeId: 'worktree_orphan',
+        worktreeName: 'orphan',
+      },
+      { registryRoot: registry },
+    );
+    expect(() => open(orphan.root, 'orphan-agent', registry)).toThrow(
+      /Bound workspace database is missing/u,
+    );
+
+    const joinedRepository = repository();
+    const joined = createWorkspace(
+      joinedRepository.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    expect(() =>
+      Coordinator.open({
+        cwd: joinedRepository.root,
+        agent: 'alternate-database',
+        databasePath: ':memory:',
+        workspaceRegistryRoot: registry,
+      }),
+    ).toThrow(/cannot override its workspace database/u);
+
+    const locked = repository();
+    const lockedContext = resolveRepository(locked.root);
+    const release = acquireWorkspaceOperationLock(lockedContext);
+    try {
+      expect(() => open(locked.root, 'racing-agent')).toThrow(
+        /session startup or workspace operation is active/u,
+      );
+    } finally {
+      release();
+    }
+    const recoveredRelease = acquireWorkspaceOperationLock(lockedContext);
+    recoveredRelease();
+    expect(joined.workspace.databasePath).not.toBe(':memory:');
+  });
+
+  it('retries workspace creation with the same registered identity', () => {
+    const source = repository();
+    const registry = registryRoot();
+    const active = open(source.root, 'active-agent');
+    const create = () =>
+      createWorkspace(
+        source.root,
+        { name: 'Product', memberName: 'studio', mode: 'fresh' },
+        { registryRoot: registry },
+      );
+
+    expect(create).toThrow(/Stop active standalone sessions/u);
+    const [pending] = listRegisteredWorkspaces({ registryRoot: registry });
+    expect(pending).toBeDefined();
+    expect(create).toThrow(/Stop active standalone sessions/u);
+    expect(listRegisteredWorkspaces({ registryRoot: registry })).toHaveLength(1);
+
+    active.close();
+    expect(create()).toMatchObject({ workspace: { id: pending?.id }, member: { name: 'studio' } });
+    expect(listRegisteredWorkspaces({ registryRoot: registry })).toHaveLength(1);
+  });
+});

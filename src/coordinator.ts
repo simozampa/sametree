@@ -27,6 +27,12 @@ import type {
   TaskPriority,
   TaskStatus,
 } from './types.js';
+import {
+  acquireWorkspaceOperationLock,
+  resolveWorkspaceBinding,
+  type WorkspaceContext,
+} from './workspace.js';
+import { assertWorkspaceBindingReady } from './workspace-service.js';
 
 type Row = Record<string, unknown>;
 const MAX_HANDOFF_CONTEXT_BYTES = 100_000;
@@ -37,6 +43,7 @@ export interface CoordinatorOptions {
   harness?: Harness;
   role?: string;
   databasePath?: string;
+  workspaceRegistryRoot?: string;
   clock?: () => number;
   recordSessionLifecycleEvents?: boolean;
 }
@@ -229,6 +236,7 @@ export class Coordinator {
   readonly config: SameTreeConfig;
   readonly agentName: string;
   readonly sessionId: string;
+  readonly workspace: WorkspaceContext | null;
   readonly worktreeId: string;
 
   readonly #database: DatabaseType;
@@ -242,53 +250,96 @@ export class Coordinator {
     this.agentName = validateAgentName(options.agent);
     this.#clock = options.clock ?? Date.now;
     this.#recordSessionLifecycleEvents = options.recordSessionLifecycleEvents ?? true;
-    this.#database = openDatabase(this.repository, {
-      ...(options.databasePath ? { databasePath: options.databasePath } : {}),
-      now: this.#clock(),
-    });
-    this.worktreeId = databaseWorktreeId(this.#database, this.repository);
-    this.sessionId = createId('session');
-
-    const now = this.#clock();
+    const releaseWorkspaceLock = acquireWorkspaceOperationLock(this.repository, 2_500);
     try {
-      immediateTransaction(this.#database, () => {
-        this.#database
-          .prepare(
-            `INSERT INTO agents (name, harness, role, created_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(name) DO UPDATE SET
-               harness = excluded.harness,
-               role = excluded.role,
-               last_seen_at = excluded.last_seen_at`,
-          )
-          .run(this.agentName, options.harness ?? 'other', options.role ?? 'implementer', now, now);
-        this.#database
-          .prepare(
-            `INSERT INTO sessions
-              (id, agent_name, home_worktree_id, process_id, started_at,
-               last_heartbeat_at, expires_at, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
-          )
-          .run(
-            this.sessionId,
-            this.agentName,
-            this.worktreeId,
-            process.pid,
-            now,
-            now,
-            now + this.config.sessionTtlSeconds * 1_000,
-          );
-        if (this.#recordSessionLifecycleEvents) {
-          this.#recordEvent('session.started', 'session', this.sessionId, {
-            harness: options.harness ?? 'other',
-            role: options.role ?? 'implementer',
-          });
-        }
+      this.workspace = resolveWorkspaceBinding(this.repository, {
+        ...(options.workspaceRegistryRoot ? { registryRoot: options.workspaceRegistryRoot } : {}),
       });
-    } catch (error) {
-      this.#database.close();
-      this.#closed = true;
-      throw error;
+      if (this.workspace) {
+        assertWorkspaceBindingReady(this.repository, this.workspace);
+        if (
+          options.databasePath !== undefined &&
+          options.databasePath !== this.workspace.workspace.databasePath
+        ) {
+          throw new SameTreeError(
+            'WORKSPACE_ERROR',
+            'A bound worktree cannot override its workspace database path.',
+          );
+        }
+      }
+      this.#database = openDatabase(this.repository, {
+        ...(options.databasePath
+          ? { databasePath: options.databasePath }
+          : this.workspace
+            ? { databasePath: this.workspace.workspace.databasePath }
+            : {}),
+        ...(this.workspace
+          ? {
+              member: {
+                workspaceId: this.workspace.workspace.id,
+                workspaceName: this.workspace.workspace.name,
+                workspaceImplicit: false,
+                repositoryId: this.workspace.repositoryId,
+                repositoryName: this.workspace.repositoryName,
+                worktreeId: this.workspace.worktreeId,
+                worktreeName: this.workspace.worktreeName,
+              },
+            }
+          : {}),
+        now: this.#clock(),
+      });
+      this.worktreeId = databaseWorktreeId(this.#database, this.repository);
+      this.sessionId = createId('session');
+
+      const now = this.#clock();
+      try {
+        immediateTransaction(this.#database, () => {
+          this.#database
+            .prepare(
+              `INSERT INTO agents (name, harness, role, created_at, last_seen_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                 harness = excluded.harness,
+                 role = excluded.role,
+                 last_seen_at = excluded.last_seen_at`,
+            )
+            .run(
+              this.agentName,
+              options.harness ?? 'other',
+              options.role ?? 'implementer',
+              now,
+              now,
+            );
+          this.#database
+            .prepare(
+              `INSERT INTO sessions
+                (id, agent_name, home_worktree_id, process_id, started_at,
+                 last_heartbeat_at, expires_at, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
+            )
+            .run(
+              this.sessionId,
+              this.agentName,
+              this.worktreeId,
+              process.pid,
+              now,
+              now,
+              now + this.config.sessionTtlSeconds * 1_000,
+            );
+          if (this.#recordSessionLifecycleEvents) {
+            this.#recordEvent('session.started', 'session', this.sessionId, {
+              harness: options.harness ?? 'other',
+              role: options.role ?? 'implementer',
+            });
+          }
+        });
+      } catch (error) {
+        this.#database.close();
+        this.#closed = true;
+        throw error;
+      }
+    } finally {
+      releaseWorkspaceLock();
     }
   }
 

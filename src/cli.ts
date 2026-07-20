@@ -5,19 +5,27 @@ import { Command, Option } from 'commander';
 
 import { Coordinator } from './coordinator.js';
 import { diagnoseRepository } from './doctor.js';
-import { errorResult } from './errors.js';
+import { errorResult, SameTreeError } from './errors.js';
 import { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 import { initializeProject } from './project.js';
 import { setupProject } from './setup.js';
 import type { Harness, PathClaim, TaskPriority, TaskStatus } from './types.js';
 import { VERSION } from './version.js';
 import { followMessages, watchEvents } from './watch.js';
+import {
+  addWorkspaceMember,
+  createWorkspace,
+  type WorkspaceJoinMode,
+  workspaceMembers,
+  workspaceStatus,
+} from './workspace-service.js';
 
 interface GlobalOptions {
   agent?: string;
   cwd: string;
   harness: Harness;
   role: string;
+  workspaceRegistry?: string;
 }
 
 function print(value: unknown): void {
@@ -42,6 +50,16 @@ function objectJson(value: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+function workspaceJoinMode(options: {
+  fresh?: boolean;
+  importCurrent?: boolean;
+}): WorkspaceJoinMode {
+  if (options.fresh === options.importCurrent) {
+    throw new SameTreeError('INVALID_INPUT', 'Choose exactly one of --fresh or --import-current.');
+  }
+  return options.importCurrent ? 'import-current' : 'fresh';
+}
+
 function claimReceipts(claims: PathClaim[]) {
   return claims.map(({ id, path, kind, expiresAt }) => ({ id, path, kind, expiresAt }));
 }
@@ -56,6 +74,7 @@ function openCoordinator(
     cwd: options.cwd,
     harness: options.harness,
     role: options.role,
+    ...(options.workspaceRegistry ? { workspaceRegistryRoot: options.workspaceRegistry } : {}),
     ...coordinatorOptions,
   });
 }
@@ -136,6 +155,11 @@ const program = new Command()
   .version(VERSION)
   .option('--agent <name>', 'unique agent name', process.env.SAMETREE_AGENT)
   .option('--cwd <path>', 'working tree directory', process.env.SAMETREE_CWD ?? process.cwd())
+  .option(
+    '--workspace-registry <path>',
+    'workspace registry directory',
+    process.env.SAMETREE_WORKSPACE_REGISTRY,
+  )
   .addOption(
     new Option('--harness <name>', 'agent harness')
       .choices(['claude-code', 'opencode', 'other'])
@@ -193,6 +217,80 @@ program
     const options = command.optsWithGlobals<GlobalOptions>();
     print(diagnoseRepository(options.cwd));
   });
+
+const workspace = program.command('workspace').description('Manage multi-repository workspaces.');
+
+workspace
+  .command('create <name>')
+  .description('Create a workspace and join this worktree.')
+  .requiredOption('--member <name>', 'workspace member name')
+  .option('--fresh', 'start with empty workspace coordination state')
+  .option('--import-current', 'import current standalone coordination state')
+  .action(
+    (
+      name: string,
+      options: { fresh?: boolean; importCurrent?: boolean; member: string },
+      command: Command,
+    ) => {
+      const globals = command.optsWithGlobals<GlobalOptions>();
+      print(
+        createWorkspace(
+          globals.cwd,
+          { name, memberName: options.member, mode: workspaceJoinMode(options) },
+          {
+            ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+          },
+        ),
+      );
+    },
+  );
+
+workspace
+  .command('add <workspace-id>')
+  .description('Add this worktree to an existing local workspace.')
+  .requiredOption('--member <name>', 'workspace member name')
+  .option('--fresh', 'leave standalone state as a recoverable backup')
+  .option('--import-current', 'import current standalone coordination state')
+  .action(
+    (
+      workspaceId: string,
+      options: { fresh?: boolean; importCurrent?: boolean; member: string },
+      command: Command,
+    ) => {
+      const globals = command.optsWithGlobals<GlobalOptions>();
+      print(
+        addWorkspaceMember(
+          globals.cwd,
+          {
+            workspaceId,
+            memberName: options.member,
+            mode: workspaceJoinMode(options),
+          },
+          {
+            ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+          },
+        ),
+      );
+    },
+  );
+
+workspace.command('status').action((_options: unknown, command: Command) => {
+  const globals = command.optsWithGlobals<GlobalOptions>();
+  print(
+    workspaceStatus(globals.cwd, {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    }),
+  );
+});
+
+workspace.command('members').action((_options: unknown, command: Command) => {
+  const globals = command.optsWithGlobals<GlobalOptions>();
+  print(
+    workspaceMembers(globals.cwd, {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    }),
+  );
+});
 
 const task = program.command('task').description('Create and coordinate durable tasks.');
 

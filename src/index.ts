@@ -49,15 +49,28 @@ export type {
 export { VERSION } from './version.js';
 export { followMessages, formatEvent, formatMessage, watchEvents } from './watch.js';
 export {
-  type BindWorktreeInput,
-  bindWorktree,
+  listRegisteredWorkspaces,
   type RegisteredWorkspace,
   type RepositoryWorkspaceBinding,
   readRegisteredWorkspace,
   registerWorkspace,
+  resolveRepositoryWorkspaceBinding,
   resolveWorkspaceBinding,
   type WorkspaceContext,
   type WorkspaceRegistration,
   type WorkspaceRegistryOptions,
   type WorktreeWorkspaceBinding,
 } from './workspace.js';
+export {
+  type AddWorkspaceMemberInput,
+  addWorkspaceMember,
+  type CreateWorkspaceInput,
+  createWorkspace,
+  type WorkspaceJoinMode,
+  type WorkspaceJoinResult,
+  type WorkspaceMember,
+  type WorkspaceServiceOptions,
+  type WorkspaceStatus,
+  workspaceMembers,
+  workspaceStatus,
+} from './workspace-service.js';

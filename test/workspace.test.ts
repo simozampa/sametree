@@ -80,14 +80,18 @@ describe('workspace registry', () => {
       {
         workspaceId: workspace.id,
         repositoryId: 'repository_main',
+        repositoryName: 'Main',
         worktreeId: 'worktree_main',
+        worktreeName: 'main',
       },
       { registryRoot },
     );
     expect(context).toEqual({
       workspace,
       repositoryId: 'repository_main',
+      repositoryName: 'Main',
       worktreeId: 'worktree_main',
+      worktreeName: 'main',
     });
     expect(resolveWorkspaceBinding(resolveRepository(repository.root), { registryRoot })).toEqual(
       context,
@@ -108,7 +112,9 @@ describe('workspace registry', () => {
       {
         workspaceId: 'workspace_test',
         repositoryId: 'repository_shared',
+        repositoryName: 'Shared',
         worktreeId: 'worktree_main',
+        worktreeName: 'main',
       },
       { registryRoot },
     );
@@ -122,7 +128,9 @@ describe('workspace registry', () => {
         {
           workspaceId: 'workspace_test',
           repositoryId: 'repository_shared',
+          repositoryName: 'Shared',
           worktreeId: 'worktree_feature',
+          worktreeName: 'feature',
         },
         { registryRoot },
       );
@@ -156,7 +164,9 @@ describe('workspace registry', () => {
       {
         workspaceId: 'workspace_test',
         repositoryId: 'repository_main',
+        repositoryName: 'Main',
         worktreeId: 'worktree_main',
+        worktreeName: 'main',
       },
       { registryRoot },
     );
@@ -167,7 +177,9 @@ describe('workspace registry', () => {
         {
           workspaceId: 'workspace_test',
           repositoryId: 'repository_other',
+          repositoryName: 'Other',
           worktreeId: 'worktree_main',
+          worktreeName: 'main',
         },
         { registryRoot },
       ),
@@ -178,7 +190,9 @@ describe('workspace registry', () => {
         {
           workspaceId: 'workspace_test',
           repositoryId: 'repository_main',
+          repositoryName: 'Main',
           worktreeId: 'worktree_other',
+          worktreeName: 'other',
         },
         { registryRoot },
       ),

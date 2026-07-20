@@ -243,4 +243,35 @@ describe('database workspace migration', () => {
     });
     database.close();
   });
+
+  it('rejects member ID collisions atomically inside database initialization', () => {
+    const first = createTestRepository();
+    const second = createTestRepository();
+    repositories.push(first, second);
+    const firstContext = resolveRepository(first.root);
+    const secondContext = resolveRepository(second.root);
+    const databasePath = path.join(firstContext.privateGitDirectory, 'sametree', 'shared.sqlite3');
+    const member = {
+      workspaceId: 'workspace_test',
+      workspaceName: 'Test workspace',
+      workspaceImplicit: false,
+      repositoryId: 'repository_test',
+      repositoryName: 'Studio',
+      worktreeId: 'worktree_test',
+      worktreeName: 'studio',
+    } as const;
+    openDatabase(firstContext, { databasePath, member }).close();
+
+    expect(() => openDatabase(secondContext, { databasePath, member })).toThrow(
+      /Repository identity collision/u,
+    );
+    const verification = new Database(databasePath, { readonly: true });
+    expect(verification.prepare('SELECT common_git_directory FROM repositories').get()).toEqual({
+      common_git_directory: firstContext.commonGitDirectory,
+    });
+    expect(verification.prepare('SELECT private_git_directory FROM worktrees').get()).toEqual({
+      private_git_directory: firstContext.privateGitDirectory,
+    });
+    verification.close();
+  });
 });

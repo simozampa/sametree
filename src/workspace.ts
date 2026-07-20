@@ -1,17 +1,28 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  type Dirent,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
+import Database from 'better-sqlite3';
 import { z } from 'zod';
 
 import { SameTreeError } from './errors.js';
 import type { RepositoryContext } from './git.js';
 
 const REGISTRY_SCHEMA_VERSION = 1;
-const BINDING_SCHEMA_VERSION = 1;
+const BINDING_SCHEMA_VERSION = 2;
 const WORKSPACE_METADATA_FILE = 'workspace.json';
 const REPOSITORY_BINDING_FILE = 'repository.json';
 const WORKTREE_BINDING_FILE = 'worktree.json';
+const WORKSPACE_OPERATION_LOCK_FILE = 'workspace-operation.sqlite3';
+const PENDING_WORKSPACE_FILE = 'pending-workspace.json';
 
 const identifierSchema = z
   .string()
@@ -33,16 +44,32 @@ const repositoryBindingSchema = z
     schemaVersion: z.literal(BINDING_SCHEMA_VERSION),
     workspaceId: identifierSchema,
     repositoryId: identifierSchema,
+    repositoryName: z.string().trim().min(1).max(100),
   })
   .strict();
 
 const worktreeBindingSchema = repositoryBindingSchema
-  .extend({ worktreeId: identifierSchema })
+  .extend({
+    worktreeId: identifierSchema,
+    worktreeName: z.string().trim().min(1).max(100),
+  })
+  .strict();
+
+const pendingWorkspaceCreationSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    workspaceId: identifierSchema,
+    workspaceName: z.string().trim().min(1).max(100),
+    memberName: z.string().trim().min(1).max(100),
+    mode: z.enum(['fresh', 'import-current']),
+    createdAt: z.number().int().nonnegative(),
+  })
   .strict();
 
 export type WorkspaceRegistration = z.infer<typeof workspaceRegistrationSchema>;
 export type RepositoryWorkspaceBinding = z.infer<typeof repositoryBindingSchema>;
 export type WorktreeWorkspaceBinding = z.infer<typeof worktreeBindingSchema>;
+export type PendingWorkspaceCreation = z.infer<typeof pendingWorkspaceCreationSchema>;
 
 export interface RegisteredWorkspace extends WorkspaceRegistration {
   directory: string;
@@ -52,7 +79,9 @@ export interface RegisteredWorkspace extends WorkspaceRegistration {
 export interface WorkspaceContext {
   workspace: RegisteredWorkspace;
   repositoryId: string;
+  repositoryName: string;
   worktreeId: string;
+  worktreeName: string;
 }
 
 export interface WorkspaceRegistryOptions {
@@ -62,11 +91,35 @@ export interface WorkspaceRegistryOptions {
 export interface BindWorktreeInput {
   workspaceId: string;
   repositoryId: string;
+  repositoryName: string;
   worktreeId: string;
+  worktreeName: string;
 }
 
 function errorCode(error: unknown): string | undefined {
   return error instanceof Error ? (Reflect.get(error, 'code') as string | undefined) : undefined;
+}
+
+function assertNoSymlinkComponents(target: string): void {
+  const absolute = path.resolve(target);
+  const { root } = path.parse(absolute);
+  let current = root;
+  for (const segment of path.relative(root, absolute).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    try {
+      if (lstatSync(current).isSymbolicLink()) {
+        throw new SameTreeError(
+          'WORKSPACE_ERROR',
+          'Refusing a symlinked database path or workspace metadata path.',
+          { path: current },
+        );
+      }
+    } catch (error) {
+      if (error instanceof SameTreeError) throw error;
+      if (errorCode(error) === 'ENOENT') break;
+      throw error;
+    }
+  }
 }
 
 function parseValue<T>(value: unknown, schema: z.ZodType<T>, label: string): T {
@@ -81,6 +134,7 @@ function parseValue<T>(value: unknown, schema: z.ZodType<T>, label: string): T {
 
 function parseFile<T>(filePath: string, schema: z.ZodType<T>, label: string): T {
   try {
+    assertNoSymlinkComponents(filePath);
     return parseValue(
       JSON.parse(readFileSync(filePath, 'utf8')),
       schema,
@@ -128,7 +182,9 @@ function writeExclusiveOrMatch<T>(
   schema: z.ZodType<T>,
   label: string,
 ): void {
+  assertNoSymlinkComponents(filePath);
   mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  assertNoSymlinkComponents(filePath);
   try {
     writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, {
       encoding: 'utf8',
@@ -165,6 +221,10 @@ function repositoryBindingPath(repository: RepositoryContext): string {
 
 function worktreeBindingPath(repository: RepositoryContext): string {
   return path.join(repository.privateGitDirectory, 'sametree', WORKTREE_BINDING_FILE);
+}
+
+function pendingWorkspacePath(repository: RepositoryContext): string {
+  return path.join(repository.privateGitDirectory, 'sametree', PENDING_WORKSPACE_FILE);
 }
 
 export function registerWorkspace(
@@ -218,6 +278,26 @@ export function readRegisteredWorkspace(
   };
 }
 
+export function listRegisteredWorkspaces(
+  options: WorkspaceRegistryOptions = {},
+): RegisteredWorkspace[] {
+  const root = registryRoot(options);
+  assertNoSymlinkComponents(root);
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return [];
+    throw new SameTreeError('WORKSPACE_ERROR', `Could not read workspace registry at ${root}.`, {
+      cause: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => readRegisteredWorkspace(entry.name, options))
+    .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+}
+
 export function bindWorktree(
   repository: RepositoryContext,
   input: BindWorktreeInput,
@@ -228,12 +308,17 @@ export function bindWorktree(
       schemaVersion: BINDING_SCHEMA_VERSION,
       workspaceId: input.workspaceId,
       repositoryId: input.repositoryId,
+      repositoryName: input.repositoryName,
     },
     repositoryBindingSchema,
     'repository workspace binding',
   );
   const worktreeBinding = parseValue(
-    { ...repositoryBinding, worktreeId: input.worktreeId },
+    {
+      ...repositoryBinding,
+      worktreeId: input.worktreeId,
+      worktreeName: input.worktreeName,
+    },
     worktreeBindingSchema,
     'worktree workspace binding',
   );
@@ -319,6 +404,115 @@ export function resolveWorkspaceBinding(
   return {
     workspace: readRegisteredWorkspace(worktree.workspaceId, options),
     repositoryId: worktree.repositoryId,
+    repositoryName: worktree.repositoryName,
     worktreeId: worktree.worktreeId,
+    worktreeName: worktree.worktreeName,
+  };
+}
+
+export function resolveRepositoryWorkspaceBinding(
+  repository: RepositoryContext,
+): RepositoryWorkspaceBinding | null {
+  return readOptionalFile(
+    repositoryBindingPath(repository),
+    repositoryBindingSchema,
+    'repository workspace binding',
+  );
+}
+
+export function readPendingWorkspaceCreation(
+  repository: RepositoryContext,
+): PendingWorkspaceCreation | null {
+  return readOptionalFile(
+    pendingWorkspacePath(repository),
+    pendingWorkspaceCreationSchema,
+    'pending workspace creation',
+  );
+}
+
+export function writePendingWorkspaceCreation(
+  repository: RepositoryContext,
+  input: Omit<PendingWorkspaceCreation, 'schemaVersion'>,
+): PendingWorkspaceCreation {
+  const pending = parseValue(
+    { schemaVersion: 1, ...input },
+    pendingWorkspaceCreationSchema,
+    'pending workspace creation',
+  );
+  writeExclusiveOrMatch(
+    pendingWorkspacePath(repository),
+    pending,
+    pendingWorkspaceCreationSchema,
+    'pending workspace creation',
+  );
+  return pending;
+}
+
+export function clearPendingWorkspaceCreation(repository: RepositoryContext): void {
+  const pendingPath = pendingWorkspacePath(repository);
+  assertNoSymlinkComponents(pendingPath);
+  try {
+    unlinkSync(pendingPath);
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') throw error;
+  }
+}
+
+function workspaceOperationLockPath(repository: RepositoryContext): string {
+  return path.join(repository.privateGitDirectory, 'sametree', WORKSPACE_OPERATION_LOCK_FILE);
+}
+
+export function workspaceOperationActive(repository: RepositoryContext): boolean {
+  const lockPath = workspaceOperationLockPath(repository);
+  assertNoSymlinkComponents(lockPath);
+  try {
+    if (!lstatSync(lockPath).isFile()) return false;
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return false;
+    throw error;
+  }
+  const database = new Database(lockPath, { timeout: 1 });
+  try {
+    database.pragma('busy_timeout = 1');
+    database.exec('BEGIN IMMEDIATE; ROLLBACK;');
+    return false;
+  } catch (error) {
+    if (errorCode(error) === 'SQLITE_BUSY' || errorCode(error) === 'SQLITE_LOCKED') return true;
+    throw error;
+  } finally {
+    database.close();
+  }
+}
+
+export function acquireWorkspaceOperationLock(
+  repository: RepositoryContext,
+  waitMilliseconds = 0,
+): () => void {
+  const lockPath = workspaceOperationLockPath(repository);
+  assertNoSymlinkComponents(lockPath);
+  mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  assertNoSymlinkComponents(lockPath);
+  const timeout = Math.max(waitMilliseconds, 1);
+  const database = new Database(lockPath, { timeout });
+  try {
+    database.pragma(`busy_timeout = ${timeout}`);
+    database.exec('BEGIN IMMEDIATE');
+  } catch (error) {
+    database.close();
+    if (errorCode(error) === 'SQLITE_BUSY' || errorCode(error) === 'SQLITE_LOCKED') {
+      throw new SameTreeError(
+        'WORKSPACE_ERROR',
+        'Another session startup or workspace operation is active for this worktree.',
+        { lockPath },
+      );
+    }
+    throw error;
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (database.inTransaction) database.exec('ROLLBACK');
+    database.close();
   };
 }

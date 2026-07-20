@@ -96,6 +96,62 @@ describe('CLI', () => {
     expect(sessions).toEqual({ count: 0 });
   });
 
+  it('creates and reports an explicitly fresh workspace', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const registry = path.join(repository.root, '.workspace-registry');
+
+    const created = await runCli(repository.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'create',
+      'Product',
+      '--member',
+      'studio',
+      '--fresh',
+    ]);
+    const result = JSON.parse(created.stdout) as {
+      workspace: { id: string };
+      member: { name: string };
+    };
+    const status = await runCli(repository.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'status',
+    ]);
+
+    expect(created).toMatchObject({ code: 0, stderr: '' });
+    expect(result.member.name).toBe('studio');
+    expect(JSON.parse(status.stdout)).toMatchObject({
+      bound: true,
+      workspace: { id: result.workspace.id, name: 'Product' },
+      member: { name: 'studio' },
+    });
+  });
+
+  it('requires an explicit workspace state mode', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const result = await runCli(repository.root, undefined, [
+      '--workspace-registry',
+      path.join(repository.root, '.workspace-registry'),
+      'workspace',
+      'create',
+      'Product',
+      '--member',
+      'studio',
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      error: { code: 'INVALID_INPUT', message: expect.stringContaining('exactly one') },
+      ok: false,
+    });
+  });
+
   it('omits lifecycle events for one-shot commands but keeps their session rows', async () => {
     const repository = createTestRepository();
     repositories.push(repository);

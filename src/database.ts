@@ -307,42 +307,86 @@ function insertMember(
   member: DatabaseMemberContext,
   now: number,
 ): void {
-  database
+  const storedRepository = database
+    .prepare('SELECT name, common_git_directory FROM repositories WHERE id = ?')
+    .get(member.repositoryId) as { common_git_directory: string; name: string } | undefined;
+  if (storedRepository) {
+    if (
+      storedRepository.name !== member.repositoryName ||
+      storedRepository.common_git_directory !== repository.commonGitDirectory
+    ) {
+      throw new SameTreeError('DATABASE_ERROR', 'Repository identity collision.', {
+        repositoryId: member.repositoryId,
+        stored: storedRepository,
+        requested: {
+          name: member.repositoryName,
+          commonGitDirectory: repository.commonGitDirectory,
+        },
+      });
+    }
+    database
+      .prepare('UPDATE repositories SET updated_at = ? WHERE id = ?')
+      .run(now, member.repositoryId);
+  } else {
+    database
+      .prepare(
+        `INSERT INTO repositories
+          (id, name, common_git_directory, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(member.repositoryId, member.repositoryName, repository.commonGitDirectory, now, now);
+  }
+
+  const storedWorktree = database
     .prepare(
-      `INSERT INTO repositories
-        (id, name, common_git_directory, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         name = excluded.name,
-         common_git_directory = excluded.common_git_directory,
-         updated_at = excluded.updated_at`,
+      `SELECT repository_id, name, private_git_directory
+       FROM worktrees WHERE id = ?`,
     )
-    .run(member.repositoryId, member.repositoryName, repository.commonGitDirectory, now, now);
-  database
-    .prepare(
-      `INSERT INTO worktrees
-        (id, repository_id, name, root, private_git_directory, head_descriptor,
-         available, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         repository_id = excluded.repository_id,
-         name = excluded.name,
-         root = excluded.root,
-         private_git_directory = excluded.private_git_directory,
-         head_descriptor = excluded.head_descriptor,
-         available = 1,
-         updated_at = excluded.updated_at`,
-    )
-    .run(
-      member.worktreeId,
-      member.repositoryId,
-      member.worktreeName,
-      repository.root,
-      repository.privateGitDirectory,
-      repository.head.descriptor,
-      now,
-      now,
-    );
+    .get(member.worktreeId) as
+    | { name: string; private_git_directory: string; repository_id: string }
+    | undefined;
+  if (storedWorktree) {
+    if (
+      storedWorktree.repository_id !== member.repositoryId ||
+      storedWorktree.name !== member.worktreeName ||
+      storedWorktree.private_git_directory !== repository.privateGitDirectory
+    ) {
+      throw new SameTreeError('DATABASE_ERROR', 'Worktree identity collision.', {
+        worktreeId: member.worktreeId,
+        stored: storedWorktree,
+        requested: {
+          repositoryId: member.repositoryId,
+          name: member.worktreeName,
+          privateGitDirectory: repository.privateGitDirectory,
+        },
+      });
+    }
+    database
+      .prepare(
+        `UPDATE worktrees SET
+           root = ?, head_descriptor = ?, available = 1, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(repository.root, repository.head.descriptor, now, member.worktreeId);
+  } else {
+    database
+      .prepare(
+        `INSERT INTO worktrees
+          (id, repository_id, name, root, private_git_directory, head_descriptor,
+           available, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+      )
+      .run(
+        member.worktreeId,
+        member.repositoryId,
+        member.worktreeName,
+        repository.root,
+        repository.privateGitDirectory,
+        repository.head.descriptor,
+        now,
+        now,
+      );
+  }
 }
 
 function migrateWorkspaceSchema(
