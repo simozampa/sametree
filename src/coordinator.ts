@@ -1420,7 +1420,7 @@ export class Coordinator {
   }
 
   snapshot(options: SnapshotOptions = {}): CoordinationSnapshot {
-    const git = readGitWorktreeContext(this.repository.root);
+    const git = readGitWorktreeContext(this.repository.root, this.repository.privateGitDirectory);
     return this.#database.transaction(() => {
       const taskRows = options.includeTerminalTasks
         ? (this.#database.prepare('SELECT * FROM tasks ORDER BY created_at, id').all() as Row[])

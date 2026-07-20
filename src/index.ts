@@ -12,6 +12,13 @@ export {
 } from './coordinator.js';
 export { diagnoseRepository } from './doctor.js';
 export { type ErrorCode, errorResult, isSameTreeError, SameTreeError } from './errors.js';
+export {
+  type GitHeadContext,
+  type RepositoryContext,
+  readGitHeadContext,
+  readGitWorktreeContext,
+  resolveRepository,
+} from './git.js';
 export { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 export { type InitializationResult, initializeProject } from './project.js';
 export {

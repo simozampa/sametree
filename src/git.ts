@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import { SameTreeError } from './errors.js';
@@ -7,9 +7,20 @@ import type { GitWorktreeContext } from './types.js';
 
 export interface RepositoryContext {
   root: string;
+  commonGitDirectory: string;
+  privateGitDirectory: string;
+  linkedWorktree: boolean;
+  head: GitHeadContext;
   databasePath: string;
   hooksPath: string;
   ignoreCase: boolean;
+}
+
+export interface GitHeadContext {
+  descriptor: string;
+  reference: string | null;
+  branch: string | null;
+  detached: boolean;
 }
 
 const GIT_STATUS_TIMEOUT_MS = 15_000;
@@ -39,7 +50,10 @@ export function resolveRepository(cwd = process.cwd()): RepositoryContext {
   }
 
   const root = realpathSync(git(cwd, ['rev-parse', '--show-toplevel']));
-  const privateGitDirectory = path.resolve(git(root, ['rev-parse', '--absolute-git-dir']));
+  const commonGitDirectory = realpathSync(
+    git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
+  );
+  const privateGitDirectory = realpathSync(git(root, ['rev-parse', '--absolute-git-dir']));
   const databasePath = path.join(privateGitDirectory, 'sametree', 'state.sqlite3');
   const configuredHooksPath = gitConfig(root, 'core.hooksPath', 'path');
   const hooksPath = configuredHooksPath
@@ -48,9 +62,54 @@ export function resolveRepository(cwd = process.cwd()): RepositoryContext {
 
   return {
     root,
+    commonGitDirectory,
+    privateGitDirectory,
+    linkedWorktree: privateGitDirectory !== commonGitDirectory,
+    head: readGitHeadContext(privateGitDirectory),
     databasePath,
     hooksPath,
     ignoreCase: gitConfig(root, 'core.ignorecase', 'bool') === 'true',
+  };
+}
+
+export function readGitHeadContext(privateGitDirectory: string): GitHeadContext {
+  const headPath = path.join(privateGitDirectory, 'HEAD');
+  let descriptor: string;
+  try {
+    descriptor = readFileSync(headPath, 'utf8').trim();
+  } catch (error) {
+    throw new SameTreeError('GIT_STATUS_ERROR', 'Could not read the private Git HEAD descriptor.', {
+      headPath,
+      cause: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  if (!descriptor || descriptor.includes('\n')) {
+    throw new SameTreeError('GIT_STATUS_ERROR', 'Git reported an invalid HEAD descriptor.', {
+      headPath,
+    });
+  }
+
+  const symbolicPrefix = 'ref: ';
+  const reference = descriptor.startsWith(symbolicPrefix)
+    ? descriptor.slice(symbolicPrefix.length)
+    : null;
+  if (reference === '') {
+    throw new SameTreeError('GIT_STATUS_ERROR', 'Git reported an empty symbolic HEAD reference.', {
+      headPath,
+    });
+  }
+
+  return {
+    descriptor,
+    reference,
+    branch:
+      reference === null
+        ? null
+        : reference.startsWith('refs/heads/')
+          ? reference.slice('refs/heads/'.length)
+          : reference,
+    detached: reference === null,
   };
 }
 
@@ -67,7 +126,10 @@ export function gitConfig(cwd: string, key: string, type?: 'bool' | 'path'): str
   }
 }
 
-export function readGitWorktreeContext(repositoryRoot: string): GitWorktreeContext {
+export function readGitWorktreeContext(
+  repositoryRoot: string,
+  privateGitDirectory = realpathSync(git(repositoryRoot, ['rev-parse', '--absolute-git-dir'])),
+): GitWorktreeContext {
   let output: string;
   try {
     output = execFileSync(
@@ -100,27 +162,12 @@ export function readGitWorktreeContext(repositoryRoot: string): GitWorktreeConte
   if (!oid) {
     throw new SameTreeError('GIT_STATUS_ERROR', 'Git did not report worktree HEAD state.');
   }
-  let branch: string | null;
-  try {
-    branch = execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], {
-      cwd: repositoryRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: GIT_STATUS_TIMEOUT_MS,
-    }).trim();
-  } catch (error) {
-    if (error instanceof Error && Reflect.get(error, 'status') === 1) branch = null;
-    else {
-      throw new SameTreeError('GIT_STATUS_ERROR', 'Could not inspect symbolic Git HEAD.', {
-        cause: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
+  const head = readGitHeadContext(privateGitDirectory);
   return {
     root: realpathSync(repositoryRoot),
-    branch,
+    branch: head.branch,
     commit: oid === '(initial)' ? null : oid,
-    detached: branch === null,
+    detached: head.detached,
     dirty: lines.some((line) => line.length > 0 && !line.startsWith('# ')),
   };
 }
