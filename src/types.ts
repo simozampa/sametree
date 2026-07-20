@@ -8,6 +8,7 @@ export interface Agent {
   name: string;
   harness: Harness;
   role: string;
+  activeMembers: string[];
   createdAt: number;
   lastSeenAt: number;
 }
@@ -15,6 +16,12 @@ export interface Agent {
 export interface Session {
   id: string;
   agentName: string;
+  homeWorktreeId: string;
+  homeMember: string;
+  startedHeadDescriptor: string;
+  startedBranch: string | null;
+  currentBranch: string | null;
+  branchChanged: boolean;
   processId: number;
   startedAt: number;
   lastHeartbeatAt: number;
@@ -34,16 +41,30 @@ export interface Task {
   createdAt: number;
   updatedAt: number;
   dependencies: string[];
+  members: string[];
 }
 
 export interface PathClaim {
   id: string;
+  worktreeId: string;
+  member: string;
   path: string;
   comparisonPath: string;
   kind: ClaimKind;
   agentName: string;
   expiresAt: number;
   createdAt: number;
+  warnings: CoordinationWarning[];
+}
+
+export interface CoordinationWarning {
+  code: 'BRANCH_CHANGED' | 'LINKED_WORKTREE_OVERLAP';
+  message: string;
+  member: string;
+  worktreeId: string;
+  sessionId?: string;
+  conflictingClaimId?: string;
+  conflictingMember?: string;
 }
 
 export interface Message {
@@ -79,18 +100,41 @@ export interface CoordinationEvent {
   entityType: string;
   entityId: string;
   payload: Record<string, unknown>;
+  worktreeId?: string | null;
+  member?: string | null;
   createdAt: number;
+}
+
+export interface CoordinationMember {
+  id: string;
+  name: string;
+  repositoryId: string;
+  repositoryName: string;
+  root: string;
+  available: boolean;
+}
+
+export interface CoordinationWorkspace {
+  id: string;
+  name: string;
+  implicit: boolean;
+  currentMemberId: string;
+  currentMember: string;
 }
 
 export interface PolicyDocument {
   content: string;
   hash: string;
   path: string;
+  worktreeId: string;
+  member: string;
   acknowledgedAt: number | null;
 }
 
 export interface PolicyAcknowledgement {
   hash: string;
+  worktreeId: string;
+  member: string;
   acknowledgedAt: number;
   newlyAcknowledged: boolean;
 }
@@ -104,14 +148,18 @@ export interface GitWorktreeContext {
 }
 
 export interface CoordinationSnapshot {
+  workspace: CoordinationWorkspace;
+  members: CoordinationMember[];
   git: GitWorktreeContext;
   agent: Agent;
   session: Session;
+  sessions: Session[];
   agents: Agent[];
   tasks: Task[];
   claims: PathClaim[];
   unreadMessages: number;
   pendingHandoffs: number;
+  warnings: CoordinationWarning[];
   lastEventSequence: number;
 }
 

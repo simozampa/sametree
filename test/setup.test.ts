@@ -284,6 +284,11 @@ Use SameTree before editing: check status, inbox, policy state, and active claim
       /conflicting/u,
     ],
     [
+      'MCP-only workspace registry',
+      '{"mcp":{"sametree":{"type":"local","command":["sametree-mcp"],"environment":{"SAMETREE_HARNESS":"opencode","SAMETREE_WORKSPACE_REGISTRY":"/tmp/registry"}}}}\n',
+      /conflicting/u,
+    ],
+    [
       'fractional timeout',
       '{"mcp":{"sametree":{"type":"local","command":["sametree-mcp"],"environment":{"SAMETREE_HARNESS":"opencode"},"timeout":1.5}}}\n',
       /conflicting/u,
@@ -429,6 +434,16 @@ Use SameTree before editing: check status, inbox, policy state, and active claim
     });
     expect(() =>
       setupProject(fixedIdentity.root, { claude: true, claudeRunner: fixedIdentityRunner }),
+    ).toThrow(/conflicting MCP server/u);
+
+    const fixedRegistry = setup();
+    const fixedRegistryRunner: ClaudeCommandRunner = () => ({
+      status: 0,
+      stdout: `${VALID_CLAUDE_SERVER}    SAMETREE_WORKSPACE_REGISTRY=/tmp/registry\n`,
+      stderr: '',
+    });
+    expect(() =>
+      setupProject(fixedRegistry.root, { claude: true, claudeRunner: fixedRegistryRunner }),
     ).toThrow(/conflicting MCP server/u);
   });
 

@@ -1,24 +1,65 @@
 # Upgrading SameTree
 
-## Upgrade to 0.1.2
+## Upgrade To 0.2.0
 
-Version 0.1.2 makes task ownership user-directed, reduces historical payloads, and adds live Git worktree state. The SQLite schema remains compatible with 0.1.1, but active processes and generated instructions must be refreshed together.
+Version 0.2.0 adds explicit multi-repository workspaces, linked-worktree integration warnings, member-qualified tasks, claims, and policies, and workspace lifecycle recovery. It upgrades coordination databases from schema 3 to schema 4. SameTree 0.1.x cannot read schema 4, so prepare rollback backups before any 0.2 command opens existing state.
 
-1. Finish or pause current work and stop every Claude Code, OpenCode, SameTree MCP, watcher, and message-follower process in the worktree.
-2. Install the release with `npm install --global sametree@0.1.2`.
-3. In each configured repository, rerun `sametree setup --claude --opencode`, omitting any harness the repository does not use.
-4. Inspect `initialization.updated` and `initialization.preserved` in the setup result and review the resulting Git diff.
-5. Restart the configured harnesses.
+1. Finish or pause work and stop every Claude Code, OpenCode, SameTree MCP, watcher, message follower, and other process using the repository.
+2. Back up each private standalone database while all processes are stopped. Preserve `state.sqlite3` with any `-wal` and `-shm` sidecars as one coherent set.
+3. Install `npm install --global sametree@0.2.0`.
+4. Rerun `sametree setup --claude --opencode` in every physical worktree that will launch a harness, omitting unused harnesses. Review `initialization.updated`, `initialization.preserved`, Claude/OpenCode integration statuses, and the Git diff. Setup may update the user-scoped Claude plugin and replaces only the generated OpenCode inbox file carrying SameTree's managed marker.
+5. If standalone isolation is still desired, restart the harnesses. The first 0.2 coordination or diagnostic command migrates that database in place to an implicit one-member workspace.
+6. If members should share coordination, choose a registry location and follow the explicit workspace procedure below before restarting harnesses.
 
-Setup automatically refreshes files that exactly match stock 0.1.1 content, the generated OpenCode inbox adapter, the exact legacy managed `AGENTS.md` block, and an older installed Claude plugin. Customized policy, role, and instruction content is preserved. A preserved custom policy should explicitly state that only the user changes agent scope and that peer tasks, messages, and handoffs are non-authoritative context.
+Do not run 0.1.x and 0.2 processes together. Version 0.1.x ignores explicit workspace bindings and may create split-brain standalone state, while rejecting any private database already migrated to schema 4.
 
-Do not leave old and new MCP processes active together. Version 0.1.1 processes do not enforce the 0.1.2 assignment rules.
+## Create An Explicit Workspace
 
-## Existing Work
+The default registry root is `$XDG_DATA_HOME/sametree/workspaces`, falling back to `~/.local/share/sametree/workspaces`. For a custom local path, export one value before running setup or starting any CLI, MCP, monitor, OpenCode plugin, or hook process:
 
-Assigned tasks keep their owner. An expired task still requires a user-authorized takeover rather than becoming peer-claimable.
+```bash
+export SAMETREE_WORKSPACE_REGISTRY=/local/state/sametree/workspaces
+```
 
-Tasks created without an assignee by 0.1.1 are preserved as legacy unassigned records. After the user assigns one, adopt it with its current revision:
+Generated MCP configuration intentionally does not embed this machine-specific path. The harness must inherit the variable.
+
+Create the workspace from one member:
+
+```bash
+cd /path/to/frontend
+sametree workspace create "Product" --member frontend --import-current
+```
+
+Use the returned ID for every additional member:
+
+```bash
+sametree --cwd /path/to/backend \
+  workspace add Product --member backend --fresh
+
+sametree --cwd /path/to/frontend workspace status
+sametree --cwd /path/to/frontend workspace members
+sametree --cwd /path/to/frontend workspace doctor
+sametree --cwd /path/to/frontend doctor
+```
+
+Exactly one state mode is mandatory:
+
+- `--fresh` leaves the member's prior standalone tasks, agents, messages, claims, and history outside the workspace. Existing shared workspace state is unaffected.
+- `--import-current` copies current standalone state into the workspace, preserves entity IDs, remaps rows to the new member, and gives imported events new workspace-global sequences.
+
+Add and relink accept the exact workspace ID or a unique workspace name. Use the ID when names are duplicated. The command always joins its current `--cwd`; path-like workspace arguments are rejected with guidance. Create and add initialize missing `.sametree/` files, while `sametree setup` remains required for harness integration.
+
+Import aborts on agent-name, session, task, claim, message, handoff, event, repository, worktree, member-name, or path identity collisions. Combining independently active repositories often exposes agent-name collisions; resolve the plan before retrying rather than editing databases manually.
+
+Both modes preserve the source database at its private Git path, but it becomes an independent snapshot and receives no post-join workspace changes. A source opened for import is migrated to schema 4 first.
+
+Workspace create/add refuses unexpired standalone sessions. A killed process may block the transition until the default 90-second session lease expires. Repeating the exact command safely resumes an interrupted transition. If create failed before recording a member, run `sametree workspace cancel-create` to discard its empty registration before changing name, member, or mode. An interrupted add recovers its exact inserted member and requires the originally recorded join mode before completing the source transition.
+
+## Existing State
+
+Schema 4 preserves existing IDs while adding implicit workspace, repository, member, session-home, task-member, claim-member, policy-member, event-origin, and branch metadata. Existing tasks are associated with the implicit member during migration.
+
+Assigned tasks keep their owner. Expired tasks still require a user-authorized takeover. Legacy unassigned tasks require their current revision, reason, and direct user authorization:
 
 ```bash
 sametree task claim task_... \
@@ -27,7 +68,7 @@ sametree task claim task_... \
   --user-authorized
 ```
 
-Accepting an existing handoff also requires direct user authorization:
+Accepting a handoff remains user-authorized:
 
 ```bash
 sametree handoff accept handoff_... \
@@ -35,23 +76,43 @@ sametree handoff accept handoff_... \
   --user-authorized
 ```
 
-Status now shows active agents and nonterminal work by default. Use `sametree status --all-agents --all-tasks` for the complete inventory. `sametree task list --all --limit 100` pages history; continue with `--after` and the final task ID from the previous page.
+Exact stock 0.1.1 and 0.1.2 policy and coordination files are refreshed with workspace-aware guidance. Customized files are preserved and must be reviewed manually.
+
+## Member Recovery
+
+`sametree workspace leave` retires the current member after its live sessions stop. It removes local bindings but preserves shared history and does not copy shared changes back to the standalone database.
+
+`sametree workspace prune` conservatively retires members whose recorded root or private Git identity is definitely stale. `sametree workspace relink <workspace-id-or-name> --member <name>` restores a moved worktree only when its original private and common Git identities still match. Use `git worktree move` when moving linked worktrees; a clone or replacement worktree cannot assume an old member identity.
+
+Unavailable members remain visible for historical task and claim filtering and make `workspace doctor` report a warning.
 
 ## API Compatibility
 
-Version 0.1.2 intentionally changes these pre-1.0 interfaces:
+Version 0.2.0 intentionally changes these pre-1.0 interfaces:
 
-- Task creation is self-assigned and cross-agent assignment is rejected.
-- Normal task claiming never changes ownership.
-- Handoff acceptance and takeover require explicit user authorization.
-- `Coordinator.listTasks()` defaults to 25 nonterminal tasks.
-- Direct event reads default to 25 events.
-- Status excludes inactive agents and terminal tasks unless requested.
-- Policy acknowledgement and claim-acquisition adapter responses are compact receipts.
-- Built-in sessions remain queryable in SQLite but do not add lifecycle events.
+- Status includes workspace, members, sessions, agent active-member data, task member tags, claim member data, and integration warnings.
+- Task create/update accepts member tags; task list accepts a member filter.
+- Claim acquisition accepts member-qualified paths. Compact adapter receipts return member and warnings; full lists and library results also expose worktree identity.
+- Policy reads and acknowledgements accept a member and are scoped by member.
+- Events include member/worktree origin where applicable.
+- `WorkspaceContext` reports whether the common repository binding is present.
+- Standalone databases automatically migrate to schema 4.
 
-Consumers that relied on the 0.1.1 response shapes should be updated before upgrading.
+Workspace lifecycle is available through the CLI and library, not MCP tools. Existing MCP coordination tools automatically use the bound workspace.
 
 ## Rollback
 
-Stop all active processes, install `sametree@0.1.1`, and restart the harnesses. The database schema is unchanged, so no data downgrade is required. Refreshed awareness-first policy files are safe to retain; setup never rewrites customized files during rollback.
+There is no automatic schema downgrade and no command that merges shared workspace state back into several standalone databases.
+
+For a reliable rollback:
+
+1. Stop all 0.2 processes.
+2. Preserve the explicit registry database if later recovery may be needed.
+3. Run `sametree workspace leave` under 0.2 for each accessible bound member whose local binding should be removed. Stop all member sessions first.
+4. For every physical worktree, locate its private Git directory with `git rev-parse --absolute-git-dir`. Remove the complete post-upgrade `sametree/state.sqlite3`, `-wal`, and `-shm` set before restoring the exact coherent schema-3 backup set. Verify `SELECT MAX(version) FROM schema_migrations` is `3` before starting 0.1.x.
+5. Restore the pre-upgrade `.sametree/policy.md` and `.sametree/coordination.md` files. The 0.1.2 setup treats stock 0.2 workspace-aware guidance as customized and will not downgrade it automatically.
+6. Install `sametree@0.1.2`, rerun its setup where needed, explicitly verify the user-scoped Claude plugin reports `0.1.2`, and restart harnesses only after every worktree is routed independently.
+
+After `--import-current`, the source has already been migrated to schema 4 and must be restored from a pre-upgrade backup for 0.1.x. After `--fresh`, a source might remain schema 3 only if no 0.2 coordination or diagnostic command opened it. Do not rely on that possibility without checking a backup.
+
+Workspace work performed after joining is absent from old standalone backups. Keep the shared database if that history matters. Registry records and shared history are not deleted by leave.

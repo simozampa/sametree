@@ -1,15 +1,41 @@
 # Coordination Protocol
 
-This document defines the behavior shared by the CLI and MCP adapters.
+This document defines the coordination behavior shared by the CLI and MCP adapters, plus the CLI-only lifecycle for explicit workspaces.
+
+## Workspaces And Members
+
+Every database is a workspace. A standalone database is an implicit one-member workspace under Git's private worktree directory. An explicit workspace has one shared registry database and one or more named members representing local repository worktrees.
+
+Explicit workspace lifecycle is CLI/library-only:
+
+```bash
+sametree workspace create <name> --member <name> (--fresh | --import-current)
+sametree workspace cancel-create
+sametree workspace add <workspace-id-or-name> --member <name> (--fresh | --import-current)
+sametree workspace status
+sametree workspace members
+sametree workspace leave
+sametree workspace prune
+sametree workspace relink <workspace-id-or-name> --member <existing-name>
+sametree workspace doctor
+```
+
+Exactly one state mode is required. Fresh mode starts the member without copying its standalone coordination. Import mode copies current standalone rows atomically, preserves entity IDs, remaps member context, and resequences audit events. Any identity collision rejects the import. Neither mode deletes the source database or keeps it synchronized afterward.
+
+If creation fails before a member is recorded, retrying the exact create command preserves its generated identity. `workspace cancel-create` safely removes that empty pending registration so corrected name, member, or mode input can be used. A join intent preserves workspace, member, and mode across a crash after member insertion. Once a member exists, complete the exact retry and use `workspace leave` instead.
+
+`leave` and `prune` mark members unavailable while preserving their tasks, claims, sessions, and events. Leave requires no live home-member session. Prune retires only members whose recorded Git identity is definitely stale. Relink restores a retired member only when its original private and common Git directories still match, as after `git worktree move`; it cannot attach a replacement clone.
+
+Create and add initialize missing `.sametree/` project files in the current member but do not configure harness integrations; run `sametree setup` separately where Claude Code or OpenCode will run. Other lifecycle commands do not create agent sessions. Workspace names cannot start with `.` or contain path separators. Add and relink accept an exact ID or unique workspace name; duplicate names require the ID, and path-like arguments are rejected because `--cwd` selects the joining worktree. SameTree does not create repositories, branches, or worktrees. A custom registry selected with `SAMETREE_WORKSPACE_REGISTRY` must be inherited by every CLI, MCP, adapter, and hook process.
 
 ## Identity and Sessions
 
-An agent name is unique within one working tree and contains letters, numbers, `.`, `_`, or `-`. MCP adapters generate a process-scoped name from the harness's native session identifier, falling back to the MCP process ID. Set `SAMETREE_AGENT` when a durable human-readable identity such as `claude-reviewer` or `opencode-1` is required.
+An agent name is unique within one workspace and contains letters, numbers, `.`, `_`, or `-`. MCP adapters generate a process-scoped name from the harness's native session identifier, falling back to the MCP process ID. Set `SAMETREE_AGENT` when a durable human-readable identity such as `claude-reviewer` or `opencode-1` is required, but never reuse it for independent processes in the same workspace.
 
-A session represents one Coordinator-backed process lifetime. Coordination CLI commands, MCP servers, watchers, and message followers create sessions; setup, diagnostics, and hook commands that do not open the Coordinator do not. Built-in sessions remain in the session table for lease ownership and diagnostics but omit lifecycle audit events. Library callers emit `session.started` and `session.closed` by default and may disable them. An MCP heartbeat renews:
+A session represents one Coordinator-backed process lifetime and has one home member. It records the home member's starting branch and HEAD descriptor. Coordination CLI commands, MCP servers, watchers, and message followers create sessions; setup, workspace lifecycle, diagnostics, and hook commands that do not open the Coordinator do not. Built-in sessions remain in the session table for lease ownership and diagnostics but omit lifecycle audit events. Library callers emit `session.started` and `session.closed` by default and may disable them. An MCP heartbeat renews:
 
 - The session expiry.
-- Active path claims owned by that session.
+- Active path claims owned by that session across available members.
 - The execution lease of in-progress tasks claimed by that session.
 
 Agent identity is cooperative, not authenticated. Do not use SameTree across hostile trust boundaries.
@@ -41,12 +67,18 @@ Tasks are awareness records for work already assigned by the user, not a peer-ma
 - Every transition into `in_progress` rechecks dependencies.
 - Every mutation increments `revision`.
 - Callers may submit `expectedRevision` to reject stale updates.
+- A task may tag up to 100 affected members. Tags describe impact; they do not restrict visibility, ownership, or authorization.
+- Creating or updating tags requires available members. Historical tasks remain filterable by an unavailable member.
 
 Assignments are durable agent ownership. Execution leases identify the active session. Keeping these separate makes crashed work visible instead of silently re-queuing it.
 
-Status is a current-state view by default: it includes agents with a live session and every nonterminal task. Callers can explicitly include inactive agents and terminal tasks. Task listing defaults to 25 nonterminal rows, accepts a maximum of 100, and uses the last returned task ID as the `after` cursor. A status filter selects that state even when it is terminal. Invalid limits are rejected rather than silently clamped.
+Task create/update accepts replacement member lists; an empty MCP list or CLI `--clear-members` clears them. CLI `--member` may repeat, and `task list --member` filters tasks explicitly tagged with that member. Untagged tasks are workspace-global records and do not match a member filter.
 
-Every status response also observes the live Git worktree root, branch or detached state, full commit ID, and dirty state. An unborn branch has a `null` commit; detached HEAD has a `null` branch. Dirty state includes staged, unstaged, conflicted, submodule, and untracked changes, but not ignored files. Git state is queried on demand outside the SQLite transaction, so it remains current but is not atomically synchronized with coordination rows.
+Status is a current-state view by default: it includes workspace metadata, all members, active sessions, agents with a live session, every nonterminal task, claims, and warnings. Agent rows list their active members. Callers can explicitly include inactive agents and terminal tasks. Task listing defaults to 25 nonterminal rows, accepts a maximum of 100, and uses the last returned task ID as the `after` cursor. A status filter selects that state even when it is terminal. Invalid limits are rejected rather than silently clamped.
+
+Every status response also observes the caller's live worktree root, branch or detached state, full commit ID, and dirty state. An unborn branch has a `null` commit; detached HEAD has a `null` branch. Dirty state includes staged, unstaged, conflicted, submodule, and untracked changes, but not ignored files. Other member rows expose identity, root, repository, and availability; their HEAD metadata is refreshed internally for session and branch warnings.
+
+Status refreshes every available member's HEAD. A session whose home member moved from its starting branch produces `BRANCH_CHANGED`; a transition between branches or detached state records `worktree.branch_changed`. Ordinary commits on one branch do not produce branch-change events. Branch changes preserve tasks and leases because every process sharing that physical checkout sees the same switch.
 
 ### Forced Takeover
 
@@ -66,7 +98,7 @@ Expired work remains assigned and uses the same user-authorized takeover path. T
 
 ## Path Claims
 
-A claim has one of two kinds:
+A claim targets one member/worktree and has one of two kinds:
 
 - `exact`: one repository-relative path, such as `src/api.ts`.
 - `tree`: a path and every descendant, such as `src/auth`.
@@ -79,7 +111,16 @@ Two claims overlap when:
 - A tree path is equal to or an ancestor of the other path.
 - The repository root tree `.` contains every path.
 
-Agents may hold overlapping claims with themselves. Any overlap with another agent rejects acquisition. A request containing multiple paths commits all claims or none.
+Agents may hold overlapping claims with themselves. Any overlap with another agent in the same member rejects acquisition. A request containing paths for several members commits all claims or none.
+
+CLI positional paths target the current member unless `--member` selects another. `--at <member>:<path>` may repeat to create a cross-member batch:
+
+```bash
+sametree claim acquire src/local.ts --member frontend \
+  --at backend:src/remote.ts
+```
+
+The MCP equivalent adds an optional `member` to each requested path. Compact CLI/MCP acquisition receipts return claim ID, member, path, kind, expiry, and warnings; full claim listings and library results also expose worktree identity. Matching paths in linked worktree members of one repository are allowed but return `LINKED_WORKTREE_OVERLAP`, including overlaps held by the same agent, because later branch integration may conflict. Matching paths in unrelated repositories do not warn. Git hooks enforce only claims targeting the current physical member.
 
 Agents should inspect active claims before editing and acquire a narrow claim when concurrent editing is plausible, ownership is ambiguous, or a collision would be costly. When uncertain, claim. Prefer exact files or the smallest practical tree because broad tree claims can block unrelated work.
 
@@ -126,17 +167,17 @@ Rejection records a terminal handoff state without changing task ownership.
 
 ## Policy
 
-The shared policy is the tracked `.sametree/policy.md` file. SameTree computes its SHA-256 hash and records acknowledgements by agent and hash.
+Policy is the tracked `.sametree/policy.md` file in each member. SameTree computes its SHA-256 hash and records acknowledgements by agent, hash, and member. CLI `policy show` and `policy ack` accept `--member`; the MCP policy tools accept an optional `member`.
 
 Editing any byte produces a new hash, so previous acknowledgements no longer satisfy the current policy. Clients should read the policy state at session start.
 
-Acknowledgement is idempotent per agent and policy hash: repeating it preserves the original timestamp and does not append another event. The acknowledgement operation returns only the hash, timestamp, and whether a row was newly recorded; policy content remains in `sametree_policy_get`. Clients should acknowledge only when that read reports `acknowledgedAt` as `null`.
+Acknowledgement is idempotent per agent, member, and policy hash: repeating it preserves the original timestamp and does not append another event. Identical bytes in two members still require separate acknowledgements. The acknowledgement operation returns only the hash, timestamp, and whether a row was newly recorded; policy content remains in `sametree_policy_get`. Clients should acknowledge only when that read reports `acknowledgedAt` as `null`.
 
 Prompt policy is backed by optional Git hooks for rules that can be checked mechanically. Hooks remain bypassable safety rails.
 
 ## Events
 
-Every meaningful coordination mutation appends an event in the same transaction as current state. Built-in process lifecycle churn is retained in session rows rather than copied into the event stream. Consumers call `sametree_events` with the last seen sequence and persist the returned maximum as their next cursor. Direct reads default to 25 events and accept an explicit limit up to 1,000; streaming watchers request larger pages internally.
+Every meaningful coordination mutation appends an event in the same transaction as current state. Explicit workspaces use one global sequence, and applicable events include member/worktree origin. Imported events receive new sequences while source sequence metadata is retained internally. Built-in process lifecycle churn is retained in session rows rather than copied into the event stream. Consumers call `sametree_events` with the last seen sequence and persist the returned maximum as their next cursor. Direct reads default to 25 events and accept an explicit limit up to 1,000; streaming watchers request larger pages internally.
 
 Event polling is intended for context refresh and debugging. Current-state tools remain authoritative for decisions.
 
@@ -148,6 +189,7 @@ Expected failures return stable machine-readable codes:
 | --- | --- |
 | `AGENT_REQUIRED` | No agent identity was provided |
 | `CLAIM_CONFLICT` | Another agent owns an overlapping active claim |
+| `DATABASE_ERROR` | The database schema, identity, or migration is invalid |
 | `HANDOFF_CONFLICT` | A handoff expired, resolved, or references stale work |
 | `GIT_STATUS_ERROR` | Git could not report live branch or worktree state |
 | `HOOK_REFUSED` | A configured Git policy check failed |
@@ -159,5 +201,6 @@ Expected failures return stable machine-readable codes:
 | `TASK_BLOCKED` | Task dependencies are unfinished |
 | `TASK_UNAVAILABLE` | Task state, owner, lease, or revision prevents mutation |
 | `USER_AUTHORIZATION_REQUIRED` | The operation would change user-owned agent scope without explicit authorization |
+| `WORKSPACE_ERROR` | Workspace registration, member, binding, or lifecycle state is invalid |
 
 MCP returns these as tool errors with the full structured object. The CLI writes the same object to stderr and exits non-zero.

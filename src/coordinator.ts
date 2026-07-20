@@ -5,16 +5,24 @@ import path from 'node:path';
 import type { Database as DatabaseType } from 'better-sqlite3';
 
 import { loadConfig, POLICY_FILE, type SameTreeConfig } from './config.js';
-import { immediateTransaction, openDatabase } from './database.js';
+import { databaseWorktreeId, immediateTransaction, openDatabase } from './database.js';
 import { inspectDatabase } from './doctor.js';
 import { SameTreeError } from './errors.js';
-import { type RepositoryContext, readGitWorktreeContext, resolveRepository } from './git.js';
+import {
+  type RepositoryContext,
+  readGitHeadContext,
+  readGitWorktreeContext,
+  resolveRepository,
+} from './git.js';
 import { claimsOverlap, normalizeClaim } from './paths.js';
 import type {
   Agent,
   ClaimKind,
   CoordinationEvent,
+  CoordinationMember,
   CoordinationSnapshot,
+  CoordinationWarning,
+  CoordinationWorkspace,
   DoctorReport,
   Handoff,
   Harness,
@@ -27,6 +35,13 @@ import type {
   TaskPriority,
   TaskStatus,
 } from './types.js';
+import {
+  acquireWorkspaceOperationLock,
+  clearMatchingPendingWorkspaceJoin,
+  resolveWorkspaceBinding,
+  type WorkspaceContext,
+} from './workspace.js';
+import { assertWorkspaceBindingReady } from './workspace-service.js';
 
 type Row = Record<string, unknown>;
 const MAX_HANDOFF_CONTEXT_BYTES = 100_000;
@@ -37,6 +52,7 @@ export interface CoordinatorOptions {
   harness?: Harness;
   role?: string;
   databasePath?: string;
+  workspaceRegistryRoot?: string;
   clock?: () => number;
   recordSessionLifecycleEvents?: boolean;
 }
@@ -47,6 +63,7 @@ export interface CreateTaskInput {
   priority?: TaskPriority;
   assignee?: string;
   dependencies?: string[];
+  members?: string[];
 }
 
 export interface UpdateTaskInput {
@@ -54,6 +71,7 @@ export interface UpdateTaskInput {
   description?: string;
   priority?: TaskPriority;
   expectedRevision?: number;
+  members?: string[];
 }
 
 export interface ForceTakeoverTaskInput {
@@ -78,6 +96,7 @@ export interface ListTasksOptions {
   after?: string;
   includeTerminal?: boolean;
   limit?: number;
+  member?: string;
   status?: TaskStatus;
 }
 
@@ -89,6 +108,7 @@ export interface SnapshotOptions {
 export interface AcquireClaimInput {
   path: string;
   kind?: ClaimKind;
+  member?: string;
 }
 
 function createId(prefix: string): string {
@@ -140,11 +160,12 @@ function parseObject(value: unknown): Record<string, unknown> {
     : {};
 }
 
-function mapAgent(row: Row): Agent {
+function mapAgent(row: Row, activeMembers: string[] = []): Agent {
   return {
     name: stringValue(row, 'name'),
     harness: stringValue(row, 'harness') as Harness,
     role: stringValue(row, 'role'),
+    activeMembers,
     createdAt: numberValue(row, 'created_at'),
     lastSeenAt: numberValue(row, 'last_seen_at'),
   };
@@ -154,6 +175,12 @@ function mapSession(row: Row): Session {
   return {
     id: stringValue(row, 'id'),
     agentName: stringValue(row, 'agent_name'),
+    homeWorktreeId: stringValue(row, 'home_worktree_id'),
+    homeMember: stringValue(row, 'worktree_name'),
+    startedHeadDescriptor: stringValue(row, 'started_head_descriptor'),
+    startedBranch: nullableString(row, 'started_branch'),
+    currentBranch: nullableString(row, 'current_branch'),
+    branchChanged: nullableString(row, 'started_branch') !== nullableString(row, 'current_branch'),
     processId: numberValue(row, 'process_id'),
     startedAt: numberValue(row, 'started_at'),
     lastHeartbeatAt: numberValue(row, 'last_heartbeat_at'),
@@ -162,7 +189,7 @@ function mapSession(row: Row): Session {
   };
 }
 
-function mapTask(row: Row, dependencies: string[]): Task {
+function mapTask(row: Row, dependencies: string[], members: string[]): Task {
   return {
     id: stringValue(row, 'id'),
     title: stringValue(row, 'title'),
@@ -175,18 +202,22 @@ function mapTask(row: Row, dependencies: string[]): Task {
     createdAt: numberValue(row, 'created_at'),
     updatedAt: numberValue(row, 'updated_at'),
     dependencies,
+    members,
   };
 }
 
-function mapClaim(row: Row): PathClaim {
+function mapClaim(row: Row, warnings: CoordinationWarning[] = []): PathClaim {
   return {
     id: stringValue(row, 'id'),
+    worktreeId: stringValue(row, 'worktree_id'),
+    member: stringValue(row, 'worktree_name'),
     path: stringValue(row, 'path'),
     comparisonPath: stringValue(row, 'comparison_path'),
     kind: stringValue(row, 'kind') as ClaimKind,
     agentName: stringValue(row, 'agent_name'),
     expiresAt: numberValue(row, 'expires_at'),
     createdAt: numberValue(row, 'created_at'),
+    warnings,
   };
 }
 
@@ -229,6 +260,8 @@ export class Coordinator {
   readonly config: SameTreeConfig;
   readonly agentName: string;
   readonly sessionId: string;
+  readonly workspace: WorkspaceContext | null;
+  readonly worktreeId: string;
 
   readonly #database: DatabaseType;
   readonly #clock: () => number;
@@ -241,50 +274,103 @@ export class Coordinator {
     this.agentName = validateAgentName(options.agent);
     this.#clock = options.clock ?? Date.now;
     this.#recordSessionLifecycleEvents = options.recordSessionLifecycleEvents ?? true;
-    this.#database = openDatabase(this.repository, {
-      ...(options.databasePath ? { databasePath: options.databasePath } : {}),
-      now: this.#clock(),
-    });
-    this.sessionId = createId('session');
-
-    const now = this.#clock();
+    const releaseWorkspaceLock = acquireWorkspaceOperationLock(this.repository, 2_500);
     try {
-      immediateTransaction(this.#database, () => {
-        this.#database
-          .prepare(
-            `INSERT INTO agents (name, harness, role, created_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(name) DO UPDATE SET
-               harness = excluded.harness,
-               role = excluded.role,
-               last_seen_at = excluded.last_seen_at`,
-          )
-          .run(this.agentName, options.harness ?? 'other', options.role ?? 'implementer', now, now);
-        this.#database
-          .prepare(
-            `INSERT INTO sessions
-              (id, agent_name, process_id, started_at, last_heartbeat_at, expires_at, status)
-             VALUES (?, ?, ?, ?, ?, ?, 'active')`,
-          )
-          .run(
-            this.sessionId,
-            this.agentName,
-            process.pid,
-            now,
-            now,
-            now + this.config.sessionTtlSeconds * 1_000,
-          );
-        if (this.#recordSessionLifecycleEvents) {
-          this.#recordEvent('session.started', 'session', this.sessionId, {
-            harness: options.harness ?? 'other',
-            role: options.role ?? 'implementer',
-          });
-        }
+      this.workspace = resolveWorkspaceBinding(this.repository, {
+        ...(options.workspaceRegistryRoot ? { registryRoot: options.workspaceRegistryRoot } : {}),
       });
-    } catch (error) {
-      this.#database.close();
-      this.#closed = true;
-      throw error;
+      if (this.workspace) {
+        assertWorkspaceBindingReady(this.repository, this.workspace);
+        clearMatchingPendingWorkspaceJoin(this.repository, {
+          workspaceId: this.workspace.workspace.id,
+          memberName: this.workspace.worktreeName,
+        });
+        if (
+          options.databasePath !== undefined &&
+          options.databasePath !== this.workspace.workspace.databasePath
+        ) {
+          throw new SameTreeError(
+            'WORKSPACE_ERROR',
+            'A bound worktree cannot override its workspace database path.',
+          );
+        }
+      }
+      this.#database = openDatabase(this.repository, {
+        ...(options.databasePath
+          ? { databasePath: options.databasePath }
+          : this.workspace
+            ? { databasePath: this.workspace.workspace.databasePath }
+            : {}),
+        ...(this.workspace
+          ? {
+              member: {
+                workspaceId: this.workspace.workspace.id,
+                workspaceName: this.workspace.workspace.name,
+                workspaceImplicit: false,
+                repositoryId: this.workspace.repositoryId,
+                repositoryName: this.workspace.repositoryName,
+                worktreeId: this.workspace.worktreeId,
+                worktreeName: this.workspace.worktreeName,
+              },
+            }
+          : {}),
+        now: this.#clock(),
+      });
+      this.worktreeId = databaseWorktreeId(this.#database, this.repository);
+      this.sessionId = createId('session');
+
+      const now = this.#clock();
+      try {
+        immediateTransaction(this.#database, () => {
+          this.#database
+            .prepare(
+              `INSERT INTO agents (name, harness, role, created_at, last_seen_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                 harness = excluded.harness,
+                 role = excluded.role,
+                 last_seen_at = excluded.last_seen_at`,
+            )
+            .run(
+              this.agentName,
+              options.harness ?? 'other',
+              options.role ?? 'implementer',
+              now,
+              now,
+            );
+          this.#database
+            .prepare(
+              `INSERT INTO sessions
+                (id, agent_name, home_worktree_id, started_head_descriptor, started_branch,
+                 process_id, started_at, last_heartbeat_at, expires_at, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+            )
+            .run(
+              this.sessionId,
+              this.agentName,
+              this.worktreeId,
+              this.repository.head.descriptor,
+              this.repository.head.branch,
+              process.pid,
+              now,
+              now,
+              now + this.config.sessionTtlSeconds * 1_000,
+            );
+          this.#refreshWorktreeHead(now);
+          if (this.#recordSessionLifecycleEvents) {
+            this.#recordEvent('session.started', 'session', this.sessionId, {
+              harness: options.harness ?? 'other',
+              role: options.role ?? 'implementer',
+            });
+          }
+        });
+      } catch (error) {
+        this.#database.close();
+        this.#closed = true;
+        throw error;
+      }
+    } finally {
+      releaseWorkspaceLock();
     }
   }
 
@@ -303,12 +389,13 @@ export class Coordinator {
     entityType: string,
     entityId: string,
     payload: Record<string, unknown> = {},
+    worktreeId = this.worktreeId,
   ): void {
     this.#database
       .prepare(
         `INSERT INTO events
-          (id, kind, actor, entity_type, entity_id, payload_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          (id, kind, actor, entity_type, entity_id, payload_json, created_at, worktree_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         createId('event'),
@@ -318,12 +405,154 @@ export class Coordinator {
         entityId,
         JSON.stringify(payload),
         this.#clock(),
+        worktreeId,
       );
+  }
+
+  #refreshWorktreeHead(
+    now = this.#clock(),
+    worktreeId = this.worktreeId,
+    privateGitDirectory = this.repository.privateGitDirectory,
+  ): void {
+    const head = readGitHeadContext(privateGitDirectory);
+    const stored = this.#database
+      .prepare('SELECT name, head_descriptor, branch FROM worktrees WHERE id = ?')
+      .get(worktreeId) as Row;
+    const previousDescriptor = stringValue(stored, 'head_descriptor');
+    const previousBranch = nullableString(stored, 'branch');
+    if (previousDescriptor === head.descriptor && previousBranch === head.branch) return;
+
+    this.#database
+      .prepare(
+        `UPDATE worktrees SET head_descriptor = ?, branch = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(head.descriptor, head.branch, now, worktreeId);
+    if (previousBranch !== head.branch) {
+      this.#recordEvent(
+        'worktree.branch_changed',
+        'worktree',
+        worktreeId,
+        {
+          member: stringValue(stored, 'name'),
+          previousBranch,
+          branch: head.branch,
+          previousHeadDescriptor: previousDescriptor,
+          headDescriptor: head.descriptor,
+        },
+        worktreeId,
+      );
+    }
+  }
+
+  #refreshWorkspaceHeads(now = this.#clock()): void {
+    const worktrees = this.#database
+      .prepare(
+        `SELECT id, private_git_directory FROM worktrees
+         WHERE available = 1 ORDER BY id`,
+      )
+      .all() as Row[];
+    for (const worktree of worktrees) {
+      try {
+        this.#refreshWorktreeHead(
+          now,
+          stringValue(worktree, 'id'),
+          stringValue(worktree, 'private_git_directory'),
+        );
+      } catch (error) {
+        if (!(error instanceof SameTreeError) || error.code !== 'GIT_STATUS_ERROR') throw error;
+      }
+    }
   }
 
   #requireAgent(name: string): void {
     const found = this.#database.prepare('SELECT 1 FROM agents WHERE name = ?').get(name);
     if (!found) throw new SameTreeError('NOT_FOUND', `Agent '${name}' is not registered.`);
+  }
+
+  #claimWorktree(member?: string): {
+    id: string;
+    ignoreCase: boolean;
+    name: string;
+    repositoryId: string;
+    root: string;
+  } {
+    const requestedMember = member === undefined ? undefined : requireText(member, 'Member', 100);
+    const row = requestedMember
+      ? (this.#database
+          .prepare(
+            `SELECT worktree.id, worktree.name, worktree.root, worktree.available,
+                    worktree.private_git_directory, worktree.repository_id
+             FROM worktrees worktree
+             WHERE worktree.name = ?`,
+          )
+          .get(requestedMember) as Row | undefined)
+      : (this.#database
+          .prepare(
+            `SELECT worktree.id, worktree.name, worktree.root, worktree.available,
+                    worktree.private_git_directory, worktree.repository_id
+             FROM worktrees worktree
+             WHERE worktree.id = ?`,
+          )
+          .get(this.worktreeId) as Row | undefined);
+    if (!row) {
+      throw new SameTreeError(
+        'NOT_FOUND',
+        `Workspace member '${requestedMember ?? this.worktreeId}' was not found.`,
+      );
+    }
+    if (numberValue(row, 'available') !== 1) {
+      throw new SameTreeError(
+        'WORKSPACE_ERROR',
+        `Workspace member '${stringValue(row, 'name')}' is unavailable.`,
+      );
+    }
+    const id = stringValue(row, 'id');
+    const root = stringValue(row, 'root');
+    const targetRepository = resolveRepository(root);
+    if (targetRepository.privateGitDirectory !== stringValue(row, 'private_git_directory')) {
+      throw new SameTreeError(
+        'WORKSPACE_ERROR',
+        `Workspace member '${stringValue(row, 'name')}' moved and must be relinked.`,
+      );
+    }
+    return {
+      id,
+      name: stringValue(row, 'name'),
+      repositoryId: stringValue(row, 'repository_id'),
+      root,
+      ignoreCase: targetRepository.ignoreCase,
+    };
+  }
+
+  #linkedClaimWarnings(
+    claim: {
+      comparisonPath: string;
+      kind: ClaimKind;
+      member: string;
+      repositoryId: string;
+      worktreeId: string;
+    },
+    active: Row[],
+  ): CoordinationWarning[] {
+    return active
+      .filter(
+        (row) =>
+          stringValue(row, 'repository_id') === claim.repositoryId &&
+          stringValue(row, 'worktree_id') !== claim.worktreeId &&
+          claimsOverlap(claim, {
+            comparisonPath: stringValue(row, 'comparison_path'),
+            kind: stringValue(row, 'kind') as ClaimKind,
+          }),
+      )
+      .map((row) => ({
+        code: 'LINKED_WORKTREE_OVERLAP' as const,
+        message: `${claim.member}:${claim.comparisonPath} may conflict when integrated with ${stringValue(row, 'worktree_name')}:${stringValue(row, 'path')}.`,
+        member: claim.member,
+        worktreeId: claim.worktreeId,
+        conflictingClaimId: stringValue(row, 'id'),
+        conflictingMember: stringValue(row, 'worktree_name'),
+      }));
   }
 
   #dependencies(taskId: string): string[] {
@@ -334,12 +563,94 @@ export class Coordinator {
     ).map((row) => stringValue(row, 'depends_on'));
   }
 
+  #taskMembers(taskId: string): string[] {
+    return (
+      this.#database
+        .prepare(
+          `SELECT worktree.name
+           FROM task_worktrees task_worktree
+           JOIN worktrees worktree ON worktree.id = task_worktree.worktree_id
+           WHERE task_worktree.task_id = ?
+           ORDER BY worktree.name`,
+        )
+        .all(taskId) as Row[]
+    ).map((row) => stringValue(row, 'name'));
+  }
+
+  #resolveTaskMembers(
+    members: string[],
+    options: { requireAvailable?: boolean } = {},
+  ): Array<{ id: string; name: string }> {
+    const names = [...new Set(members.map((member) => requireText(member, 'Member', 100)))];
+    if (names.length > 100) {
+      throw new SameTreeError('INVALID_INPUT', 'Associate at most 100 members with a task.');
+    }
+    return names.map((name) => {
+      const row = this.#database
+        .prepare('SELECT id, available FROM worktrees WHERE name = ?')
+        .get(name) as Row | undefined;
+      if (!row) throw new SameTreeError('NOT_FOUND', `Workspace member '${name}' was not found.`);
+      if ((options.requireAvailable ?? true) && numberValue(row, 'available') !== 1) {
+        throw new SameTreeError('WORKSPACE_ERROR', `Workspace member '${name}' is unavailable.`);
+      }
+      return { id: stringValue(row, 'id'), name };
+    });
+  }
+
+  #activeMembers(agentName: string, now: number): string[] {
+    return (
+      this.#database
+        .prepare(
+          `SELECT DISTINCT worktree.name
+           FROM sessions session
+           JOIN worktrees worktree ON worktree.id = session.home_worktree_id
+           WHERE session.agent_name = ? AND session.status = 'active' AND session.expires_at > ?
+           ORDER BY worktree.name`,
+        )
+        .all(agentName, now) as Row[]
+    ).map((row) => stringValue(row, 'name'));
+  }
+
+  #workspaceStatus(): { members: CoordinationMember[]; workspace: CoordinationWorkspace } {
+    const metadata = this.#database.prepare('SELECT * FROM workspace_metadata').get() as Row;
+    const members = (
+      this.#database
+        .prepare(
+          `SELECT worktree.*, repository.name AS repository_name
+           FROM worktrees worktree
+           JOIN repositories repository ON repository.id = worktree.repository_id
+           ORDER BY worktree.name, worktree.id`,
+        )
+        .all() as Row[]
+    ).map((row) => ({
+      id: stringValue(row, 'id'),
+      name: stringValue(row, 'name'),
+      repositoryId: stringValue(row, 'repository_id'),
+      repositoryName: stringValue(row, 'repository_name'),
+      root: stringValue(row, 'root'),
+      available: numberValue(row, 'available') === 1,
+    }));
+    const current = members.find((member) => member.id === this.worktreeId);
+    if (!current)
+      throw new SameTreeError('WORKSPACE_ERROR', 'Current workspace member is missing.');
+    return {
+      workspace: {
+        id: stringValue(metadata, 'id'),
+        name: stringValue(metadata, 'name'),
+        implicit: numberValue(metadata, 'implicit') === 1,
+        currentMemberId: current.id,
+        currentMember: current.name,
+      },
+      members,
+    };
+  }
+
   #task(taskId: string): Task {
     const row = this.#database.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as
       | Row
       | undefined;
     if (!row) throw new SameTreeError('NOT_FOUND', `Task '${taskId}' does not exist.`);
-    return mapTask(row, this.#dependencies(taskId));
+    return mapTask(row, this.#dependencies(taskId), this.#taskMembers(taskId));
   }
 
   #unfinishedDependencies(taskId: string): string[] {
@@ -355,12 +666,22 @@ export class Coordinator {
     ).map((row) => stringValue(row, 'id'));
   }
 
+  #assertActiveSession(now: number): void {
+    const active = this.#database
+      .prepare("SELECT 1 FROM sessions WHERE id = ? AND status = 'active' AND expires_at > ?")
+      .get(this.sessionId, now);
+    if (!active) {
+      throw new SameTreeError('TASK_UNAVAILABLE', 'This session expired and cannot acquire work.');
+    }
+  }
+
   #transferClaims(
     claimIds: string[],
     fromAgent: string,
     now: number,
     conflictCode: 'HANDOFF_CONFLICT' | 'TASK_UNAVAILABLE' = 'HANDOFF_CONFLICT',
   ): PathClaim[] {
+    this.#assertActiveSession(now);
     const selectedIds = [...new Set(claimIds)];
     if (selectedIds.length > 100) {
       throw new SameTreeError('INVALID_INPUT', 'Transfer at most 100 claims at once.');
@@ -368,8 +689,11 @@ export class Coordinator {
     const selectedClaims = selectedIds.map((claimId) => {
       const claim = this.#database
         .prepare(
-          `SELECT * FROM path_claims
-           WHERE id = ? AND agent_name = ? AND expires_at > ?`,
+          `SELECT claim.*, worktree.name AS worktree_name
+           FROM path_claims claim
+           JOIN worktrees worktree ON worktree.id = claim.worktree_id
+           WHERE claim.id = ? AND claim.agent_name = ? AND claim.expires_at > ?
+             AND worktree.available = 1`,
         )
         .get(claimId, fromAgent, now) as Row | undefined;
       if (!claim) {
@@ -381,12 +705,18 @@ export class Coordinator {
       return claim;
     });
     const sourceClaims = this.#database
-      .prepare('SELECT * FROM path_claims WHERE agent_name = ? AND expires_at > ?')
+      .prepare(
+        `SELECT claim.*, worktree.name AS worktree_name
+         FROM path_claims claim
+         JOIN worktrees worktree ON worktree.id = claim.worktree_id
+         WHERE claim.agent_name = ? AND claim.expires_at > ?`,
+      )
       .all(fromAgent, now) as Row[];
     for (const selected of selectedClaims) {
       const overlap = sourceClaims.find(
         (candidate) =>
           !selectedIds.includes(stringValue(candidate, 'id')) &&
+          stringValue(candidate, 'worktree_id') === stringValue(selected, 'worktree_id') &&
           claimsOverlap(
             {
               comparisonPath: stringValue(selected, 'comparison_path'),
@@ -467,11 +797,19 @@ export class Coordinator {
       if (renewed === 0) {
         throw new SameTreeError('TASK_UNAVAILABLE', 'This session expired and cannot be renewed.');
       }
+      this.#refreshWorktreeHead(now);
       this.#database
         .prepare('UPDATE agents SET last_seen_at = ? WHERE name = ?')
         .run(now, this.agentName);
       this.#database
-        .prepare('UPDATE path_claims SET expires_at = ? WHERE session_id = ? AND expires_at > ?')
+        .prepare(
+          `UPDATE path_claims SET expires_at = ?
+           WHERE session_id = ? AND expires_at > ?
+             AND EXISTS (
+               SELECT 1 FROM worktrees
+               WHERE worktrees.id = path_claims.worktree_id AND worktrees.available = 1
+             )`,
+        )
         .run(claimExpiry, this.sessionId, now);
       this.#database
         .prepare(
@@ -480,7 +818,14 @@ export class Coordinator {
         )
         .run(taskExpiry, this.sessionId, now);
 
-      const row = this.#database.prepare('SELECT * FROM sessions WHERE id = ?').get(this.sessionId);
+      const row = this.#database
+        .prepare(
+          `SELECT session.*, worktree.name AS worktree_name, worktree.branch AS current_branch
+           FROM sessions session
+           JOIN worktrees worktree ON worktree.id = session.home_worktree_id
+           WHERE session.id = ?`,
+        )
+        .get(this.sessionId);
       return mapSession(row as Row);
     });
   }
@@ -521,6 +866,7 @@ export class Coordinator {
   }
 
   listAgents(options: { activeOnly?: boolean } = {}): Agent[] {
+    const now = this.#clock();
     const rows = options.activeOnly
       ? (this.#database
           .prepare(
@@ -530,11 +876,14 @@ export class Coordinator {
              WHERE session.status = 'active' AND session.expires_at > ?
              ORDER BY agent.last_seen_at DESC, agent.name`,
           )
-          .all(this.#clock()) as Row[])
+          .all(now) as Row[])
       : (this.#database
           .prepare('SELECT * FROM agents ORDER BY last_seen_at DESC, name')
           .all() as Row[]);
-    return rows.map(mapAgent);
+    return rows.map((row) => {
+      const name = stringValue(row, 'name');
+      return mapAgent(row, this.#activeMembers(name, now));
+    });
   }
 
   createTask(input: CreateTaskInput): Task {
@@ -558,6 +907,7 @@ export class Coordinator {
 
     return immediateTransaction(this.#database, () => {
       for (const dependency of dependencies) this.#task(dependency);
+      const members = this.#resolveTaskMembers(input.members ?? []);
 
       this.#database
         .prepare(
@@ -570,7 +920,16 @@ export class Coordinator {
         'INSERT INTO task_dependencies (task_id, depends_on) VALUES (?, ?)',
       );
       for (const dependency of dependencies) addDependency.run(id, dependency);
-      this.#recordEvent('task.created', 'task', id, { assignee, dependencies, priority });
+      const addMember = this.#database.prepare(
+        'INSERT INTO task_worktrees (task_id, worktree_id) VALUES (?, ?)',
+      );
+      for (const member of members) addMember.run(id, member.id);
+      this.#recordEvent('task.created', 'task', id, {
+        assignee,
+        dependencies,
+        members: members.map((member) => member.name),
+        priority,
+      });
       return this.#task(id);
     });
   }
@@ -587,6 +946,14 @@ export class Coordinator {
       parameters.push(options.status);
     } else if (!options.includeTerminal) {
       conditions.push("status NOT IN ('done', 'cancelled')");
+    }
+    if (options.member !== undefined) {
+      const member = this.#resolveTaskMembers([options.member], { requireAvailable: false })[0];
+      if (!member) throw new SameTreeError('NOT_FOUND', 'Workspace member was not found.');
+      conditions.push(
+        'EXISTS (SELECT 1 FROM task_worktrees WHERE task_id = tasks.id AND worktree_id = ?)',
+      );
+      parameters.push(member.id);
     }
     if (options.after) {
       const cursor = this.#database
@@ -607,12 +974,16 @@ export class Coordinator {
     const rows = this.#database
       .prepare(`SELECT * FROM tasks ${where} ORDER BY created_at, id LIMIT ?`)
       .all(...parameters) as Row[];
-    return rows.map((row) => mapTask(row, this.#dependencies(stringValue(row, 'id'))));
+    return rows.map((row) => {
+      const id = stringValue(row, 'id');
+      return mapTask(row, this.#dependencies(id), this.#taskMembers(id));
+    });
   }
 
   claimTask(taskId: string, authorization: UserAuthorizedTaskInput = {}): Task {
     const now = this.#clock();
     return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
       const task = this.#task(taskId);
       if (task.status === 'done' || task.status === 'cancelled' || task.status === 'blocked') {
         throw new SameTreeError('TASK_UNAVAILABLE', `Task '${taskId}' is ${task.status}.`);
@@ -697,6 +1068,7 @@ export class Coordinator {
     const now = this.#clock();
 
     return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
       const task = this.#task(taskId);
       if (task.revision !== input.expectedRevision) {
         throw new SameTreeError(
@@ -756,7 +1128,9 @@ export class Coordinator {
   }
 
   updateTask(taskId: string, input: UpdateTaskInput): Task {
+    const now = this.#clock();
     return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
       const task = this.#task(taskId);
       if (input.expectedRevision !== undefined && input.expectedRevision !== task.revision) {
         throw new SameTreeError(
@@ -804,6 +1178,8 @@ export class Coordinator {
         );
       }
       const active = status === 'in_progress';
+      const members =
+        input.members === undefined ? undefined : this.#resolveTaskMembers(input.members);
       this.#database
         .prepare(
           `UPDATE tasks SET
@@ -816,13 +1192,21 @@ export class Coordinator {
           description,
           input.priority ?? task.priority,
           active ? this.sessionId : null,
-          active ? this.#clock() + this.config.taskLeaseSeconds * 1_000 : null,
-          this.#clock(),
+          active ? now + this.config.taskLeaseSeconds * 1_000 : null,
+          now,
           taskId,
         );
+      if (members) {
+        this.#database.prepare('DELETE FROM task_worktrees WHERE task_id = ?').run(taskId);
+        const addMember = this.#database.prepare(
+          'INSERT INTO task_worktrees (task_id, worktree_id) VALUES (?, ?)',
+        );
+        for (const member of members) addMember.run(taskId, member.id);
+      }
       this.#recordEvent('task.updated', 'task', taskId, {
         fromStatus: task.status,
         toStatus: status,
+        ...(members ? { members: members.map((member) => member.name) } : {}),
       });
       return this.#task(taskId);
     });
@@ -837,28 +1221,53 @@ export class Coordinator {
       throw new SameTreeError('INVALID_INPUT', 'Claim TTL must be between 30 and 86400 seconds.');
     }
 
-    const requested = inputs.map((input) =>
-      normalizeClaim(
-        this.repository.root,
-        input.path,
-        input.kind ?? (input.path.endsWith('/') ? 'tree' : 'exact'),
-        this.repository.ignoreCase,
-      ),
-    );
+    const requested = inputs.map((input) => {
+      const worktree = this.#claimWorktree(input.member);
+      return {
+        ...normalizeClaim(
+          worktree.root,
+          input.path,
+          input.kind ?? (input.path.endsWith('/') ? 'tree' : 'exact'),
+          worktree.ignoreCase,
+        ),
+        worktreeId: worktree.id,
+        member: worktree.name,
+        repositoryId: worktree.repositoryId,
+      };
+    });
     const unique = requested.filter(
       (claim, index, all) =>
         all.findIndex(
           (candidate) =>
-            candidate.comparisonPath === claim.comparisonPath && candidate.kind === claim.kind,
+            candidate.comparisonPath === claim.comparisonPath &&
+            candidate.kind === claim.kind &&
+            candidate.worktreeId === claim.worktreeId,
         ) === index,
     );
     const now = this.#clock();
     const expiresAt = now + ttl * 1_000;
 
     return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
+      const availableWorktree = this.#database.prepare(
+        'SELECT 1 FROM worktrees WHERE id = ? AND available = 1',
+      );
+      for (const claim of unique) {
+        if (!availableWorktree.get(claim.worktreeId)) {
+          throw new SameTreeError(
+            'WORKSPACE_ERROR',
+            `Workspace member '${claim.member}' is unavailable.`,
+          );
+        }
+      }
       this.#database.prepare('DELETE FROM path_claims WHERE expires_at <= ?').run(now);
       const active = this.#database
-        .prepare('SELECT * FROM path_claims WHERE expires_at > ?')
+        .prepare(
+          `SELECT claim.*, worktree.name AS worktree_name, worktree.repository_id
+           FROM path_claims claim
+           JOIN worktrees worktree ON worktree.id = claim.worktree_id
+           WHERE claim.expires_at > ?`,
+        )
         .all(now) as Row[];
 
       // One agent may intentionally hold a broad claim plus narrower claims for handoff.
@@ -866,6 +1275,7 @@ export class Coordinator {
         const conflict = active.find(
           (row) =>
             stringValue(row, 'agent_name') !== this.agentName &&
+            stringValue(row, 'worktree_id') === claim.worktreeId &&
             claimsOverlap(claim, {
               comparisonPath: stringValue(row, 'comparison_path'),
               kind: stringValue(row, 'kind') as ClaimKind,
@@ -874,7 +1284,7 @@ export class Coordinator {
         if (conflict) {
           throw new SameTreeError(
             'CLAIM_CONFLICT',
-            `${claim.path} overlaps ${stringValue(conflict, 'agent_name')}'s active claim.`,
+            `${claim.member}:${claim.path} overlaps ${stringValue(conflict, 'agent_name')}'s active claim.`,
             { conflictingClaim: mapClaim(conflict) },
           );
         }
@@ -885,6 +1295,7 @@ export class Coordinator {
         const own = active.find(
           (row) =>
             stringValue(row, 'agent_name') === this.agentName &&
+            stringValue(row, 'worktree_id') === claim.worktreeId &&
             stringValue(row, 'comparison_path') === claim.comparisonPath &&
             stringValue(row, 'kind') === claim.kind,
         );
@@ -892,7 +1303,22 @@ export class Coordinator {
           this.#database
             .prepare('UPDATE path_claims SET session_id = ?, expires_at = ? WHERE id = ?')
             .run(this.sessionId, expiresAt, stringValue(own, 'id'));
-          results.push({ ...mapClaim(own), expiresAt });
+          results.push({
+            ...mapClaim(
+              own,
+              this.#linkedClaimWarnings(
+                {
+                  comparisonPath: claim.comparisonPath,
+                  kind: claim.kind,
+                  member: claim.member,
+                  repositoryId: claim.repositoryId,
+                  worktreeId: claim.worktreeId,
+                },
+                active,
+              ),
+            ),
+            expiresAt,
+          });
           continue;
         }
 
@@ -900,8 +1326,9 @@ export class Coordinator {
         this.#database
           .prepare(
             `INSERT INTO path_claims
-              (id, path, comparison_path, kind, agent_name, session_id, expires_at, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              (id, path, comparison_path, kind, agent_name, session_id,
+               expires_at, created_at, worktree_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             id,
@@ -912,20 +1339,47 @@ export class Coordinator {
             this.sessionId,
             expiresAt,
             now,
+            claim.worktreeId,
           );
         results.push({
           id,
+          worktreeId: claim.worktreeId,
+          member: claim.member,
           path: claim.path,
           comparisonPath: claim.comparisonPath,
           kind: claim.kind,
           agentName: this.agentName,
           expiresAt,
           createdAt: now,
+          warnings: this.#linkedClaimWarnings(claim, active),
+        });
+        active.push({
+          id,
+          path: claim.path,
+          comparison_path: claim.comparisonPath,
+          kind: claim.kind,
+          agent_name: this.agentName,
+          session_id: this.sessionId,
+          expires_at: expiresAt,
+          created_at: now,
+          worktree_id: claim.worktreeId,
+          worktree_name: claim.member,
+          repository_id: claim.repositoryId,
         });
       }
+      for (const result of results) {
+        const claim = unique.find(
+          (candidate) =>
+            candidate.worktreeId === result.worktreeId &&
+            candidate.comparisonPath === result.comparisonPath &&
+            candidate.kind === result.kind,
+        );
+        if (claim) result.warnings = this.#linkedClaimWarnings(claim, active);
+      }
       this.#recordEvent('claim.acquired', 'claim', results.map((claim) => claim.id).join(','), {
-        paths: results.map((claim) => claim.path),
+        paths: results.map((claim) => ({ member: claim.member, path: claim.path })),
         expiresAt,
+        warnings: results.flatMap((claim) => claim.warnings),
       });
       return results;
     });
@@ -934,12 +1388,37 @@ export class Coordinator {
   listClaims(options: { includeExpired?: boolean } = {}): PathClaim[] {
     const rows = options.includeExpired
       ? (this.#database
-          .prepare('SELECT * FROM path_claims ORDER BY path, created_at')
+          .prepare(
+            `SELECT claim.*, worktree.name AS worktree_name, worktree.repository_id
+             FROM path_claims claim
+             JOIN worktrees worktree ON worktree.id = claim.worktree_id
+             ORDER BY worktree.name, claim.path, claim.created_at`,
+          )
           .all() as Row[])
       : (this.#database
-          .prepare('SELECT * FROM path_claims WHERE expires_at > ? ORDER BY path, created_at')
+          .prepare(
+            `SELECT claim.*, worktree.name AS worktree_name, worktree.repository_id
+             FROM path_claims claim
+             JOIN worktrees worktree ON worktree.id = claim.worktree_id
+             WHERE claim.expires_at > ?
+             ORDER BY worktree.name, claim.path, claim.created_at`,
+          )
           .all(this.#clock()) as Row[]);
-    return rows.map(mapClaim);
+    return rows.map((row) =>
+      mapClaim(
+        row,
+        this.#linkedClaimWarnings(
+          {
+            comparisonPath: stringValue(row, 'comparison_path'),
+            kind: stringValue(row, 'kind') as ClaimKind,
+            member: stringValue(row, 'worktree_name'),
+            repositoryId: stringValue(row, 'repository_id'),
+            worktreeId: stringValue(row, 'worktree_id'),
+          },
+          rows,
+        ),
+      ),
+    );
   }
 
   releaseClaims(input: { ids?: string[]; all?: boolean } = {}): { released: number } {
@@ -1298,6 +1777,7 @@ export class Coordinator {
         );
       }
       if (accept) {
+        this.#assertActiveSession(now);
         const blockers = this.#unfinishedDependencies(task.id);
         if (blockers.length > 0) {
           throw new SameTreeError(
@@ -1345,29 +1825,36 @@ export class Coordinator {
     });
   }
 
-  getPolicy(): PolicyDocument {
-    const policyPath = path.join(this.repository.root, POLICY_FILE);
+  getPolicy(member?: string): PolicyDocument {
+    const worktree = this.#claimWorktree(member);
+    const policyPath = path.join(worktree.root, POLICY_FILE);
     if (!existsSync(policyPath)) {
       throw new SameTreeError(
         'POLICY_NOT_FOUND',
         `No policy exists at ${policyPath}; run 'sametree init'.`,
       );
     }
-    const content = readFileSync(policyPath, 'utf8');
-    const hash = createHash('sha256').update(content).digest('hex');
+    const policyBytes = readFileSync(policyPath);
+    const content = policyBytes.toString('utf8');
+    const hash = createHash('sha256').update(policyBytes).digest('hex');
     const ack = this.#database
-      .prepare('SELECT acknowledged_at FROM policy_acks WHERE policy_hash = ? AND agent_name = ?')
-      .get(hash, this.agentName) as Row | undefined;
+      .prepare(
+        `SELECT acknowledged_at FROM policy_acks
+         WHERE policy_hash = ? AND agent_name = ? AND worktree_id = ?`,
+      )
+      .get(hash, this.agentName, worktree.id) as Row | undefined;
     return {
       content,
       hash,
       path: policyPath,
+      worktreeId: worktree.id,
+      member: worktree.name,
       acknowledgedAt: ack ? numberValue(ack, 'acknowledged_at') : null,
     };
   }
 
-  acknowledgePolicy(hash: string): PolicyAcknowledgement {
-    const policy = this.getPolicy();
+  acknowledgePolicy(hash: string, member?: string): PolicyAcknowledgement {
+    const policy = this.getPolicy(member);
     if (policy.hash !== hash) {
       throw new SameTreeError(
         'INVALID_INPUT',
@@ -1381,17 +1868,30 @@ export class Coordinator {
       const acknowledgedAt = this.#clock();
       const inserted = this.#database
         .prepare(
-          `INSERT INTO policy_acks (policy_hash, agent_name, acknowledged_at)
-           VALUES (?, ?, ?)
-           ON CONFLICT(policy_hash, agent_name) DO NOTHING`,
+          `INSERT INTO policy_acks (policy_hash, agent_name, worktree_id, acknowledged_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(policy_hash, agent_name, worktree_id) DO NOTHING`,
         )
-        .run(hash, this.agentName, acknowledgedAt).changes;
-      if (inserted === 1) this.#recordEvent('policy.acknowledged', 'policy', hash);
+        .run(hash, this.agentName, policy.worktreeId, acknowledgedAt).changes;
+      if (inserted === 1) {
+        this.#recordEvent(
+          'policy.acknowledged',
+          'policy',
+          hash,
+          { member: policy.member },
+          policy.worktreeId,
+        );
+      }
       const acknowledgement = this.#database
-        .prepare('SELECT acknowledged_at FROM policy_acks WHERE policy_hash = ? AND agent_name = ?')
-        .get(hash, this.agentName) as Row;
+        .prepare(
+          `SELECT acknowledged_at FROM policy_acks
+           WHERE policy_hash = ? AND agent_name = ? AND worktree_id = ?`,
+        )
+        .get(hash, this.agentName, policy.worktreeId) as Row;
       return {
         hash,
+        worktreeId: policy.worktreeId,
+        member: policy.member,
         acknowledgedAt: numberValue(acknowledgement, 'acknowledged_at'),
         newlyAcknowledged: inserted === 1,
       };
@@ -1405,7 +1905,12 @@ export class Coordinator {
     }
     return (
       this.#database
-        .prepare('SELECT * FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?')
+        .prepare(
+          `SELECT event.*, worktree.name AS worktree_name
+           FROM events event
+           LEFT JOIN worktrees worktree ON worktree.id = event.worktree_id
+           WHERE event.sequence > ? ORDER BY event.sequence LIMIT ?`,
+        )
         .all(options.after ?? 0, limit) as Row[]
     ).map((row) => ({
       sequence: numberValue(row, 'sequence'),
@@ -1415,13 +1920,17 @@ export class Coordinator {
       entityType: stringValue(row, 'entity_type'),
       entityId: stringValue(row, 'entity_id'),
       payload: parseObject(row.payload_json),
+      worktreeId: nullableString(row, 'worktree_id'),
+      member: nullableString(row, 'worktree_name'),
       createdAt: numberValue(row, 'created_at'),
     }));
   }
 
   snapshot(options: SnapshotOptions = {}): CoordinationSnapshot {
-    const git = readGitWorktreeContext(this.repository.root);
+    immediateTransaction(this.#database, () => this.#refreshWorkspaceHeads());
+    const git = readGitWorktreeContext(this.repository.root, this.repository.privateGitDirectory);
     return this.#database.transaction(() => {
+      const workspaceStatus = this.#workspaceStatus();
       const taskRows = options.includeTerminalTasks
         ? (this.#database.prepare('SELECT * FROM tasks ORDER BY created_at, id').all() as Row[])
         : (this.#database
@@ -1435,8 +1944,32 @@ export class Coordinator {
         .prepare('SELECT * FROM agents WHERE name = ?')
         .get(this.agentName);
       const sessionRow = this.#database
-        .prepare('SELECT * FROM sessions WHERE id = ?')
+        .prepare(
+          `SELECT session.*, worktree.name AS worktree_name, worktree.branch AS current_branch
+           FROM sessions session
+           JOIN worktrees worktree ON worktree.id = session.home_worktree_id
+           WHERE session.id = ?`,
+        )
         .get(this.sessionId);
+      const sessionRows = this.#database
+        .prepare(
+          `SELECT session.*, worktree.name AS worktree_name, worktree.branch AS current_branch
+           FROM sessions session
+           JOIN worktrees worktree ON worktree.id = session.home_worktree_id
+           WHERE session.status = 'active' AND session.expires_at > ?
+           ORDER BY session.started_at, session.id`,
+        )
+        .all(this.#clock()) as Row[];
+      const sessions = sessionRows.map(mapSession);
+      const branchWarnings: CoordinationWarning[] = sessions
+        .filter((session) => session.branchChanged)
+        .map((session) => ({
+          code: 'BRANCH_CHANGED',
+          message: `${session.agentName} started on ${session.startedBranch ?? 'detached HEAD'} while ${session.homeMember} is now on ${session.currentBranch ?? 'detached HEAD'}.`,
+          member: session.homeMember,
+          worktreeId: session.homeWorktreeId,
+          sessionId: session.id,
+        }));
       const unread = this.#database
         .prepare(
           `SELECT COUNT(*) AS count
@@ -1461,22 +1994,34 @@ export class Coordinator {
       const lastEvent = this.#database
         .prepare('SELECT MAX(sequence) AS sequence FROM events')
         .get() as Row;
+      const claims = this.listClaims();
+      const claimWarnings = claims.flatMap((claim) => claim.warnings);
 
       return {
+        ...workspaceStatus,
         git,
-        agent: mapAgent(agentRow as Row),
+        agent: mapAgent(agentRow as Row, this.#activeMembers(this.agentName, this.#clock())),
         session: mapSession(sessionRow as Row),
+        sessions,
         agents: this.listAgents({ activeOnly: !options.includeInactiveAgents }),
-        tasks: taskRows.map((row) => mapTask(row, this.#dependencies(stringValue(row, 'id')))),
-        claims: this.listClaims(),
+        tasks: taskRows.map((row) => {
+          const id = stringValue(row, 'id');
+          return mapTask(row, this.#dependencies(id), this.#taskMembers(id));
+        }),
+        claims,
         unreadMessages: numberValue(unread, 'count'),
         pendingHandoffs: numberValue(handoffs, 'count'),
+        warnings: [...branchWarnings, ...claimWarnings],
         lastEventSequence: nullableNumber(lastEvent, 'sequence') ?? 0,
       };
     })();
   }
 
   doctor(): DoctorReport {
-    return inspectDatabase(this.#database, this.repository);
+    return inspectDatabase(
+      this.#database,
+      this.repository,
+      this.workspace?.workspace.databasePath ?? this.repository.databasePath,
+    );
   }
 }

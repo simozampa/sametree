@@ -38,6 +38,14 @@ export function loadConfig(repositoryRoot: string): SameTreeConfig {
   try {
     return configSchema.parse(JSON.parse(readFileSync(configPath, 'utf8')));
   } catch (error) {
+    const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+    if (code === 'ENOENT') {
+      throw new SameTreeError(
+        'INVALID_INPUT',
+        `Missing SameTree configuration at ${configPath}; run 'sametree init' in this repository first.`,
+        { cause: error instanceof Error ? error.message : String(error) },
+      );
+    }
     throw new SameTreeError('INVALID_INPUT', `Invalid SameTree configuration at ${configPath}.`, {
       cause: error instanceof Error ? error.message : String(error),
     });

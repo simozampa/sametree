@@ -6,6 +6,8 @@ import { writeTextFileAtomic } from './files.js';
 import { resolveRepository } from './git.js';
 import { assertSafeWritePath } from './paths.js';
 import {
+  AWARENESS_INTEGRATION_TEMPLATE,
+  AWARENESS_POLICY_TEMPLATE,
   configTemplate,
   IMPLEMENTER_ROLE_TEMPLATE,
   INTEGRATION_TEMPLATE,
@@ -26,14 +28,18 @@ export interface InitializationResult {
 export const PROJECT_FILE_TEMPLATES: ReadonlyArray<{
   relativePath: string;
   content: string;
-  legacyContent?: string;
+  legacyContent?: string | readonly string[];
 }> = [
   { relativePath: CONFIG_FILE, content: configTemplate(DEFAULT_CONFIG) },
-  { relativePath: POLICY_FILE, content: POLICY_TEMPLATE, legacyContent: LEGACY_POLICY_TEMPLATE },
+  {
+    relativePath: POLICY_FILE,
+    content: POLICY_TEMPLATE,
+    legacyContent: [LEGACY_POLICY_TEMPLATE, AWARENESS_POLICY_TEMPLATE],
+  },
   {
     relativePath: path.join(CONFIG_DIRECTORY, 'coordination.md'),
     content: INTEGRATION_TEMPLATE,
-    legacyContent: LEGACY_INTEGRATION_TEMPLATE,
+    legacyContent: [LEGACY_INTEGRATION_TEMPLATE, AWARENESS_INTEGRATION_TEMPLATE],
   },
   {
     relativePath: path.join(CONFIG_DIRECTORY, 'roles', 'implementer.md'),
@@ -50,7 +56,7 @@ function writeProjectFile(
   repositoryRoot: string,
   relativePath: string,
   content: string,
-  legacyContent: string | undefined,
+  legacyContent: string | readonly string[] | undefined,
   force: boolean,
   result: InitializationResult,
   onFileWritten?: (relativePath: string, content: string) => void,
@@ -66,7 +72,13 @@ function writeProjectFile(
       const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
       if (code !== 'EEXIST') throw error;
       const existing = readFileSync(target, 'utf8');
-      if (legacyContent !== undefined && existing === legacyContent) {
+      const legacyContents =
+        legacyContent === undefined
+          ? []
+          : typeof legacyContent === 'string'
+            ? [legacyContent]
+            : legacyContent;
+      if (legacyContents.includes(existing)) {
         writeTextFileAtomic(target, content);
         result.updated.push(relativePath);
         onFileWritten?.(relativePath, content);

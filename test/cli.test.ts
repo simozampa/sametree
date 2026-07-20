@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
@@ -96,6 +97,161 @@ describe('CLI', () => {
     expect(sessions).toEqual({ count: 0 });
   });
 
+  it('creates and reports an explicitly fresh workspace', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const registry = path.join(repository.root, '.workspace-registry');
+
+    const created = await runCli(repository.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'create',
+      'Product',
+      '--member',
+      'frontend',
+      '--fresh',
+    ]);
+    const result = JSON.parse(created.stdout) as {
+      workspace: { id: string };
+      member: { name: string };
+    };
+    const status = await runCli(repository.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'status',
+    ]);
+    const doctor = await runCli(repository.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'doctor',
+    ]);
+    const repositoryDoctor = await runCli(repository.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'doctor',
+    ]);
+
+    expect(created).toMatchObject({ code: 0, stderr: '' });
+    expect(result.member.name).toBe('frontend');
+    expect(JSON.parse(status.stdout)).toMatchObject({
+      bound: true,
+      workspace: { id: result.workspace.id, name: 'Product' },
+      member: { name: 'frontend' },
+    });
+    expect(JSON.parse(doctor.stdout)).toMatchObject({ ok: true, warnings: [] });
+    expect(JSON.parse(repositoryDoctor.stdout)).toMatchObject({
+      ok: true,
+      databasePath: expect.stringContaining(result.workspace.id),
+    });
+  });
+
+  it('initializes members, resolves workspace names, and explains path-like references', async () => {
+    const frontend = createTestRepository({ initialize: false });
+    const server = createTestRepository({ initialize: false });
+    const invalid = createTestRepository({ initialize: false });
+    const invalidName = createTestRepository({ initialize: false });
+    repositories.push(frontend, server, invalid, invalidName);
+    const registry = path.join(frontend.root, '.workspace-registry');
+
+    const created = await runCli(frontend.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'create',
+      'Product',
+      '--member',
+      'frontend',
+      '--fresh',
+    ]);
+    const added = await runCli(server.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'add',
+      'Product',
+      '--member',
+      'backend',
+      '--fresh',
+    ]);
+    const pathLike = await runCli(invalid.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'add',
+      '../backend',
+      '--member',
+      'invalid',
+      '--fresh',
+    ]);
+    const pathLikeName = await runCli(invalidName.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'create',
+      '.Product',
+      '--member',
+      'invalid-name',
+      '--fresh',
+    ]);
+
+    expect(created).toMatchObject({ code: 0, stderr: '' });
+    expect(added).toMatchObject({ code: 0, stderr: '' });
+    expect(JSON.parse(added.stdout)).toMatchObject({
+      workspace: { name: 'Product' },
+      member: { name: 'backend' },
+      initialization: { created: expect.arrayContaining(['.sametree/config.json']) },
+    });
+    expect(existsSync(path.join(frontend.root, '.sametree', 'config.json'))).toBe(true);
+    expect(existsSync(path.join(server.root, '.sametree', 'config.json'))).toBe(true);
+    expect(pathLike.code).toBe(1);
+    expect(JSON.parse(pathLike.stderr)).toMatchObject({
+      error: {
+        code: 'INVALID_INPUT',
+        message: expect.stringContaining('looks like a path'),
+      },
+    });
+    expect(existsSync(path.join(invalid.root, '.sametree', 'config.json'))).toBe(false);
+    expect(pathLikeName.code).toBe(1);
+    expect(JSON.parse(pathLikeName.stderr)).toMatchObject({
+      error: { code: 'INVALID_INPUT', message: expect.stringContaining('cannot start') },
+    });
+    expect(existsSync(path.join(invalidName.root, '.sametree', 'config.json'))).toBe(false);
+
+    const coordinator = Coordinator.open({
+      cwd: server.root,
+      agent: 'server-agent',
+      workspaceRegistryRoot: registry,
+    });
+    expect(coordinator.acquireClaims([{ member: 'frontend', path: 'src/shared.ts' }])).toHaveLength(
+      1,
+    );
+    coordinator.close();
+  });
+
+  it('requires an explicit workspace state mode', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    const result = await runCli(repository.root, undefined, [
+      '--workspace-registry',
+      path.join(repository.root, '.workspace-registry'),
+      'workspace',
+      'create',
+      'Product',
+      '--member',
+      'frontend',
+    ]);
+
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      error: { code: 'INVALID_INPUT', message: expect.stringContaining('exactly one') },
+      ok: false,
+    });
+  });
+
   it('omits lifecycle events for one-shot commands but keeps their session rows', async () => {
     const repository = createTestRepository();
     repositories.push(repository);
@@ -181,11 +337,25 @@ describe('CLI', () => {
     const repository = createTestRepository();
     repositories.push(repository);
 
-    const result = await runCli(repository.root, 'claimant', ['claim', 'acquire', 'src/api.ts']);
+    const member = path.basename(repository.root);
+    const result = await runCli(repository.root, 'claimant', [
+      'claim',
+      'acquire',
+      '--at',
+      `${member}:src/api.ts`,
+    ]);
     const output = JSON.parse(result.stdout) as Array<Record<string, unknown>>;
 
     expect(result).toMatchObject({ code: 0, stderr: '' });
-    expect(Object.keys(output[0] ?? {}).sort()).toEqual(['expiresAt', 'id', 'kind', 'path']);
+    expect(Object.keys(output[0] ?? {}).sort()).toEqual([
+      'expiresAt',
+      'id',
+      'kind',
+      'member',
+      'path',
+      'warnings',
+    ]);
+    expect(output[0]?.member).toBe(member);
   });
 
   it('forcibly takes over active work with explicit user authorization', async () => {

@@ -5,19 +5,33 @@ import { Command, Option } from 'commander';
 
 import { Coordinator } from './coordinator.js';
 import { diagnoseRepository } from './doctor.js';
-import { errorResult } from './errors.js';
+import { errorResult, SameTreeError } from './errors.js';
 import { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 import { initializeProject } from './project.js';
 import { setupProject } from './setup.js';
 import type { Harness, PathClaim, TaskPriority, TaskStatus } from './types.js';
 import { VERSION } from './version.js';
 import { followMessages, watchEvents } from './watch.js';
+import { resolveRegisteredWorkspace, validateWorkspaceName } from './workspace.js';
+import {
+  addWorkspaceMember,
+  cancelWorkspaceCreation,
+  createWorkspace,
+  diagnoseWorkspace,
+  leaveWorkspace,
+  pruneWorkspace,
+  relinkWorkspace,
+  type WorkspaceJoinMode,
+  workspaceMembers,
+  workspaceStatus,
+} from './workspace-service.js';
 
 interface GlobalOptions {
   agent?: string;
   cwd: string;
   harness: Harness;
   role: string;
+  workspaceRegistry?: string;
 }
 
 function print(value: unknown): void {
@@ -26,6 +40,18 @@ function print(value: unknown): void {
 
 function collect(value: string, previous: string[]): string[] {
   return [...previous, value];
+}
+
+function collectOptional(value: string, previous?: string[]): string[] {
+  return [...(previous ?? []), value];
+}
+
+function qualifiedClaim(value: string): { member: string; path: string } {
+  const separator = value.indexOf(':');
+  if (separator < 1 || separator === value.length - 1) {
+    throw new SameTreeError('INVALID_INPUT', "Use --at with '<member>:<path>'.");
+  }
+  return { member: value.slice(0, separator), path: value.slice(separator + 1) };
 }
 
 function integer(value: string): number {
@@ -42,8 +68,25 @@ function objectJson(value: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+function workspaceJoinMode(options: {
+  fresh?: boolean;
+  importCurrent?: boolean;
+}): WorkspaceJoinMode {
+  if (options.fresh === options.importCurrent) {
+    throw new SameTreeError('INVALID_INPUT', 'Choose exactly one of --fresh or --import-current.');
+  }
+  return options.importCurrent ? 'import-current' : 'fresh';
+}
+
 function claimReceipts(claims: PathClaim[]) {
-  return claims.map(({ id, path, kind, expiresAt }) => ({ id, path, kind, expiresAt }));
+  return claims.map(({ id, member, path, kind, expiresAt, warnings }) => ({
+    id,
+    member,
+    path,
+    kind,
+    expiresAt,
+    warnings,
+  }));
 }
 
 function openCoordinator(
@@ -56,6 +99,7 @@ function openCoordinator(
     cwd: options.cwd,
     harness: options.harness,
     role: options.role,
+    ...(options.workspaceRegistry ? { workspaceRegistryRoot: options.workspaceRegistry } : {}),
     ...coordinatorOptions,
   });
 }
@@ -136,6 +180,11 @@ const program = new Command()
   .version(VERSION)
   .option('--agent <name>', 'unique agent name', process.env.SAMETREE_AGENT)
   .option('--cwd <path>', 'working tree directory', process.env.SAMETREE_CWD ?? process.cwd())
+  .option(
+    '--workspace-registry <path>',
+    'workspace registry directory',
+    process.env.SAMETREE_WORKSPACE_REGISTRY,
+  )
   .addOption(
     new Option('--harness <name>', 'agent harness')
       .choices(['claude-code', 'opencode', 'other'])
@@ -191,8 +240,152 @@ program
   .description('Check Git, SQLite, policy, and state integrity.')
   .action((_options: unknown, command: Command) => {
     const options = command.optsWithGlobals<GlobalOptions>();
-    print(diagnoseRepository(options.cwd));
+    print(
+      diagnoseRepository(options.cwd, {
+        ...(options.workspaceRegistry ? { registryRoot: options.workspaceRegistry } : {}),
+      }),
+    );
   });
+
+const workspace = program.command('workspace').description('Manage multi-repository workspaces.');
+
+workspace
+  .command('create <name>')
+  .description('Create a workspace and join this worktree.')
+  .requiredOption('--member <name>', 'workspace member name')
+  .option('--fresh', 'start with empty workspace coordination state')
+  .option('--import-current', 'import current standalone coordination state')
+  .action(
+    (
+      name: string,
+      options: { fresh?: boolean; importCurrent?: boolean; member: string },
+      command: Command,
+    ) => {
+      const globals = command.optsWithGlobals<GlobalOptions>();
+      const mode = workspaceJoinMode(options);
+      const workspaceName = validateWorkspaceName(name);
+      const initialization = initializeProject(globals.cwd);
+      print({
+        ...createWorkspace(
+          globals.cwd,
+          { name: workspaceName, memberName: options.member, mode },
+          {
+            ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+          },
+        ),
+        initialization,
+      });
+    },
+  );
+
+workspace
+  .command('add <workspace>')
+  .description('Add this worktree to an existing local workspace.')
+  .requiredOption('--member <name>', 'workspace member name')
+  .option('--fresh', 'leave standalone state as a recoverable backup')
+  .option('--import-current', 'import current standalone coordination state')
+  .action(
+    (
+      workspaceReference: string,
+      options: { fresh?: boolean; importCurrent?: boolean; member: string },
+      command: Command,
+    ) => {
+      const globals = command.optsWithGlobals<GlobalOptions>();
+      const mode = workspaceJoinMode(options);
+      const registryOptions = {
+        ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+      };
+      const registered = resolveRegisteredWorkspace(workspaceReference, registryOptions);
+      const initialization = initializeProject(globals.cwd);
+      print({
+        ...addWorkspaceMember(
+          globals.cwd,
+          {
+            workspaceId: registered.id,
+            memberName: options.member,
+            mode,
+          },
+          registryOptions,
+        ),
+        initialization,
+      });
+    },
+  );
+
+workspace
+  .command('cancel-create')
+  .description('Cancel a pending workspace creation before a member was recorded.')
+  .action((_options: unknown, command: Command) => {
+    const globals = command.optsWithGlobals<GlobalOptions>();
+    print(
+      cancelWorkspaceCreation(globals.cwd, {
+        ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+      }),
+    );
+  });
+
+workspace.command('status').action((_options: unknown, command: Command) => {
+  const globals = command.optsWithGlobals<GlobalOptions>();
+  print(
+    workspaceStatus(globals.cwd, {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    }),
+  );
+});
+
+workspace.command('members').action((_options: unknown, command: Command) => {
+  const globals = command.optsWithGlobals<GlobalOptions>();
+  print(
+    workspaceMembers(globals.cwd, {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    }),
+  );
+});
+
+workspace.command('leave').action((_options: unknown, command: Command) => {
+  const globals = command.optsWithGlobals<GlobalOptions>();
+  print(
+    leaveWorkspace(globals.cwd, {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    }),
+  );
+});
+
+workspace.command('prune').action((_options: unknown, command: Command) => {
+  const globals = command.optsWithGlobals<GlobalOptions>();
+  print(
+    pruneWorkspace(globals.cwd, {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    }),
+  );
+});
+
+workspace
+  .command('relink <workspace>')
+  .requiredOption('--member <name>', 'existing workspace member name')
+  .action((workspaceReference: string, options: { member: string }, command: Command) => {
+    const globals = command.optsWithGlobals<GlobalOptions>();
+    const registryOptions = {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    };
+    const registered = resolveRegisteredWorkspace(workspaceReference, registryOptions);
+    print(
+      relinkWorkspace(
+        globals.cwd,
+        { workspaceId: registered.id, memberName: options.member },
+        registryOptions,
+      ),
+    );
+  });
+
+workspace.command('doctor').action((_options: unknown, command: Command) => {
+  const globals = command.optsWithGlobals<GlobalOptions>();
+  print(
+    diagnoseWorkspace(globals.cwd, {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    }),
+  );
+});
 
 const task = program.command('task').description('Create and coordinate durable tasks.');
 
@@ -205,6 +398,7 @@ task
   )
   .option('--assignee <agent>', 'initial assignee')
   .option('--depends-on <task-id>', 'dependency task ID', collect, [])
+  .option('--member <name>', 'affected workspace member', collectOptional)
   .action(
     (
       options: {
@@ -213,6 +407,7 @@ task
         priority: TaskPriority;
         assignee?: string;
         dependsOn: string[];
+        member?: string[];
       },
       command: Command,
     ) => {
@@ -223,6 +418,7 @@ task
           priority: options.priority,
           ...(options.assignee ? { assignee: options.assignee } : {}),
           dependencies: options.dependsOn,
+          members: options.member ?? [],
         }),
       );
     },
@@ -240,17 +436,25 @@ task
     ]),
   )
   .option('--all', 'include done and cancelled tasks')
+  .option('--member <name>', 'filter by affected workspace member')
   .option('--after <task-id>', 'continue after this task cursor')
   .option('--limit <number>', 'maximum tasks', integer, 25)
   .action(
     (
-      options: { after?: string; all?: boolean; limit: number; status?: TaskStatus },
+      options: {
+        after?: string;
+        all?: boolean;
+        limit: number;
+        member?: string;
+        status?: TaskStatus;
+      },
       command: Command,
     ) => {
       runWithCoordinator(command, (coordinator) =>
         coordinator.listTasks({
           ...(options.status ? { status: options.status } : {}),
           ...(options.after ? { after: options.after } : {}),
+          ...(options.member ? { member: options.member } : {}),
           includeTerminal: options.all ?? false,
           limit: options.limit,
         }),
@@ -319,6 +523,8 @@ task
   )
   .addOption(new Option('--priority <level>').choices(['low', 'normal', 'high', 'urgent']))
   .option('--description <text>')
+  .option('--member <name>', 'replace affected workspace members', collectOptional)
+  .option('--clear-members', 'remove every affected workspace member')
   .option('--revision <number>', 'expected current revision', integer)
   .action(
     (
@@ -328,15 +534,25 @@ task
         priority?: TaskPriority;
         description?: string;
         revision?: number;
+        member?: string[];
+        clearMembers?: boolean;
       },
       command: Command,
     ) => {
+      if (options.clearMembers && options.member !== undefined) {
+        throw new SameTreeError('INVALID_INPUT', 'Use --member or --clear-members, not both.');
+      }
       runWithCoordinator(command, (coordinator) =>
         coordinator.updateTask(taskId, {
           ...(options.status ? { status: options.status } : {}),
           ...(options.priority ? { priority: options.priority } : {}),
           ...(options.description !== undefined ? { description: options.description } : {}),
           ...(options.revision !== undefined ? { expectedRevision: options.revision } : {}),
+          ...(options.clearMembers
+            ? { members: [] }
+            : options.member !== undefined
+              ? { members: options.member }
+              : {}),
         }),
       );
     },
@@ -345,22 +561,37 @@ task
 const claim = program.command('claim').description('Coordinate cooperative path leases.');
 
 claim
-  .command('acquire <paths...>')
+  .command('acquire [paths...]')
   .option('--tree', 'claim every path recursively')
+  .option('--member <name>', 'target workspace member')
+  .option('--at <member:path>', 'claim a member-qualified path', collect, [])
   .option('--ttl <seconds>', 'lease duration', integer)
-  .action((paths: string[], options: { tree?: boolean; ttl?: number }, command: Command) => {
-    runWithCoordinator(command, (coordinator) =>
-      claimReceipts(
-        coordinator.acquireClaims(
-          paths.map((claimedPath) => ({
-            path: claimedPath,
-            ...(options.tree ? { kind: 'tree' as const } : {}),
-          })),
-          options.ttl,
+  .action(
+    (
+      paths: string[],
+      options: { at: string[]; member?: string; tree?: boolean; ttl?: number },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        claimReceipts(
+          coordinator.acquireClaims(
+            [
+              ...paths.map((claimedPath) => ({
+                path: claimedPath,
+                ...(options.tree ? { kind: 'tree' as const } : {}),
+                ...(options.member !== undefined ? { member: options.member } : {}),
+              })),
+              ...options.at.map((value) => ({
+                ...qualifiedClaim(value),
+                ...(options.tree ? { kind: 'tree' as const } : {}),
+              })),
+            ],
+            options.ttl,
+          ),
         ),
-      ),
-    );
-  });
+      );
+    },
+  );
 
 claim
   .command('list')
@@ -525,13 +756,21 @@ handoff
 
 const policy = program.command('policy').description('Read and acknowledge shared instructions.');
 
-policy.command('show').action((_options: unknown, command: Command) => {
-  runWithCoordinator(command, (coordinator) => coordinator.getPolicy());
-});
+policy
+  .command('show')
+  .option('--member <name>', 'target workspace member')
+  .action((options: { member?: string }, command: Command) => {
+    runWithCoordinator(command, (coordinator) => coordinator.getPolicy(options.member));
+  });
 
-policy.command('ack <hash>').action((hash: string, _options: unknown, command: Command) => {
-  runWithCoordinator(command, (coordinator) => coordinator.acknowledgePolicy(hash));
-});
+policy
+  .command('ack <hash>')
+  .option('--member <name>', 'target workspace member')
+  .action((hash: string, options: { member?: string }, command: Command) => {
+    runWithCoordinator(command, (coordinator) =>
+      coordinator.acknowledgePolicy(hash, options.member),
+    );
+  });
 
 program
   .command('events')
@@ -587,7 +826,12 @@ hooks.command('install').action((_options: unknown, command: Command) => {
 const hook = program.command('hook', { hidden: true });
 hook.command('pre-commit').action((_options: unknown, command: Command) => {
   runWithCoordinator(command, (coordinator) =>
-    checkPreCommit(coordinator.listClaims(), coordinator.agentName, coordinator.repository.root),
+    checkPreCommit(
+      coordinator.listClaims(),
+      coordinator.agentName,
+      coordinator.repository.root,
+      coordinator.worktreeId,
+    ),
   );
 });
 hook

@@ -28,6 +28,9 @@ function openCoordinator(): Coordinator {
       harness,
       role: process.env.SAMETREE_ROLE ?? 'implementer',
       cwd: process.env.SAMETREE_CWD ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd(),
+      ...(process.env.SAMETREE_WORKSPACE_REGISTRY
+        ? { workspaceRegistryRoot: process.env.SAMETREE_WORKSPACE_REGISTRY }
+        : {}),
       recordSessionLifecycleEvents: false,
     });
   } catch (error) {
@@ -50,7 +53,14 @@ function result(value: unknown) {
 }
 
 function claimReceipts(claims: PathClaim[]) {
-  return claims.map(({ id, path, kind, expiresAt }) => ({ id, path, kind, expiresAt }));
+  return claims.map(({ id, member, path, kind, expiresAt, warnings }) => ({
+    id,
+    member,
+    path,
+    kind,
+    expiresAt,
+    warnings,
+  }));
 }
 
 function execute(operation: () => unknown) {
@@ -107,10 +117,11 @@ server.registerTool(
       priority: z.enum(['low', 'normal', 'high', 'urgent']).optional(),
       assignee: z.string().optional(),
       dependencies: z.array(z.string()).max(100).optional(),
+      members: z.array(z.string().min(1)).max(100).optional(),
     },
     outputSchema,
   },
-  ({ title, description, priority, assignee, dependencies }) =>
+  ({ title, description, priority, assignee, dependencies, members }) =>
     execute(() =>
       coordinator.createTask({
         title,
@@ -118,6 +129,7 @@ server.registerTool(
         ...(priority !== undefined ? { priority } : {}),
         ...(assignee !== undefined ? { assignee } : {}),
         ...(dependencies !== undefined ? { dependencies } : {}),
+        ...(members !== undefined ? { members } : {}),
       }),
     ),
 );
@@ -133,17 +145,19 @@ server.registerTool(
       after: z.string().optional(),
       limit: z.number().int().min(1).max(100).optional(),
       includeTerminal: z.boolean().optional(),
+      member: z.string().min(1).optional(),
     },
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
-  ({ status, after, limit, includeTerminal }) =>
+  ({ status, after, limit, includeTerminal, member }) =>
     execute(() =>
       coordinator.listTasks({
         ...(status !== undefined ? { status } : {}),
         ...(after !== undefined ? { after } : {}),
         ...(limit !== undefined ? { limit } : {}),
         ...(includeTerminal !== undefined ? { includeTerminal } : {}),
+        ...(member !== undefined ? { member } : {}),
       }),
     ),
 );
@@ -210,16 +224,18 @@ server.registerTool(
       description: z.string().max(20_000).optional(),
       priority: z.enum(['low', 'normal', 'high', 'urgent']).optional(),
       expectedRevision: z.number().int().positive().optional(),
+      members: z.array(z.string().min(1)).max(100).optional(),
     },
     outputSchema,
   },
-  ({ taskId, status, description, priority, expectedRevision }) =>
+  ({ taskId, status, description, priority, expectedRevision, members }) =>
     execute(() =>
       coordinator.updateTask(taskId, {
         ...(status ? { status: status as TaskStatus } : {}),
         ...(description !== undefined ? { description } : {}),
         ...(priority ? { priority: priority as TaskPriority } : {}),
         ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+        ...(members !== undefined ? { members } : {}),
       }),
     ),
 );
@@ -231,7 +247,13 @@ server.registerTool(
     description: 'Atomically acquire exact-file or recursive-directory cooperative leases.',
     inputSchema: {
       paths: z
-        .array(z.object({ path: z.string(), kind: z.enum(['exact', 'tree']).optional() }))
+        .array(
+          z.object({
+            path: z.string(),
+            kind: z.enum(['exact', 'tree']).optional(),
+            member: z.string().min(1).optional(),
+          }),
+        )
         .min(1)
         .max(100),
       ttlSeconds: z.number().int().min(30).max(86_400).optional(),
@@ -242,7 +264,11 @@ server.registerTool(
     execute(() =>
       claimReceipts(
         coordinator.acquireClaims(
-          paths.map(({ path, kind }) => ({ path, ...(kind !== undefined ? { kind } : {}) })),
+          paths.map(({ path, kind, member }) => ({
+            path,
+            ...(kind !== undefined ? { kind } : {}),
+            ...(member !== undefined ? { member } : {}),
+          })),
           ttlSeconds,
         ),
       ),
@@ -411,10 +437,11 @@ server.registerTool(
   {
     title: 'Read shared policy',
     description: 'Read the current versioned policy and this agent’s acknowledgement state.',
+    inputSchema: { member: z.string().min(1).optional() },
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
-  () => execute(() => coordinator.getPolicy()),
+  ({ member }) => execute(() => coordinator.getPolicy(member)),
 );
 
 server.registerTool(
@@ -423,11 +450,11 @@ server.registerTool(
     title: 'Acknowledge shared policy',
     description:
       'Record that this agent read the exact policy content when sametree_policy_get reports acknowledgedAt as null.',
-    inputSchema: { hash: z.string().length(64) },
+    inputSchema: { hash: z.string().length(64), member: z.string().min(1).optional() },
     outputSchema,
     annotations: { idempotentHint: true },
   },
-  ({ hash }) => execute(() => coordinator.acknowledgePolicy(hash)),
+  ({ hash, member }) => execute(() => coordinator.acknowledgePolicy(hash, member)),
 );
 
 server.registerTool(

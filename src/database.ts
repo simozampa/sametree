@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { chmodSync, lstatSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 
@@ -9,6 +10,22 @@ import type { RepositoryContext } from './git.js';
 const MINIMUM_SQLITE_VERSION = '3.51.3';
 const WAL_RETRY_ATTEMPTS = 20;
 const WAL_RETRY_DELAY_MS = 25;
+
+export interface DatabaseMemberContext {
+  workspaceId: string;
+  workspaceName: string;
+  workspaceImplicit: boolean;
+  repositoryId: string;
+  repositoryName: string;
+  worktreeId: string;
+  worktreeName: string;
+}
+
+export interface OpenDatabaseOptions {
+  databasePath?: string;
+  member?: DatabaseMemberContext;
+  now?: number;
+}
 
 function assertNoSymlinkComponents(target: string): void {
   const absolute = path.resolve(target);
@@ -29,6 +46,11 @@ function assertNoSymlinkComponents(target: string): void {
       throw error;
     }
   }
+}
+
+export function assertDatabasePathSafe(databasePath: string): void {
+  assertNoSymlinkComponents(path.dirname(databasePath));
+  assertNoSymlinkComponents(databasePath);
 }
 
 const BROADCAST_RECIPIENT_SCHEMA = `
@@ -53,6 +75,50 @@ const MESSAGE_DELIVERY_SCHEMA = `
   CREATE INDEX IF NOT EXISTS message_deliveries_pending_session_idx
     ON message_deliveries(reserved_by_session)
     WHERE delivered_at IS NULL;
+`;
+
+const WORKSPACE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS workspace_metadata (
+    id TEXT PRIMARY KEY,
+    singleton INTEGER NOT NULL DEFAULT 1 UNIQUE CHECK(singleton = 1),
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 100),
+    implicit INTEGER NOT NULL CHECK(implicit IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS repositories (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 100),
+    common_git_directory TEXT NOT NULL UNIQUE,
+    ignore_case INTEGER NOT NULL DEFAULT 0 CHECK(ignore_case IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS worktrees (
+    id TEXT PRIMARY KEY,
+    repository_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL UNIQUE CHECK(length(name) BETWEEN 1 AND 100),
+    root TEXT NOT NULL UNIQUE,
+    private_git_directory TEXT NOT NULL UNIQUE,
+    head_descriptor TEXT NOT NULL,
+    branch TEXT,
+    available INTEGER NOT NULL CHECK(available IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  ) STRICT;
+`;
+
+const TASK_WORKTREE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS task_worktrees (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    worktree_id TEXT NOT NULL REFERENCES worktrees(id) ON DELETE RESTRICT,
+    PRIMARY KEY (task_id, worktree_id)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS task_worktrees_worktree_idx
+    ON task_worktrees(worktree_id, task_id);
 `;
 
 const INITIAL_SCHEMA = `
@@ -213,7 +279,337 @@ function enableWal(database: DatabaseType): void {
   throw new SameTreeError('DATABASE_ERROR', 'SQLite did not enter WAL mode.');
 }
 
-function migrate(database: DatabaseType, now: number): void {
+function createId(prefix: string): string {
+  return `${prefix}_${randomUUID()}`;
+}
+
+function tableExists(database: DatabaseType, table: string): boolean {
+  return Boolean(
+    database.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(table),
+  );
+}
+
+function tableHasColumn(database: DatabaseType, table: string, column: string): boolean {
+  return (database.pragma(`table_info(${table})`) as { name: string }[]).some(
+    (entry) => entry.name === column,
+  );
+}
+
+function implicitMember(repository: RepositoryContext): DatabaseMemberContext {
+  const name = [...path.basename(repository.root)].slice(0, 100).join('');
+  return {
+    workspaceId: createId('workspace'),
+    workspaceName: name,
+    workspaceImplicit: true,
+    repositoryId: createId('repository'),
+    repositoryName: name,
+    worktreeId: createId('worktree'),
+    worktreeName: name,
+  };
+}
+
+function insertMember(
+  database: DatabaseType,
+  repository: RepositoryContext,
+  member: DatabaseMemberContext,
+  now: number,
+): void {
+  const storedRepository = database
+    .prepare('SELECT name, common_git_directory FROM repositories WHERE id = ?')
+    .get(member.repositoryId) as { common_git_directory: string; name: string } | undefined;
+  if (storedRepository) {
+    if (
+      storedRepository.name !== member.repositoryName ||
+      storedRepository.common_git_directory !== repository.commonGitDirectory
+    ) {
+      throw new SameTreeError('DATABASE_ERROR', 'Repository identity collision.', {
+        repositoryId: member.repositoryId,
+        stored: storedRepository,
+        requested: {
+          name: member.repositoryName,
+          commonGitDirectory: repository.commonGitDirectory,
+        },
+      });
+    }
+    database
+      .prepare('UPDATE repositories SET ignore_case = ?, updated_at = ? WHERE id = ?')
+      .run(repository.ignoreCase ? 1 : 0, now, member.repositoryId);
+  } else {
+    database
+      .prepare(
+        `INSERT INTO repositories
+          (id, name, common_git_directory, ignore_case, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        member.repositoryId,
+        member.repositoryName,
+        repository.commonGitDirectory,
+        repository.ignoreCase ? 1 : 0,
+        now,
+        now,
+      );
+  }
+
+  const storedWorktree = database
+    .prepare(
+      `SELECT repository_id, name, private_git_directory, available
+       FROM worktrees WHERE id = ?`,
+    )
+    .get(member.worktreeId) as
+    | { available: number; name: string; private_git_directory: string; repository_id: string }
+    | undefined;
+  if (storedWorktree) {
+    if (storedWorktree.available !== 1) {
+      throw new SameTreeError(
+        'WORKSPACE_ERROR',
+        'Workspace member is unavailable; relink it before starting a session.',
+        { worktreeId: member.worktreeId },
+      );
+    }
+    if (
+      storedWorktree.repository_id !== member.repositoryId ||
+      storedWorktree.name !== member.worktreeName ||
+      storedWorktree.private_git_directory !== repository.privateGitDirectory
+    ) {
+      throw new SameTreeError('DATABASE_ERROR', 'Worktree identity collision.', {
+        worktreeId: member.worktreeId,
+        stored: storedWorktree,
+        requested: {
+          repositoryId: member.repositoryId,
+          name: member.worktreeName,
+          privateGitDirectory: repository.privateGitDirectory,
+        },
+      });
+    }
+    database
+      .prepare(
+        `UPDATE worktrees SET
+           root = ?, available = 1, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(repository.root, now, member.worktreeId);
+  } else {
+    database
+      .prepare(
+        `INSERT INTO worktrees
+          (id, repository_id, name, root, private_git_directory, head_descriptor, branch,
+           available, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+      )
+      .run(
+        member.worktreeId,
+        member.repositoryId,
+        member.worktreeName,
+        repository.root,
+        repository.privateGitDirectory,
+        repository.head.descriptor,
+        repository.head.branch,
+        now,
+        now,
+      );
+  }
+}
+
+function migrateWorkspaceSchema(
+  database: DatabaseType,
+  repository: RepositoryContext,
+  requestedMember: DatabaseMemberContext | undefined,
+  now: number,
+): void {
+  const hadTaskWorktrees = tableExists(database, 'task_worktrees');
+  database.exec(WORKSPACE_SCHEMA);
+  if (!tableHasColumn(database, 'repositories', 'ignore_case')) {
+    database.exec(
+      'ALTER TABLE repositories ADD COLUMN ignore_case INTEGER NOT NULL DEFAULT 0 CHECK(ignore_case IN (0, 1))',
+    );
+  }
+  if (!tableHasColumn(database, 'worktrees', 'branch')) {
+    database.exec('ALTER TABLE worktrees ADD COLUMN branch TEXT');
+    database.exec(
+      `UPDATE worktrees SET branch =
+         CASE
+           WHEN head_descriptor LIKE 'ref: refs/heads/%'
+           THEN substr(head_descriptor, length('ref: refs/heads/') + 1)
+           ELSE NULL
+         END`,
+    );
+  }
+
+  const metadata = database.prepare('SELECT * FROM workspace_metadata LIMIT 1').get() as
+    | { id: string; implicit: number; name: string }
+    | undefined;
+  let member = requestedMember;
+  if (!metadata) {
+    member ??= implicitMember(repository);
+    database
+      .prepare(
+        `INSERT INTO workspace_metadata (id, name, implicit, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(member.workspaceId, member.workspaceName, member.workspaceImplicit ? 1 : 0, now, now);
+    insertMember(database, repository, member, now);
+  } else if (member) {
+    if (
+      metadata.id !== member.workspaceId ||
+      metadata.name !== member.workspaceName ||
+      metadata.implicit !== (member.workspaceImplicit ? 1 : 0)
+    ) {
+      throw new SameTreeError('DATABASE_ERROR', 'Database workspace identity does not match.', {
+        databaseWorkspace: metadata,
+        requestedWorkspace: {
+          id: member.workspaceId,
+          name: member.workspaceName,
+          implicit: member.workspaceImplicit,
+        },
+      });
+    }
+    insertMember(database, repository, member, now);
+  } else {
+    const stored = database
+      .prepare(
+        `SELECT repository.id AS repository_id, repository.name AS repository_name,
+                worktree.id AS worktree_id, worktree.name AS worktree_name
+         FROM worktrees worktree
+         JOIN repositories repository ON repository.id = worktree.repository_id
+         ORDER BY worktree.created_at, worktree.id
+         LIMIT 1`,
+      )
+      .get() as
+      | {
+          repository_id: string;
+          repository_name: string;
+          worktree_id: string;
+          worktree_name: string;
+        }
+      | undefined;
+    if (!stored || metadata.implicit !== 1) {
+      throw new SameTreeError(
+        'DATABASE_ERROR',
+        'Explicit workspace databases require a member binding.',
+      );
+    }
+    member = {
+      workspaceId: metadata.id,
+      workspaceName: metadata.name,
+      workspaceImplicit: true,
+      repositoryId: stored.repository_id,
+      repositoryName: stored.repository_name,
+      worktreeId: stored.worktree_id,
+      worktreeName: stored.worktree_name,
+    };
+    insertMember(database, repository, member, now);
+  }
+
+  if (!member) throw new SameTreeError('DATABASE_ERROR', 'Database member migration failed.');
+
+  if (!tableHasColumn(database, 'sessions', 'home_worktree_id')) {
+    database.exec(
+      'ALTER TABLE sessions ADD COLUMN home_worktree_id TEXT REFERENCES worktrees(id) ON DELETE RESTRICT',
+    );
+    database.prepare('UPDATE sessions SET home_worktree_id = ?').run(member.worktreeId);
+  }
+  if (!tableHasColumn(database, 'sessions', 'started_head_descriptor')) {
+    database.exec('ALTER TABLE sessions ADD COLUMN started_head_descriptor TEXT');
+    database.exec(
+      `UPDATE sessions SET started_head_descriptor = (
+         SELECT head_descriptor FROM worktrees WHERE id = sessions.home_worktree_id
+       )`,
+    );
+  }
+  if (!tableHasColumn(database, 'sessions', 'started_branch')) {
+    database.exec('ALTER TABLE sessions ADD COLUMN started_branch TEXT');
+    database.exec(
+      `UPDATE sessions SET started_branch = (
+         SELECT branch FROM worktrees WHERE id = sessions.home_worktree_id
+       )`,
+    );
+  }
+  if (!tableHasColumn(database, 'path_claims', 'worktree_id')) {
+    database.exec(
+      'ALTER TABLE path_claims ADD COLUMN worktree_id TEXT REFERENCES worktrees(id) ON DELETE RESTRICT',
+    );
+    database.prepare('UPDATE path_claims SET worktree_id = ?').run(member.worktreeId);
+  }
+  if (!tableHasColumn(database, 'policy_acks', 'worktree_id')) {
+    database.exec(`
+      ALTER TABLE policy_acks RENAME TO policy_acks_v3;
+      CREATE TABLE policy_acks (
+        policy_hash TEXT NOT NULL,
+        agent_name TEXT NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+        worktree_id TEXT NOT NULL REFERENCES worktrees(id) ON DELETE CASCADE,
+        acknowledged_at INTEGER NOT NULL,
+        PRIMARY KEY (policy_hash, agent_name, worktree_id)
+      ) STRICT;
+    `);
+    database
+      .prepare(
+        `INSERT INTO policy_acks (policy_hash, agent_name, worktree_id, acknowledged_at)
+         SELECT policy_hash, agent_name, ?, acknowledged_at FROM policy_acks_v3`,
+      )
+      .run(member.worktreeId);
+    database.exec('DROP TABLE policy_acks_v3');
+  }
+  if (!tableHasColumn(database, 'events', 'worktree_id')) {
+    database.exec(
+      'ALTER TABLE events ADD COLUMN worktree_id TEXT REFERENCES worktrees(id) ON DELETE SET NULL',
+    );
+    database.prepare('UPDATE events SET worktree_id = ?').run(member.worktreeId);
+  }
+
+  database.exec(TASK_WORKTREE_SCHEMA);
+  if (!hadTaskWorktrees) {
+    database
+      .prepare('INSERT INTO task_worktrees (task_id, worktree_id) SELECT id, ? FROM tasks')
+      .run(member.worktreeId);
+  }
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS sessions_home_worktree_idx
+      ON sessions(home_worktree_id, status, expires_at);
+    CREATE INDEX IF NOT EXISTS claims_worktree_active_idx
+      ON path_claims(worktree_id, expires_at, comparison_path);
+    CREATE INDEX IF NOT EXISTS events_worktree_sequence_idx
+      ON events(worktree_id, sequence);
+
+    CREATE TRIGGER IF NOT EXISTS sessions_require_home_worktree_insert
+    BEFORE INSERT ON sessions
+    WHEN NEW.home_worktree_id IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'sessions require a home worktree');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS sessions_require_home_worktree_update
+    BEFORE UPDATE ON sessions
+    WHEN NEW.home_worktree_id IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'sessions require a home worktree');
+    END;
+
+    DROP TRIGGER IF EXISTS claims_require_session_worktree_insert;
+    DROP TRIGGER IF EXISTS claims_require_session_worktree_update;
+
+    CREATE TRIGGER claims_require_session_worktree_insert
+    BEFORE INSERT ON path_claims
+    WHEN NEW.worktree_id IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'claims require a target worktree');
+    END;
+
+    CREATE TRIGGER claims_require_session_worktree_update
+    BEFORE UPDATE ON path_claims
+    WHEN NEW.worktree_id IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'claims require a target worktree');
+    END;
+  `);
+}
+
+function migrate(
+  database: DatabaseType,
+  repository: RepositoryContext,
+  now: number,
+  member?: DatabaseMemberContext,
+): void {
   database.exec('BEGIN IMMEDIATE');
   try {
     database.exec(
@@ -223,7 +619,7 @@ function migrate(database: DatabaseType, now: number): void {
       .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
       .get() as { version: number };
 
-    if (current.version > 3) {
+    if (current.version > 4) {
       throw new SameTreeError(
         'DATABASE_ERROR',
         `This database uses unsupported schema version ${current.version}.`,
@@ -254,6 +650,14 @@ function migrate(database: DatabaseType, now: number): void {
         .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)')
         .run(now);
     }
+    if (current.version < 4) {
+      migrateWorkspaceSchema(database, repository, member, now);
+      database
+        .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)')
+        .run(now);
+    } else {
+      migrateWorkspaceSchema(database, repository, member, now);
+    }
     database.exec('COMMIT');
   } catch (error) {
     if (database.inTransaction) database.exec('ROLLBACK');
@@ -263,13 +667,13 @@ function migrate(database: DatabaseType, now: number): void {
 
 export function openDatabase(
   repository: RepositoryContext,
-  options: { databasePath?: string; now?: number } = {},
+  options: OpenDatabaseOptions = {},
 ): DatabaseType {
   const databasePath = options.databasePath ?? repository.databasePath;
   const stateDirectory = path.dirname(databasePath);
   assertNoSymlinkComponents(stateDirectory);
   mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
-  assertNoSymlinkComponents(databasePath);
+  assertDatabasePathSafe(databasePath);
 
   const database = new Database(databasePath, { timeout: 2_500 });
   try {
@@ -295,7 +699,7 @@ export function openDatabase(
       );
     }
 
-    migrate(database, options.now ?? Date.now());
+    migrate(database, repository, options.now ?? Date.now(), options.member);
     if (persistentDatabase && database.pragma('journal_mode', { simple: true }) !== 'wal') {
       throw new SameTreeError('DATABASE_ERROR', 'SQLite left WAL mode during initialization.');
     }
@@ -304,6 +708,22 @@ export function openDatabase(
     database.close();
     throw error;
   }
+}
+
+export function databaseWorktreeId(database: DatabaseType, repository: RepositoryContext): string {
+  const worktree = database
+    .prepare('SELECT id FROM worktrees WHERE private_git_directory = ?')
+    .get(repository.privateGitDirectory) as { id: string } | undefined;
+  if (!worktree) {
+    throw new SameTreeError(
+      'DATABASE_ERROR',
+      'Current worktree is not registered in the database.',
+      {
+        privateGitDirectory: repository.privateGitDirectory,
+      },
+    );
+  }
+  return worktree.id;
 }
 
 export function immediateTransaction<T>(database: DatabaseType, operation: () => T): T {

@@ -72,6 +72,7 @@ export function checkPreCommit(
   claims: PathClaim[],
   agentName: string,
   cwd = process.cwd(),
+  worktreeId?: string,
 ): { changedLines: number; stagedFiles: string[] } {
   if (!agentName) {
     throw new SameTreeError(
@@ -97,6 +98,7 @@ export function checkPreCommit(
     const staged = normalizeClaim(repository.root, file, 'exact', repository.ignoreCase);
     const conflicting = claims.find(
       (claim) =>
+        (worktreeId === undefined || claim.worktreeId === worktreeId) &&
         claim.agentName !== agentName &&
         (staged.path === claim.path ||
           claimsOverlap(staged, {

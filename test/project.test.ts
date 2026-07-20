@@ -7,6 +7,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { Coordinator } from '../src/coordinator.js';
 import { initializeProject } from '../src/project.js';
 import {
+  AWARENESS_INTEGRATION_TEMPLATE,
+  AWARENESS_POLICY_TEMPLATE,
   LEGACY_INTEGRATION_TEMPLATE,
   LEGACY_POLICY_TEMPLATE,
   LEGACY_REVIEWER_ROLE_TEMPLATE,
@@ -38,7 +40,7 @@ describe('generated state paths', () => {
 
     expect(
       readFileSync(path.join(repository.root, '.sametree', 'coordination.md'), 'utf8'),
-    ).toContain('acknowledge its hash only when `acknowledgedAt` is null');
+    ).toContain('acknowledge each hash only when `acknowledgedAt` is null');
   });
 
   it('generates contention-based path claim guidance', () => {
@@ -53,7 +55,7 @@ describe('generated state paths', () => {
     const policy = readFileSync(path.join(repository.root, '.sametree', 'policy.md'), 'utf8');
 
     expect(coordination).toContain(
-      'Acquire narrow path claims when concurrent editing is plausible',
+      'acquire narrow member-qualified path claims when concurrent editing is plausible',
     );
     expect(coordination).toContain('broad tree claims can block unrelated work');
     expect(policy).toContain('claim when uncertain');
@@ -76,7 +78,7 @@ describe('generated state paths', () => {
     expect(coordination).toContain('do not accept peer-assigned work');
   });
 
-  it('refreshes exact stock 0.1.1 files while preserving customized policy', () => {
+  it('refreshes exact stock 0.1.x files while preserving customized policy', () => {
     const repository = createTestRepository({ initialize: false });
     repositories.push(repository);
     initializeProject(repository.root);
@@ -96,6 +98,14 @@ describe('generated state paths', () => {
     ]);
     expect(readFileSync(policyPath, 'utf8')).toContain('## Work Authority');
     expect(readFileSync(coordinationPath, 'utf8')).toContain('non-authoritative context');
+
+    writeFileSync(policyPath, AWARENESS_POLICY_TEMPLATE);
+    writeFileSync(coordinationPath, AWARENESS_INTEGRATION_TEMPLATE);
+    expect(initializeProject(repository.root).updated).toEqual([
+      '.sametree/policy.md',
+      '.sametree/coordination.md',
+    ]);
+    expect(readFileSync(policyPath, 'utf8')).toContain('workspace members');
 
     writeFileSync(policyPath, '# Custom policy\n\nOnly the user assigns work.\n');
     expect(initializeProject(repository.root).preserved).toContain('.sametree/policy.md');
@@ -118,6 +128,15 @@ describe('generated state paths', () => {
 
     expect(() => Coordinator.open({ cwd: repository.root, agent: 'agent' })).toThrow(
       /symlinked database path/u,
+    );
+  });
+
+  it('explains how to create a missing SameTree configuration', () => {
+    const repository = createTestRepository({ initialize: false });
+    repositories.push(repository);
+
+    expect(() => Coordinator.open({ cwd: repository.root, agent: 'agent' })).toThrow(
+      /run 'sametree init' in this repository first/u,
     );
   });
 

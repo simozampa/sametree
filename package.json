@@ -1,7 +1,7 @@
 {
   "name": "sametree",
-  "version": "0.1.2",
-  "description": "Local coordination for coding agents that share a Git working tree",
+  "version": "0.2.0",
+  "description": "Local coordination for coding agents across Git working trees and repositories",
   "keywords": [
     "agent",
     "agents",
@@ -11,7 +11,8 @@
     "mcp-server",
     "multi-agent",
     "opencode",
-    "sqlite"
+    "sqlite",
+    "workspace"
   ],
   "homepage": "https://github.com/simozampa/sametree#readme",
   "bugs": "https://github.com/simozampa/sametree/issues",

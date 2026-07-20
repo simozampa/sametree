@@ -301,9 +301,9 @@ describe('Coordinator', () => {
     let now = Date.now();
     const { open } = setup(() => now);
     const owner = open('owner');
-    const replacement = open('replacement');
     const active = owner.claimTask(owner.createTask({ title: 'Expired takeover' }).id);
     now += 901_000;
+    const replacement = open('replacement');
 
     expect(() => replacement.claimTask(active.id)).toThrowError(
       expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
@@ -531,7 +531,7 @@ describe('Coordinator', () => {
 
     const database = new Database(resolveRepository(repository.root).databasePath);
     database.exec(
-      'DROP TABLE message_deliveries; DELETE FROM schema_migrations WHERE version = 3;',
+      'DROP TABLE message_deliveries; DELETE FROM schema_migrations WHERE version >= 3;',
     );
     database.close();
 
@@ -542,7 +542,7 @@ describe('Coordinator', () => {
     });
     expect(
       verification.prepare('SELECT MAX(version) AS version FROM schema_migrations').get(),
-    ).toEqual({ version: 3 });
+    ).toEqual({ version: 4 });
     verification.close();
   });
 
@@ -763,7 +763,9 @@ describe('Coordinator', () => {
     expect(Object.keys(acknowledged).sort()).toEqual([
       'acknowledgedAt',
       'hash',
+      'member',
       'newlyAcknowledged',
+      'worktreeId',
     ]);
     expect(author.acknowledgePolicy(policy.hash)).toEqual({
       ...acknowledged,
@@ -781,6 +783,10 @@ describe('Coordinator', () => {
     expect(
       author.events({ after: 0 }).filter((event) => event.kind === 'policy.acknowledged'),
     ).toHaveLength(2);
+    writeFileSync(policy.path, Buffer.from([0xff]));
+    const invalidUtf8 = author.getPolicy().hash;
+    writeFileSync(policy.path, Buffer.from([0xfe]));
+    expect(author.getPolicy().hash).not.toBe(invalidUtf8);
     expect(() => author.acknowledgePolicy('0'.repeat(64))).toThrow(SameTreeError);
   });
 
