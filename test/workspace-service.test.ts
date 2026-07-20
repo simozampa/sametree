@@ -12,13 +12,19 @@ import { resolveRepository } from '../src/git.js';
 import {
   acquireWorkspaceOperationLock,
   bindWorktree,
+  clearRepositoryWorkspaceBinding,
   listRegisteredWorkspaces,
   registerWorkspace,
+  resolveRepositoryWorkspaceBinding,
   resolveWorkspaceBinding,
 } from '../src/workspace.js';
 import {
   addWorkspaceMember,
   createWorkspace,
+  diagnoseWorkspace,
+  leaveWorkspace,
+  pruneWorkspace,
+  relinkWorkspace,
   workspaceMembers,
   workspaceStatus,
 } from '../src/workspace-service.js';
@@ -569,5 +575,317 @@ describe('workspace operations', () => {
     active.close();
     expect(create()).toMatchObject({ workspace: { id: pending?.id }, member: { name: 'studio' } });
     expect(listRegisteredWorkspaces({ registryRoot: registry })).toHaveLength(1);
+  });
+
+  it('prunes missing members while preserving their task and claim history', () => {
+    const studio = repository();
+    const server = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    addWorkspaceMember(
+      server.root,
+      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const serverAgent = open(server.root, 'server-agent', registry);
+    const task = serverAgent.claimTask(
+      serverAgent.createTask({
+        title: 'Preserve after prune',
+        members: ['holo-server'],
+      }).id,
+    );
+    const claim = serverAgent.acquireClaims([
+      { member: 'holo-server', path: 'src/preserved.ts' },
+    ])[0];
+    serverAgent.close();
+    server.cleanup();
+
+    expect(pruneWorkspace(studio.root, { registryRoot: registry }).pruned).toEqual([
+      expect.objectContaining({ name: 'holo-server', available: false }),
+    ]);
+    const observer = open(studio.root, 'observer', registry);
+    expect(observer.listTasks({ member: 'holo-server' })).toContainEqual(
+      expect.objectContaining({ id: task.id }),
+    );
+    expect(observer.listClaims({ includeExpired: true })).toContainEqual(
+      expect.objectContaining({ id: claim?.id, member: 'holo-server' }),
+    );
+    expect(() => observer.acquireClaims([{ member: 'holo-server', path: 'src/new.ts' }])).toThrow(
+      /is unavailable/u,
+    );
+    expect(() =>
+      observer.forceTakeoverTask(task.id, {
+        claimIds: claim ? [claim.id] : [],
+        expectedRevision: task.revision,
+        reason: 'The user explicitly requested a takeover test.',
+        userAuthorized: true,
+      }),
+    ).toThrow(/no longer transferable/u);
+    expect(diagnoseWorkspace(studio.root, { registryRoot: registry })).toMatchObject({
+      ok: false,
+      foreignKeyViolations: 0,
+      warnings: [expect.stringContaining('holo-server is unavailable')],
+    });
+  });
+
+  it('leaves without deleting workspace history', () => {
+    const studio = repository();
+    const server = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    addWorkspaceMember(
+      server.root,
+      { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const studioAgent = open(studio.root, 'studio-agent', registry);
+    const serverAgent = open(server.root, 'server-agent', registry);
+    const task = serverAgent.createTask({ title: 'Leave history', members: ['holo-server'] });
+    const handoffTask = studioAgent.claimTask(
+      studioAgent.createTask({ title: 'Reject retired recipient' }).id,
+    );
+    const handoff = studioAgent.offerHandoff({
+      taskId: handoffTask.id,
+      to: 'server-agent',
+      summary: 'Verify that a retired recipient cannot accept this work.',
+    });
+    serverAgent.acquireClaims([{ member: 'studio', path: 'src/shared.ts' }]);
+    expect(() => leaveWorkspace(server.root, { registryRoot: registry })).toThrow(
+      /Stop active sessions/u,
+    );
+
+    expect(
+      leaveWorkspace(server.root, { registryRoot: registry, now: Date.now() + 1_000_000 }),
+    ).toMatchObject({
+      name: 'holo-server',
+      available: false,
+    });
+    expect(() => serverAgent.acquireClaims([{ member: 'studio', path: 'src/shared.ts' }])).toThrow(
+      /session expired/u,
+    );
+    expect(() => serverAgent.updateTask(task.id, { status: 'in_progress' })).toThrow(
+      /session expired/u,
+    );
+    expect(() =>
+      serverAgent.forceTakeoverTask(handoffTask.id, {
+        expectedRevision: handoffTask.revision,
+        reason: 'The user explicitly requested a retired-session takeover test.',
+        userAuthorized: true,
+      }),
+    ).toThrow(/session expired/u);
+    expect(() =>
+      serverAgent.respondToHandoff(handoff.id, true, {
+        reason: 'The user explicitly requested a retired-session handoff test.',
+        userAuthorized: true,
+      }),
+    ).toThrow(/session expired/u);
+    expect(
+      resolveWorkspaceBinding(resolveRepository(server.root), { registryRoot: registry }),
+    ).toBeNull();
+    const observer = open(studio.root, 'observer', registry);
+    expect(observer.listTasks({ member: 'holo-server' })).toContainEqual(
+      expect.objectContaining({ id: task.id }),
+    );
+  });
+
+  it('relinks a moved worktree only when its private Git identity matches', () => {
+    const main = repository();
+    const registry = registryRoot();
+    git(main.root, ['add', '.']);
+    git(main.root, [
+      '-c',
+      'user.name=SameTree Test',
+      '-c',
+      'user.email=sametree@example.com',
+      'commit',
+      '-m',
+      'test: initialize repository',
+    ]);
+    const workspace = createWorkspace(
+      main.root,
+      { name: 'Product', memberName: 'main', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const linkedRoot = `${main.root}-linked`;
+    const movedRoot = `${main.root}-moved`;
+    try {
+      git(main.root, ['worktree', 'add', '-b', 'feature', linkedRoot]);
+      addWorkspaceMember(
+        linkedRoot,
+        { workspaceId: workspace.workspace.id, memberName: 'feature', mode: 'fresh' },
+        { registryRoot: registry },
+      );
+      git(main.root, ['worktree', 'move', linkedRoot, movedRoot]);
+
+      expect(pruneWorkspace(main.root, { registryRoot: registry }).pruned).toEqual([
+        expect.objectContaining({ name: 'feature', available: false }),
+      ]);
+      expect(() =>
+        Coordinator.open({
+          cwd: movedRoot,
+          agent: 'must-relink',
+          workspaceRegistryRoot: registry,
+        }),
+      ).toThrow(/does not match its registered database member/u);
+
+      expect(
+        relinkWorkspace(
+          movedRoot,
+          { workspaceId: workspace.workspace.id, memberName: 'feature' },
+          { registryRoot: registry },
+        ),
+      ).toMatchObject({ name: 'feature', root: movedRoot, available: true });
+      expect(diagnoseWorkspace(main.root, { registryRoot: registry })).toMatchObject({
+        ok: true,
+        warnings: [],
+      });
+    } finally {
+      git(main.root, ['worktree', 'remove', '--force', movedRoot]);
+    }
+  });
+
+  it('recovers a sole moved member after prune removes its repository binding', () => {
+    const main = repository();
+    const registry = registryRoot();
+    git(main.root, ['add', '.']);
+    git(main.root, [
+      '-c',
+      'user.name=SameTree Test',
+      '-c',
+      'user.email=sametree@example.com',
+      'commit',
+      '-m',
+      'test: initialize repository',
+    ]);
+    const linkedRoot = `${main.root}-only-linked`;
+    const movedRoot = `${main.root}-only-moved`;
+    try {
+      git(main.root, ['worktree', 'add', '-b', 'only-feature', linkedRoot]);
+      const workspace = createWorkspace(
+        linkedRoot,
+        { name: 'Product', memberName: 'feature', mode: 'fresh' },
+        { registryRoot: registry },
+      );
+      git(main.root, ['worktree', 'move', linkedRoot, movedRoot]);
+
+      expect(pruneWorkspace(movedRoot, { registryRoot: registry }).pruned).toEqual([
+        expect.objectContaining({ name: 'feature', available: false }),
+      ]);
+      expect(resolveRepositoryWorkspaceBinding(resolveRepository(movedRoot))).toBeNull();
+      expect(
+        relinkWorkspace(
+          movedRoot,
+          { workspaceId: workspace.workspace.id, memberName: 'feature' },
+          { registryRoot: registry },
+        ),
+      ).toMatchObject({ name: 'feature', root: movedRoot, available: true });
+    } finally {
+      git(main.root, ['worktree', 'remove', '--force', movedRoot]);
+    }
+  });
+
+  it('repairs interrupted retirement cleanup without repeating the transition', () => {
+    const main = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      main.root,
+      { name: 'Product', memberName: 'main', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const repositoryContext = resolveRepository(main.root);
+    const database = new Database(workspace.workspace.databasePath);
+    database.prepare('UPDATE worktrees SET available = 0 WHERE id = ?').run(workspace.member.id);
+    database.close();
+    clearRepositoryWorkspaceBinding(repositoryContext, {
+      workspaceId: workspace.workspace.id,
+      repositoryId: workspace.member.repositoryId,
+    });
+
+    expect(leaveWorkspace(main.root, { registryRoot: registry })).toMatchObject({
+      name: 'main',
+      available: false,
+    });
+    expect(resolveWorkspaceBinding(repositoryContext, { registryRoot: registry })).toBeNull();
+    const verified = new Database(workspace.workspace.databasePath, { readonly: true });
+    expect(
+      verified.prepare("SELECT COUNT(*) AS count FROM events WHERE kind = 'worktree.left'").get(),
+    ).toEqual({ count: 0 });
+    verified.close();
+  });
+
+  it('cleans a stale repository binding when prune retries after retirement', () => {
+    const main = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      main.root,
+      { name: 'Product', memberName: 'main', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const database = new Database(workspace.workspace.databasePath);
+    database.prepare('UPDATE worktrees SET available = 0 WHERE id = ?').run(workspace.member.id);
+    database.close();
+
+    expect(pruneWorkspace(main.root, { registryRoot: registry })).toEqual({ pruned: [] });
+    expect(resolveRepositoryWorkspaceBinding(resolveRepository(main.root))).toBeNull();
+  });
+
+  it('reports source paths that would make coordinator startup fail', () => {
+    const main = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      main.root,
+      { name: 'Product', memberName: 'main', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const database = new Database(workspace.workspace.databasePath);
+    database
+      .prepare('UPDATE workspace_sources SET source_database_path = ? WHERE worktree_id = ?')
+      .run('/incorrect/state.sqlite3', workspace.member.id);
+    database.close();
+
+    expect(diagnoseWorkspace(main.root, { registryRoot: registry })).toMatchObject({
+      ok: false,
+      warnings: [expect.stringContaining('incorrect source database path')],
+    });
+    expect(() =>
+      Coordinator.open({
+        cwd: main.root,
+        agent: 'invalid-source',
+        workspaceRegistryRoot: registry,
+      }),
+    ).toThrow(/does not match its registered database member/u);
+  });
+
+  it('reports workspace metadata that would make startup and relink fail', () => {
+    const main = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      main.root,
+      { name: 'Product', memberName: 'main', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const database = new Database(workspace.workspace.databasePath);
+    database.prepare('UPDATE workspace_metadata SET name = ?').run('Incorrect');
+    database.close();
+
+    expect(diagnoseWorkspace(main.root, { registryRoot: registry })).toMatchObject({
+      ok: false,
+      warnings: [expect.stringContaining('registry and database identities disagree')],
+    });
+    expect(() =>
+      relinkWorkspace(
+        main.root,
+        { workspaceId: workspace.workspace.id, memberName: 'main' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/registry and database disagree/u);
   });
 });

@@ -15,6 +15,10 @@ import { followMessages, watchEvents } from './watch.js';
 import {
   addWorkspaceMember,
   createWorkspace,
+  diagnoseWorkspace,
+  leaveWorkspace,
+  pruneWorkspace,
+  relinkWorkspace,
   type WorkspaceJoinMode,
   workspaceMembers,
   workspaceStatus,
@@ -306,6 +310,47 @@ workspace.command('members').action((_options: unknown, command: Command) => {
   const globals = command.optsWithGlobals<GlobalOptions>();
   print(
     workspaceMembers(globals.cwd, {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    }),
+  );
+});
+
+workspace.command('leave').action((_options: unknown, command: Command) => {
+  const globals = command.optsWithGlobals<GlobalOptions>();
+  print(
+    leaveWorkspace(globals.cwd, {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    }),
+  );
+});
+
+workspace.command('prune').action((_options: unknown, command: Command) => {
+  const globals = command.optsWithGlobals<GlobalOptions>();
+  print(
+    pruneWorkspace(globals.cwd, {
+      ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+    }),
+  );
+});
+
+workspace
+  .command('relink <workspace-id>')
+  .requiredOption('--member <name>', 'existing workspace member name')
+  .action((workspaceId: string, options: { member: string }, command: Command) => {
+    const globals = command.optsWithGlobals<GlobalOptions>();
+    print(
+      relinkWorkspace(
+        globals.cwd,
+        { workspaceId, memberName: options.member },
+        { ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}) },
+      ),
+    );
+  });
+
+workspace.command('doctor').action((_options: unknown, command: Command) => {
+  const globals = command.optsWithGlobals<GlobalOptions>();
+  print(
+    diagnoseWorkspace(globals.cwd, {
       ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
     }),
   );

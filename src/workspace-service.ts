@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync } from 'node:fs';
+import path from 'node:path';
 
 import Database, { type Database as DatabaseType } from 'better-sqlite3';
 
@@ -7,9 +8,14 @@ import { type DatabaseMemberContext, immediateTransaction, openDatabase } from '
 import { SameTreeError } from './errors.js';
 import { type RepositoryContext, resolveRepository } from './git.js';
 import {
+  acquireRepositoryOperationLock,
+  acquireRepositoryOperationLockAt,
   acquireWorkspaceOperationLock,
   bindWorktree,
   clearPendingWorkspaceCreation,
+  clearRepositoryWorkspaceBinding,
+  clearRepositoryWorkspaceBindingAt,
+  clearWorktreeWorkspaceBinding,
   type RegisteredWorkspace,
   readPendingWorkspaceCreation,
   readRegisteredWorkspace,
@@ -62,6 +68,7 @@ export interface WorkspaceMember {
   name: string;
   repositoryId: string;
   repositoryName: string;
+  commonGitDirectory: string;
   root: string;
   privateGitDirectory: string;
   headDescriptor: string;
@@ -82,6 +89,20 @@ export interface WorkspaceStatus {
   workspace: RegisteredWorkspace | null;
   member: WorkspaceMember | null;
   members: WorkspaceMember[];
+}
+
+export interface WorkspacePruneResult {
+  pruned: WorkspaceMember[];
+}
+
+export interface WorkspaceDoctorReport {
+  ok: boolean;
+  workspace: RegisteredWorkspace;
+  databasePath: string;
+  integrity: string;
+  foreignKeyViolations: number;
+  members: WorkspaceMember[];
+  warnings: string[];
 }
 
 interface SourceIdentity {
@@ -123,7 +144,8 @@ function readMember(database: DatabaseType, worktreeId: string): WorkspaceMember
     .prepare(
       `SELECT worktree.id, worktree.name, worktree.root, worktree.private_git_directory,
               worktree.head_descriptor, worktree.available,
-              repository.id AS repository_id, repository.name AS repository_name
+              repository.id AS repository_id, repository.name AS repository_name,
+              repository.common_git_directory
        FROM worktrees worktree
        JOIN repositories repository ON repository.id = worktree.repository_id
        WHERE worktree.id = ?`,
@@ -131,6 +153,7 @@ function readMember(database: DatabaseType, worktreeId: string): WorkspaceMember
     .get(worktreeId) as
     | {
         available: number;
+        common_git_directory: string;
         head_descriptor: string;
         id: string;
         name: string;
@@ -147,6 +170,7 @@ function readMember(database: DatabaseType, worktreeId: string): WorkspaceMember
     name: row.name,
     repositoryId: row.repository_id,
     repositoryName: row.repository_name,
+    commonGitDirectory: row.common_git_directory,
     root: row.root,
     privateGitDirectory: row.private_git_directory,
     headDescriptor: row.head_descriptor,
@@ -160,10 +184,80 @@ function listMembers(database: DatabaseType): WorkspaceMember[] {
   ).map((row) => readMember(database, row.id));
 }
 
+function recordWorkspaceEvent(
+  database: DatabaseType,
+  kind: string,
+  worktreeId: string,
+  payload: Record<string, unknown>,
+  now: number,
+): void {
+  database
+    .prepare(
+      `INSERT INTO events
+        (id, kind, actor, entity_type, entity_id, payload_json, created_at, worktree_id)
+       VALUES (?, ?, 'workspace', 'worktree', ?, ?, ?, ?)`,
+    )
+    .run(createId('event'), kind, worktreeId, JSON.stringify(payload), now, worktreeId);
+}
+
+function retireMember(
+  database: DatabaseType,
+  member: WorkspaceMember,
+  kind: 'worktree.left' | 'worktree.pruned',
+  now: number,
+): void {
+  database
+    .prepare('UPDATE worktrees SET available = 0, updated_at = ? WHERE id = ?')
+    .run(now, member.id);
+  database
+    .prepare(
+      `UPDATE sessions SET status = 'closed', expires_at = ?
+       WHERE home_worktree_id = ? AND status = 'active'`,
+    )
+    .run(now, member.id);
+  recordWorkspaceEvent(database, kind, member.id, { member: member.name }, now);
+}
+
+function pathIsDefinitelyMissing(filePath: string): boolean {
+  try {
+    lstatSync(filePath);
+    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return true;
+    throw error;
+  }
+}
+
+function memberIsDefinitelyStale(member: WorkspaceMember): boolean {
+  try {
+    if (
+      pathIsDefinitelyMissing(member.root) ||
+      pathIsDefinitelyMissing(member.privateGitDirectory)
+    ) {
+      return true;
+    }
+    const resolved = resolveRepository(member.root);
+    return (
+      resolved.privateGitDirectory !== member.privateGitDirectory ||
+      resolved.commonGitDirectory !== member.commonGitDirectory
+    );
+  } catch (error) {
+    throw new SameTreeError(
+      'WORKSPACE_ERROR',
+      `Could not safely inspect workspace member '${member.name}'.`,
+      { cause: error instanceof Error ? error.message : String(error) },
+    );
+  }
+}
+
 export function assertWorkspaceBindingReady(
   repository: RepositoryContext,
   binding: WorkspaceContext,
 ): void {
+  if (!binding.repositoryBindingPresent) {
+    throw new SameTreeError('WORKSPACE_ERROR', 'Worktree binding has no repository binding.');
+  }
   if (!existsSync(binding.workspace.databasePath)) {
     throw new SameTreeError('WORKSPACE_ERROR', 'Bound workspace database is missing.', {
       databasePath: binding.workspace.databasePath,
@@ -185,9 +279,12 @@ export function assertWorkspaceBindingReady(
       | undefined;
     const member = database
       .prepare(
-        `SELECT 1 FROM worktrees worktree
+        `SELECT worktree.name, repository.name AS repository_name
+         FROM worktrees worktree
+         JOIN repositories repository ON repository.id = worktree.repository_id
          JOIN workspace_sources source ON source.worktree_id = worktree.id
          WHERE worktree.id = ? AND worktree.repository_id = ?
+           AND worktree.available = 1
            AND worktree.private_git_directory = ?
            AND source.source_database_path = ?`,
       )
@@ -196,8 +293,13 @@ export function assertWorkspaceBindingReady(
         binding.repositoryId,
         repository.privateGitDirectory,
         repository.databasePath,
-      );
-    if (metadata?.id !== binding.workspace.id || !member) {
+      ) as { name: string; repository_name: string } | undefined;
+    if (
+      metadata?.id !== binding.workspace.id ||
+      !member ||
+      member.name !== binding.worktreeName ||
+      member.repository_name !== binding.repositoryName
+    ) {
       throw new SameTreeError(
         'WORKSPACE_ERROR',
         'Workspace binding does not match its registered database member.',
@@ -504,14 +606,26 @@ function databaseMember(
       },
     );
   }
+  let registeredRepository: { id: string; name: string } | undefined;
+  if (!repositoryBinding && existsSync(workspace.databasePath)) {
+    const database = new Database(workspace.databasePath, { readonly: true, fileMustExist: true });
+    try {
+      registeredRepository = database
+        .prepare('SELECT id, name FROM repositories WHERE common_git_directory = ?')
+        .get(repository.commonGitDirectory) as { id: string; name: string } | undefined;
+    } finally {
+      database.close();
+    }
+  }
   return {
     workspaceId: workspace.id,
     workspaceName: workspace.name,
     workspaceImplicit: false,
     repositoryId:
       repositoryBinding?.repositoryId ??
+      registeredRepository?.id ??
       (mode === 'import-current' && source ? source.repositoryId : createId('repository')),
-    repositoryName: repositoryBinding?.repositoryName ?? memberName,
+    repositoryName: repositoryBinding?.repositoryName ?? registeredRepository?.name ?? memberName,
     worktreeId: mode === 'import-current' && source ? source.worktreeId : createId('worktree'),
     worktreeName: memberName,
   };
@@ -662,7 +776,9 @@ function joinWorkspace(
   const joined = existingJoin(repository, workspace, memberName, mode, options);
   if (joined) return joined;
   const releaseOperationLock = acquireWorkspaceOperationLock(repository);
+  let releaseRepositoryLock: (() => void) | undefined;
   try {
+    releaseRepositoryLock = acquireRepositoryOperationLock(repository);
     const joinedAfterLock = existingJoin(repository, workspace, memberName, mode, options);
     if (joinedAfterLock) return joinedAfterLock;
     const now = options.now ?? Date.now();
@@ -737,6 +853,7 @@ function joinWorkspace(
       source?.close();
     }
   } finally {
+    releaseRepositoryLock?.();
     releaseOperationLock();
   }
 }
@@ -848,4 +965,358 @@ export function workspaceMembers(
   if (!status.bound)
     throw new SameTreeError('WORKSPACE_ERROR', 'This worktree is not in a workspace.');
   return status.members;
+}
+
+export function leaveWorkspace(
+  cwd: string,
+  options: WorkspaceServiceOptions = {},
+): WorkspaceMember {
+  const repository = resolveRepository(cwd);
+  const binding = resolveWorkspaceBinding(repository, options);
+  if (!binding) throw new SameTreeError('WORKSPACE_ERROR', 'This worktree is not in a workspace.');
+  const releaseLock = acquireWorkspaceOperationLock(repository, 2_500);
+  let releaseRepositoryLock: (() => void) | undefined;
+  let member: WorkspaceMember;
+  let removeRepositoryBinding = false;
+  const now = options.now ?? Date.now();
+  try {
+    releaseRepositoryLock = acquireRepositoryOperationLock(repository, 2_500);
+    const database = new Database(binding.workspace.databasePath);
+    try {
+      member = readMember(database, binding.worktreeId);
+      immediateTransaction(database, () => {
+        const active = database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM sessions
+             WHERE home_worktree_id = ? AND status = 'active' AND expires_at > ?`,
+          )
+          .get(member.id, now) as { count: number };
+        if (active.count > 0) {
+          throw new SameTreeError(
+            'WORKSPACE_ERROR',
+            'Stop active sessions in this worktree before leaving the workspace.',
+            { activeSessions: active.count },
+          );
+        }
+        if (member.available) retireMember(database, member, 'worktree.left', now);
+        const remaining = database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM worktrees
+             WHERE repository_id = ? AND available = 1`,
+          )
+          .get(member.repositoryId) as { count: number };
+        removeRepositoryBinding = remaining.count === 0;
+      });
+    } finally {
+      database.close();
+    }
+    if (removeRepositoryBinding) {
+      clearRepositoryWorkspaceBinding(repository, {
+        workspaceId: binding.workspace.id,
+        repositoryId: binding.repositoryId,
+      });
+    }
+    clearWorktreeWorkspaceBinding(repository, {
+      workspaceId: binding.workspace.id,
+      worktreeId: binding.worktreeId,
+    });
+    return { ...member, available: false };
+  } finally {
+    releaseRepositoryLock?.();
+    releaseLock();
+  }
+}
+
+export function pruneWorkspace(
+  cwd: string,
+  options: WorkspaceServiceOptions = {},
+): WorkspacePruneResult {
+  const repository = resolveRepository(cwd);
+  const binding = resolveWorkspaceBinding(repository, options);
+  if (!binding) throw new SameTreeError('WORKSPACE_ERROR', 'This worktree is not in a workspace.');
+  const database = new Database(binding.workspace.databasePath);
+  const now = options.now ?? Date.now();
+  try {
+    const pruned: WorkspaceMember[] = [];
+    for (const candidate of listMembers(database)) {
+      if (!candidate.available || !memberIsDefinitelyStale(candidate)) continue;
+      const releaseRepositoryLock = !pathIsDefinitelyMissing(candidate.commonGitDirectory)
+        ? acquireRepositoryOperationLockAt(candidate.commonGitDirectory, 2_500)
+        : undefined;
+      try {
+        let removeRepositoryBinding = false;
+        immediateTransaction(database, () => {
+          const current = readMember(database, candidate.id);
+          if (!current.available || !memberIsDefinitelyStale(current)) return;
+          retireMember(database, current, 'worktree.pruned', now);
+          const remaining = database
+            .prepare(
+              `SELECT COUNT(*) AS count FROM worktrees
+               WHERE repository_id = ? AND available = 1`,
+            )
+            .get(current.repositoryId) as { count: number };
+          removeRepositoryBinding = remaining.count === 0;
+          pruned.push({ ...current, available: false });
+        });
+        if (removeRepositoryBinding && !pathIsDefinitelyMissing(candidate.commonGitDirectory)) {
+          clearRepositoryWorkspaceBindingAt(candidate.commonGitDirectory, {
+            workspaceId: binding.workspace.id,
+            repositoryId: candidate.repositoryId,
+          });
+        }
+      } finally {
+        releaseRepositoryLock?.();
+      }
+    }
+    const inspectedRepositories = new Set<string>();
+    for (const candidate of listMembers(database)) {
+      if (
+        inspectedRepositories.has(candidate.repositoryId) ||
+        pathIsDefinitelyMissing(candidate.commonGitDirectory)
+      ) {
+        continue;
+      }
+      inspectedRepositories.add(candidate.repositoryId);
+      const releaseRepositoryLock = acquireRepositoryOperationLockAt(
+        candidate.commonGitDirectory,
+        2_500,
+      );
+      try {
+        const available = database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM worktrees
+             WHERE repository_id = ? AND available = 1`,
+          )
+          .get(candidate.repositoryId) as { count: number };
+        if (available.count === 0) {
+          clearRepositoryWorkspaceBindingAt(candidate.commonGitDirectory, {
+            workspaceId: binding.workspace.id,
+            repositoryId: candidate.repositoryId,
+          });
+        }
+      } finally {
+        releaseRepositoryLock();
+      }
+    }
+    return { pruned };
+  } finally {
+    database.close();
+  }
+}
+
+export function relinkWorkspace(
+  cwd: string,
+  input: { workspaceId: string; memberName: string },
+  options: WorkspaceServiceOptions = {},
+): WorkspaceMember {
+  const repository = resolveRepository(cwd);
+  const workspace = readRegisteredWorkspace(input.workspaceId, options);
+  const releaseLock = acquireWorkspaceOperationLock(repository, 2_500);
+  let releaseRepositoryLock: (() => void) | undefined;
+  const now = options.now ?? Date.now();
+  try {
+    releaseRepositoryLock = acquireRepositoryOperationLock(repository, 2_500);
+    const existingWorktreeBinding = resolveWorkspaceBinding(repository, options);
+    if (
+      existingWorktreeBinding &&
+      (existingWorktreeBinding.workspace.id !== workspace.id ||
+        existingWorktreeBinding.worktreeName !== input.memberName)
+    ) {
+      throw new SameTreeError('WORKSPACE_ERROR', 'Worktree is bound to another workspace member.');
+    }
+    const existingRepositoryBinding = resolveRepositoryWorkspaceBinding(repository);
+    if (existingRepositoryBinding && existingRepositoryBinding.workspaceId !== workspace.id) {
+      throw new SameTreeError('WORKSPACE_ERROR', 'Repository is bound to another workspace.');
+    }
+    const database = new Database(workspace.databasePath);
+    try {
+      const metadata = database
+        .prepare('SELECT id, name, implicit FROM workspace_metadata')
+        .get() as { id: string; implicit: number; name: string } | undefined;
+      if (
+        metadata?.id !== workspace.id ||
+        metadata.name !== workspace.name ||
+        metadata.implicit !== 0
+      ) {
+        throw new SameTreeError('WORKSPACE_ERROR', 'Workspace registry and database disagree.');
+      }
+      const row = database
+        .prepare(
+          `SELECT worktree.id, worktree.repository_id, worktree.name,
+                  worktree.private_git_directory, repository.name AS repository_name,
+                  repository.common_git_directory
+           FROM worktrees worktree
+           JOIN repositories repository ON repository.id = worktree.repository_id
+           WHERE worktree.name = ?`,
+        )
+        .get(input.memberName) as
+        | {
+            common_git_directory: string;
+            id: string;
+            name: string;
+            private_git_directory: string;
+            repository_id: string;
+            repository_name: string;
+          }
+        | undefined;
+      if (!row) {
+        throw new SameTreeError(
+          'NOT_FOUND',
+          `Workspace member '${input.memberName}' was not found.`,
+        );
+      }
+      if (
+        row.private_git_directory !== repository.privateGitDirectory ||
+        row.common_git_directory !== repository.commonGitDirectory
+      ) {
+        throw new SameTreeError(
+          'WORKSPACE_ERROR',
+          'Relink requires the member’s original private and common Git directories.',
+        );
+      }
+      bindWorktree(
+        repository,
+        {
+          workspaceId: workspace.id,
+          repositoryId: row.repository_id,
+          repositoryName: row.repository_name,
+          worktreeId: row.id,
+          worktreeName: row.name,
+        },
+        options,
+      );
+      immediateTransaction(database, () => {
+        const active = database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM sessions
+             WHERE home_worktree_id = ? AND status = 'active' AND expires_at > ?`,
+          )
+          .get(row.id, now) as { count: number };
+        if (active.count > 0) {
+          throw new SameTreeError(
+            'WORKSPACE_ERROR',
+            'Stop active member sessions before relinking the worktree.',
+            { activeSessions: active.count },
+          );
+        }
+        database
+          .prepare(
+            `UPDATE worktrees SET
+               root = ?, head_descriptor = ?, branch = ?, available = 1, updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(repository.root, repository.head.descriptor, repository.head.branch, now, row.id);
+        recordWorkspaceEvent(
+          database,
+          'worktree.relinked',
+          row.id,
+          { member: row.name, root: repository.root },
+          now,
+        );
+      });
+      return readMember(database, row.id);
+    } finally {
+      database.close();
+    }
+  } finally {
+    releaseRepositoryLock?.();
+    releaseLock();
+  }
+}
+
+export function diagnoseWorkspace(
+  cwd: string,
+  options: WorkspaceServiceOptions = {},
+): WorkspaceDoctorReport {
+  const repository = resolveRepository(cwd);
+  const binding = resolveWorkspaceBinding(repository, options);
+  if (!binding) throw new SameTreeError('WORKSPACE_ERROR', 'This worktree is not in a workspace.');
+  const database = new Database(binding.workspace.databasePath, {
+    readonly: true,
+    fileMustExist: true,
+  });
+  try {
+    database.pragma('foreign_keys = ON');
+    const integrity = String(database.pragma('integrity_check', { simple: true }));
+    const foreignKeyViolations = (database.pragma('foreign_key_check') as unknown[]).length;
+    const members = listMembers(database);
+    const warnings: string[] = [];
+    const metadata = database.prepare('SELECT id, name, implicit FROM workspace_metadata').get() as
+      | { id: string; implicit: number; name: string }
+      | undefined;
+    if (
+      metadata?.id !== binding.workspace.id ||
+      metadata.name !== binding.workspace.name ||
+      metadata.implicit !== 0
+    ) {
+      warnings.push('Workspace registry and database identities disagree.');
+    }
+    const hasSources = tableExists(database, 'workspace_sources');
+    for (const member of members) {
+      if (!hasSources) {
+        warnings.push(`${member.name} has no recorded standalone-state transition.`);
+      } else {
+        const source = database
+          .prepare(
+            `SELECT source_database_path FROM workspace_sources
+             WHERE worktree_id = ?`,
+          )
+          .get(member.id) as { source_database_path: string } | undefined;
+        if (!source) {
+          warnings.push(`${member.name} has no recorded source database.`);
+        } else if (
+          source.source_database_path !==
+          path.join(member.privateGitDirectory, 'sametree', 'state.sqlite3')
+        ) {
+          warnings.push(`${member.name} has an incorrect source database path.`);
+        }
+      }
+      if (!member.available) {
+        warnings.push(`${member.name} is unavailable.`);
+        continue;
+      }
+      let resolved: RepositoryContext;
+      try {
+        resolved = resolveRepository(member.root);
+      } catch {
+        warnings.push(`${member.name} is missing and should be pruned or relinked.`);
+        continue;
+      }
+      if (
+        resolved.privateGitDirectory !== member.privateGitDirectory ||
+        resolved.commonGitDirectory !== member.commonGitDirectory
+      ) {
+        warnings.push(`${member.name} no longer matches its Git directories.`);
+        continue;
+      }
+      try {
+        const memberBinding = resolveWorkspaceBinding(resolved, options);
+        if (
+          memberBinding?.workspace.id !== binding.workspace.id ||
+          memberBinding.worktreeId !== member.id ||
+          memberBinding.repositoryId !== member.repositoryId ||
+          memberBinding.worktreeName !== member.name ||
+          memberBinding.repositoryName !== member.repositoryName ||
+          !memberBinding.repositoryBindingPresent
+        ) {
+          warnings.push(`${member.name} has a missing or conflicting workspace binding.`);
+        }
+      } catch (error) {
+        warnings.push(
+          `${member.name} binding could not be verified: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    return {
+      ok: integrity === 'ok' && foreignKeyViolations === 0 && warnings.length === 0,
+      workspace: binding.workspace,
+      databasePath: binding.workspace.databasePath,
+      integrity,
+      foreignKeyViolations,
+      members,
+      warnings,
+    };
+  } finally {
+    database.close();
+  }
 }

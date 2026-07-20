@@ -348,13 +348,20 @@ function insertMember(
 
   const storedWorktree = database
     .prepare(
-      `SELECT repository_id, name, private_git_directory
+      `SELECT repository_id, name, private_git_directory, available
        FROM worktrees WHERE id = ?`,
     )
     .get(member.worktreeId) as
-    | { name: string; private_git_directory: string; repository_id: string }
+    | { available: number; name: string; private_git_directory: string; repository_id: string }
     | undefined;
   if (storedWorktree) {
+    if (storedWorktree.available !== 1) {
+      throw new SameTreeError(
+        'WORKSPACE_ERROR',
+        'Workspace member is unavailable; relink it before starting a session.',
+        { worktreeId: member.worktreeId },
+      );
+    }
     if (
       storedWorktree.repository_id !== member.repositoryId ||
       storedWorktree.name !== member.worktreeName ||

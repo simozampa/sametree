@@ -121,6 +121,12 @@ describe('CLI', () => {
       'workspace',
       'status',
     ]);
+    const doctor = await runCli(repository.root, undefined, [
+      '--workspace-registry',
+      registry,
+      'workspace',
+      'doctor',
+    ]);
 
     expect(created).toMatchObject({ code: 0, stderr: '' });
     expect(result.member.name).toBe('studio');
@@ -129,6 +135,7 @@ describe('CLI', () => {
       workspace: { id: result.workspace.id, name: 'Product' },
       member: { name: 'studio' },
     });
+    expect(JSON.parse(doctor.stdout)).toMatchObject({ ok: true, warnings: [] });
   });
 
   it('requires an explicit workspace state mode', async () => {

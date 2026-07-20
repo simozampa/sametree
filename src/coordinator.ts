@@ -661,12 +661,22 @@ export class Coordinator {
     ).map((row) => stringValue(row, 'id'));
   }
 
+  #assertActiveSession(now: number): void {
+    const active = this.#database
+      .prepare("SELECT 1 FROM sessions WHERE id = ? AND status = 'active' AND expires_at > ?")
+      .get(this.sessionId, now);
+    if (!active) {
+      throw new SameTreeError('TASK_UNAVAILABLE', 'This session expired and cannot acquire work.');
+    }
+  }
+
   #transferClaims(
     claimIds: string[],
     fromAgent: string,
     now: number,
     conflictCode: 'HANDOFF_CONFLICT' | 'TASK_UNAVAILABLE' = 'HANDOFF_CONFLICT',
   ): PathClaim[] {
+    this.#assertActiveSession(now);
     const selectedIds = [...new Set(claimIds)];
     if (selectedIds.length > 100) {
       throw new SameTreeError('INVALID_INPUT', 'Transfer at most 100 claims at once.');
@@ -677,7 +687,8 @@ export class Coordinator {
           `SELECT claim.*, worktree.name AS worktree_name
            FROM path_claims claim
            JOIN worktrees worktree ON worktree.id = claim.worktree_id
-           WHERE claim.id = ? AND claim.agent_name = ? AND claim.expires_at > ?`,
+           WHERE claim.id = ? AND claim.agent_name = ? AND claim.expires_at > ?
+             AND worktree.available = 1`,
         )
         .get(claimId, fromAgent, now) as Row | undefined;
       if (!claim) {
@@ -786,7 +797,14 @@ export class Coordinator {
         .prepare('UPDATE agents SET last_seen_at = ? WHERE name = ?')
         .run(now, this.agentName);
       this.#database
-        .prepare('UPDATE path_claims SET expires_at = ? WHERE session_id = ? AND expires_at > ?')
+        .prepare(
+          `UPDATE path_claims SET expires_at = ?
+           WHERE session_id = ? AND expires_at > ?
+             AND EXISTS (
+               SELECT 1 FROM worktrees
+               WHERE worktrees.id = path_claims.worktree_id AND worktrees.available = 1
+             )`,
+        )
         .run(claimExpiry, this.sessionId, now);
       this.#database
         .prepare(
@@ -960,6 +978,7 @@ export class Coordinator {
   claimTask(taskId: string, authorization: UserAuthorizedTaskInput = {}): Task {
     const now = this.#clock();
     return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
       const task = this.#task(taskId);
       if (task.status === 'done' || task.status === 'cancelled' || task.status === 'blocked') {
         throw new SameTreeError('TASK_UNAVAILABLE', `Task '${taskId}' is ${task.status}.`);
@@ -1044,6 +1063,7 @@ export class Coordinator {
     const now = this.#clock();
 
     return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
       const task = this.#task(taskId);
       if (task.revision !== input.expectedRevision) {
         throw new SameTreeError(
@@ -1103,7 +1123,9 @@ export class Coordinator {
   }
 
   updateTask(taskId: string, input: UpdateTaskInput): Task {
+    const now = this.#clock();
     return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
       const task = this.#task(taskId);
       if (input.expectedRevision !== undefined && input.expectedRevision !== task.revision) {
         throw new SameTreeError(
@@ -1165,8 +1187,8 @@ export class Coordinator {
           description,
           input.priority ?? task.priority,
           active ? this.sessionId : null,
-          active ? this.#clock() + this.config.taskLeaseSeconds * 1_000 : null,
-          this.#clock(),
+          active ? now + this.config.taskLeaseSeconds * 1_000 : null,
+          now,
           taskId,
         );
       if (members) {
@@ -1221,6 +1243,18 @@ export class Coordinator {
     const expiresAt = now + ttl * 1_000;
 
     return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
+      const availableWorktree = this.#database.prepare(
+        'SELECT 1 FROM worktrees WHERE id = ? AND available = 1',
+      );
+      for (const claim of unique) {
+        if (!availableWorktree.get(claim.worktreeId)) {
+          throw new SameTreeError(
+            'WORKSPACE_ERROR',
+            `Workspace member '${claim.member}' is unavailable.`,
+          );
+        }
+      }
       this.#database.prepare('DELETE FROM path_claims WHERE expires_at <= ?').run(now);
       const active = this.#database
         .prepare(
@@ -1738,6 +1772,7 @@ export class Coordinator {
         );
       }
       if (accept) {
+        this.#assertActiveSession(now);
         const blockers = this.#unfinishedDependencies(task.id);
         if (blockers.length > 0) {
           throw new SameTreeError(

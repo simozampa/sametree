@@ -82,6 +82,7 @@ export interface WorkspaceContext {
   repositoryName: string;
   worktreeId: string;
   worktreeName: string;
+  repositoryBindingPresent: boolean;
 }
 
 export interface WorkspaceRegistryOptions {
@@ -386,14 +387,10 @@ export function resolveWorkspaceBinding(
     repositoryBindingSchema,
     'repository workspace binding',
   );
-  if (!repositoryBinding) {
-    throw new SameTreeError('WORKSPACE_ERROR', 'Worktree binding has no repository binding.', {
-      worktreeId: worktree.worktreeId,
-    });
-  }
   if (
-    repositoryBinding.workspaceId !== worktree.workspaceId ||
-    repositoryBinding.repositoryId !== worktree.repositoryId
+    repositoryBinding &&
+    (repositoryBinding.workspaceId !== worktree.workspaceId ||
+      repositoryBinding.repositoryId !== worktree.repositoryId)
   ) {
     throw new SameTreeError('WORKSPACE_ERROR', 'Repository and worktree bindings disagree.', {
       repository: repositoryBinding,
@@ -407,6 +404,7 @@ export function resolveWorkspaceBinding(
     repositoryName: worktree.repositoryName,
     worktreeId: worktree.worktreeId,
     worktreeName: worktree.worktreeName,
+    repositoryBindingPresent: repositoryBinding !== null,
   };
 }
 
@@ -458,6 +456,56 @@ export function clearPendingWorkspaceCreation(repository: RepositoryContext): vo
   }
 }
 
+export function clearWorktreeWorkspaceBinding(
+  repository: RepositoryContext,
+  expected: { workspaceId: string; worktreeId: string },
+): void {
+  const bindingPath = worktreeBindingPath(repository);
+  const binding = readOptionalFile(
+    bindingPath,
+    worktreeBindingSchema,
+    'worktree workspace binding',
+  );
+  if (!binding) return;
+  if (binding.workspaceId !== expected.workspaceId || binding.worktreeId !== expected.worktreeId) {
+    throw new SameTreeError('WORKSPACE_ERROR', 'Refusing to remove another worktree binding.', {
+      binding,
+      expected,
+    });
+  }
+  unlinkSync(bindingPath);
+}
+
+export function clearRepositoryWorkspaceBinding(
+  repository: RepositoryContext,
+  expected: { workspaceId: string; repositoryId: string },
+): void {
+  clearRepositoryWorkspaceBindingAt(repository.commonGitDirectory, expected);
+}
+
+export function clearRepositoryWorkspaceBindingAt(
+  commonGitDirectory: string,
+  expected: { workspaceId: string; repositoryId: string },
+): void {
+  const bindingPath = path.join(commonGitDirectory, 'sametree', REPOSITORY_BINDING_FILE);
+  const binding = readOptionalFile(
+    bindingPath,
+    repositoryBindingSchema,
+    'repository workspace binding',
+  );
+  if (!binding) return;
+  if (
+    binding.workspaceId !== expected.workspaceId ||
+    binding.repositoryId !== expected.repositoryId
+  ) {
+    throw new SameTreeError('WORKSPACE_ERROR', 'Refusing to remove another repository binding.', {
+      binding,
+      expected,
+    });
+  }
+  unlinkSync(bindingPath);
+}
+
 function workspaceOperationLockPath(repository: RepositoryContext): string {
   return path.join(repository.privateGitDirectory, 'sametree', WORKSPACE_OPERATION_LOCK_FILE);
 }
@@ -488,7 +536,27 @@ export function acquireWorkspaceOperationLock(
   repository: RepositoryContext,
   waitMilliseconds = 0,
 ): () => void {
-  const lockPath = workspaceOperationLockPath(repository);
+  return acquireSqliteLock(workspaceOperationLockPath(repository), waitMilliseconds);
+}
+
+export function acquireRepositoryOperationLock(
+  repository: RepositoryContext,
+  waitMilliseconds = 0,
+): () => void {
+  return acquireRepositoryOperationLockAt(repository.commonGitDirectory, waitMilliseconds);
+}
+
+export function acquireRepositoryOperationLockAt(
+  commonGitDirectory: string,
+  waitMilliseconds = 0,
+): () => void {
+  return acquireSqliteLock(
+    path.join(commonGitDirectory, 'sametree', 'repository-operation.sqlite3'),
+    waitMilliseconds,
+  );
+}
+
+function acquireSqliteLock(lockPath: string, waitMilliseconds: number): () => void {
   assertNoSymlinkComponents(lockPath);
   mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
   assertNoSymlinkComponents(lockPath);

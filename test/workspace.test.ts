@@ -90,6 +90,7 @@ describe('workspace registry', () => {
       workspace,
       repositoryId: 'repository_main',
       repositoryName: 'Main',
+      repositoryBindingPresent: true,
       worktreeId: 'worktree_main',
       worktreeName: 'main',
     });

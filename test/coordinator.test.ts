@@ -301,9 +301,9 @@ describe('Coordinator', () => {
     let now = Date.now();
     const { open } = setup(() => now);
     const owner = open('owner');
-    const replacement = open('replacement');
     const active = owner.claimTask(owner.createTask({ title: 'Expired takeover' }).id);
     now += 901_000;
+    const replacement = open('replacement');
 
     expect(() => replacement.claimTask(active.id)).toThrowError(
       expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }),
