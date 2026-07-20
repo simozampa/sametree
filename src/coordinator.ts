@@ -37,6 +37,7 @@ import type {
 } from './types.js';
 import {
   acquireWorkspaceOperationLock,
+  clearMatchingPendingWorkspaceJoin,
   resolveWorkspaceBinding,
   type WorkspaceContext,
 } from './workspace.js';
@@ -280,6 +281,10 @@ export class Coordinator {
       });
       if (this.workspace) {
         assertWorkspaceBindingReady(this.repository, this.workspace);
+        clearMatchingPendingWorkspaceJoin(this.repository, {
+          workspaceId: this.workspace.workspace.id,
+          memberName: this.workspace.worktreeName,
+        });
         if (
           options.databasePath !== undefined &&
           options.databasePath !== this.workspace.workspace.databasePath
@@ -2013,6 +2018,10 @@ export class Coordinator {
   }
 
   doctor(): DoctorReport {
-    return inspectDatabase(this.#database, this.repository);
+    return inspectDatabase(
+      this.#database,
+      this.repository,
+      this.workspace?.workspace.databasePath ?? this.repository.databasePath,
+    );
   }
 }

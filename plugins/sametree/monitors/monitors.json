@@ -2,7 +2,7 @@
   {
     "name": "sametree-inbox",
     "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/inbox-monitor.sh\"",
-    "description": "Messages from other SameTree agents in this worktree",
+    "description": "Messages from other agents in this SameTree workspace",
     "when": "always"
   }
 ]

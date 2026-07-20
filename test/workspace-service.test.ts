@@ -1,5 +1,13 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -14,12 +22,16 @@ import {
   bindWorktree,
   clearRepositoryWorkspaceBinding,
   listRegisteredWorkspaces,
+  readPendingWorkspaceJoin,
   registerWorkspace,
+  removeRegisteredWorkspace,
   resolveRepositoryWorkspaceBinding,
   resolveWorkspaceBinding,
+  writePendingWorkspaceJoin,
 } from '../src/workspace.js';
 import {
   addWorkspaceMember,
+  cancelWorkspaceCreation,
   createWorkspace,
   diagnoseWorkspace,
   leaveWorkspace,
@@ -155,6 +167,164 @@ describe('workspace operations', () => {
         { registryRoot: registry, now: 2_000 },
       ),
     ).toMatchObject({ imported: false, member: { id: joined.member.id } });
+  });
+
+  it('recovers a member inserted before its source transition was recorded', () => {
+    const studio = repository();
+    const server = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const serverContext = resolveRepository(server.root);
+    writePendingWorkspaceJoin(serverContext, {
+      workspaceId: workspace.workspace.id,
+      memberName: 'holo-server',
+      mode: 'fresh',
+    });
+    const target = openDatabase(serverContext, {
+      databasePath: workspace.workspace.databasePath,
+      member: {
+        workspaceId: workspace.workspace.id,
+        workspaceName: workspace.workspace.name,
+        workspaceImplicit: false,
+        repositoryId: 'repository_interrupted',
+        repositoryName: 'holo-server',
+        worktreeId: 'worktree_interrupted',
+        worktreeName: 'holo-server',
+      },
+    });
+    target.close();
+    expect(() =>
+      relinkWorkspace(
+        server.root,
+        { workspaceId: workspace.workspace.id, memberName: 'holo-server' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/was not found/u);
+
+    const inaccessibleDatabase = `${workspace.workspace.databasePath}.inaccessible`;
+    renameSync(workspace.workspace.databasePath, inaccessibleDatabase);
+    symlinkSync(inaccessibleDatabase, workspace.workspace.databasePath);
+    expect(() =>
+      addWorkspaceMember(
+        server.root,
+        { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/symlinked database path/u);
+    unlinkSync(workspace.workspace.databasePath);
+    renameSync(inaccessibleDatabase, workspace.workspace.databasePath);
+
+    const blocker = new Database(workspace.workspace.databasePath);
+    blocker.exec('BEGIN IMMEDIATE');
+    try {
+      expect(() =>
+        addWorkspaceMember(
+          server.root,
+          { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+          { registryRoot: registry },
+        ),
+      ).toThrow(/locked/u);
+    } finally {
+      blocker.exec('ROLLBACK');
+      blocker.close();
+    }
+    expect(readPendingWorkspaceJoin(serverContext)).toMatchObject({ mode: 'fresh' });
+
+    expect(() =>
+      addWorkspaceMember(
+        server.root,
+        {
+          workspaceId: workspace.workspace.id,
+          memberName: 'holo-server',
+          mode: 'import-current',
+        },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/different workspace join is pending/u);
+    expect(existsSync(serverContext.databasePath)).toBe(false);
+    expect(
+      addWorkspaceMember(
+        server.root,
+        { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+        { registryRoot: registry },
+      ),
+    ).toMatchObject({
+      member: { id: 'worktree_interrupted', name: 'holo-server' },
+      imported: false,
+    });
+    expect(readPendingWorkspaceJoin(serverContext)).toBeNull();
+    writePendingWorkspaceJoin(serverContext, {
+      workspaceId: workspace.workspace.id,
+      memberName: 'holo-server',
+      mode: 'fresh',
+    });
+    open(server.root, 'recovered-agent', registry);
+    expect(readPendingWorkspaceJoin(serverContext)).toBeNull();
+  }, 10_000);
+
+  it('recovers an inserted linked-worktree member after its root moves', () => {
+    const main = repository();
+    const registry = registryRoot();
+    git(main.root, ['add', '.']);
+    git(main.root, [
+      '-c',
+      'user.name=SameTree Test',
+      '-c',
+      'user.email=sametree@example.com',
+      'commit',
+      '-m',
+      'test: initialize repository',
+    ]);
+    const workspace = createWorkspace(
+      main.root,
+      { name: 'Product', memberName: 'main', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const linkedRoot = `${main.root}-interrupted-linked`;
+    const movedRoot = `${main.root}-interrupted-moved`;
+    try {
+      git(main.root, ['worktree', 'add', '-b', 'interrupted-feature', linkedRoot]);
+      const linked = resolveRepository(linkedRoot);
+      writePendingWorkspaceJoin(linked, {
+        workspaceId: workspace.workspace.id,
+        memberName: 'feature',
+        mode: 'fresh',
+      });
+      const target = openDatabase(linked, {
+        databasePath: workspace.workspace.databasePath,
+        member: {
+          workspaceId: workspace.workspace.id,
+          workspaceName: workspace.workspace.name,
+          workspaceImplicit: false,
+          repositoryId: workspace.member.repositoryId,
+          repositoryName: workspace.member.repositoryName,
+          worktreeId: 'worktree_interrupted_feature',
+          worktreeName: 'feature',
+        },
+      });
+      target.close();
+      git(main.root, ['worktree', 'move', linkedRoot, movedRoot]);
+
+      expect(
+        addWorkspaceMember(
+          movedRoot,
+          { workspaceId: workspace.workspace.id, memberName: 'feature', mode: 'fresh' },
+          { registryRoot: registry },
+        ),
+      ).toMatchObject({
+        member: {
+          id: 'worktree_interrupted_feature',
+          name: 'feature',
+          root: movedRoot,
+        },
+      });
+    } finally {
+      git(main.root, ['worktree', 'remove', '--force', movedRoot]);
+    }
   });
 
   it('shares tasks and messages across sibling repository members', () => {
@@ -577,6 +747,141 @@ describe('workspace operations', () => {
     expect(listRegisteredWorkspaces({ registryRoot: registry })).toHaveLength(1);
   });
 
+  it('cancels a pending creation before any member was recorded', () => {
+    const source = repository();
+    const joining = repository();
+    const registry = registryRoot();
+    const active = open(source.root, 'active-agent');
+    expect(() =>
+      createWorkspace(
+        source.root,
+        { name: 'Product', memberName: 'studio', mode: 'fresh' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/Stop active standalone sessions/u);
+    const [pending] = listRegisteredWorkspaces({ registryRoot: registry });
+    if (!pending) throw new Error('Expected a pending workspace registration.');
+    writePendingWorkspaceJoin(resolveRepository(joining.root), {
+      workspaceId: pending.id,
+      memberName: 'joining',
+      mode: 'fresh',
+    });
+
+    expect(cancelWorkspaceCreation(source.root, { registryRoot: registry })).toEqual({
+      cancelled: true,
+      workspaceId: pending.id,
+    });
+    expect(listRegisteredWorkspaces({ registryRoot: registry })).toEqual([]);
+    active.close();
+    expect(
+      createWorkspace(
+        joining.root,
+        { name: 'Renamed', memberName: 'renamed', mode: 'fresh' },
+        { registryRoot: registry },
+      ),
+    ).toMatchObject({ workspace: { name: 'Renamed' }, member: { name: 'renamed' } });
+  });
+
+  it('does not replace an interrupted add with a new workspace creation', () => {
+    const studio = repository();
+    const server = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const serverContext = resolveRepository(server.root);
+    writePendingWorkspaceJoin(serverContext, {
+      workspaceId: workspace.workspace.id,
+      memberName: 'holo-server',
+      mode: 'fresh',
+    });
+    const target = openDatabase(serverContext, {
+      databasePath: workspace.workspace.databasePath,
+      member: {
+        workspaceId: workspace.workspace.id,
+        workspaceName: workspace.workspace.name,
+        workspaceImplicit: false,
+        repositoryId: 'repository_interrupted_add',
+        repositoryName: 'holo-server',
+        worktreeId: 'worktree_interrupted_add',
+        worktreeName: 'holo-server',
+      },
+    });
+    target.close();
+
+    expect(() =>
+      createWorkspace(
+        server.root,
+        { name: 'Replacement', memberName: 'replacement', mode: 'fresh' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/Complete the pending workspace join/u);
+    expect(listRegisteredWorkspaces({ registryRoot: registry })).toHaveLength(1);
+    expect(() => cancelWorkspaceCreation(server.root, { registryRoot: registry })).toThrow(
+      /no pending workspace creation/u,
+    );
+    expect(
+      addWorkspaceMember(
+        server.root,
+        { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+        { registryRoot: registry },
+      ),
+    ).toMatchObject({ member: { id: 'worktree_interrupted_add' } });
+  });
+
+  it('clears a join intent after a recoverable preflight collision', () => {
+    const studio = repository();
+    const server = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      studio.root,
+      { name: 'Product', memberName: 'studio', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+
+    expect(() =>
+      addWorkspaceMember(
+        server.root,
+        { workspaceId: workspace.workspace.id, memberName: 'studio', mode: 'fresh' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/Worktree name/u);
+    expect(
+      addWorkspaceMember(
+        server.root,
+        { workspaceId: workspace.workspace.id, memberName: 'holo-server', mode: 'fresh' },
+        { registryRoot: registry },
+      ),
+    ).toMatchObject({ member: { name: 'holo-server' } });
+  });
+
+  it('cancels a pending creation whose registration was never persisted', () => {
+    const source = repository();
+    const registry = registryRoot();
+    const active = open(source.root, 'active-agent');
+    expect(() =>
+      createWorkspace(
+        source.root,
+        { name: 'Product', memberName: 'studio', mode: 'fresh' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/Stop active standalone sessions/u);
+    const [pending] = listRegisteredWorkspaces({ registryRoot: registry });
+    if (!pending) throw new Error('Expected a pending workspace registration.');
+    removeRegisteredWorkspace(pending.id, { registryRoot: registry });
+
+    expect(cancelWorkspaceCreation(source.root, { registryRoot: registry })).toEqual({
+      cancelled: true,
+      workspaceId: pending.id,
+    });
+    active.close();
+    expect(() => cancelWorkspaceCreation(source.root, { registryRoot: registry })).toThrow(
+      /no pending workspace creation/u,
+    );
+  });
+
   it('prunes missing members while preserving their task and claim history', () => {
     const studio = repository();
     const server = repository();
@@ -725,6 +1030,15 @@ describe('workspace operations', () => {
       );
       git(main.root, ['worktree', 'move', linkedRoot, movedRoot]);
 
+      const releaseStartupLock = acquireWorkspaceOperationLock(resolveRepository(movedRoot));
+      try {
+        expect(() => pruneWorkspace(main.root, { registryRoot: registry })).toThrow(
+          /Another session startup or workspace operation/u,
+        );
+      } finally {
+        releaseStartupLock();
+      }
+
       expect(pruneWorkspace(main.root, { registryRoot: registry }).pruned).toEqual([
         expect.objectContaining({ name: 'feature', available: false }),
       ]);
@@ -750,7 +1064,7 @@ describe('workspace operations', () => {
     } finally {
       git(main.root, ['worktree', 'remove', '--force', movedRoot]);
     }
-  });
+  }, 10_000);
 
   it('recovers a sole moved member after prune removes its repository binding', () => {
     const main = repository();
@@ -821,6 +1135,27 @@ describe('workspace operations', () => {
     verified.close();
   });
 
+  it('does not report an unavailable member with stale bindings as joined', () => {
+    const main = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      main.root,
+      { name: 'Product', memberName: 'main', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const database = new Database(workspace.workspace.databasePath);
+    database.prepare('UPDATE worktrees SET available = 0 WHERE id = ?').run(workspace.member.id);
+    database.close();
+
+    expect(() =>
+      addWorkspaceMember(
+        main.root,
+        { workspaceId: workspace.workspace.id, memberName: 'main', mode: 'fresh' },
+        { registryRoot: registry },
+      ),
+    ).toThrow(/does not match its registered database member/u);
+  });
+
   it('cleans a stale repository binding when prune retries after retirement', () => {
     const main = repository();
     const registry = registryRoot();
@@ -887,5 +1222,22 @@ describe('workspace operations', () => {
         { registryRoot: registry },
       ),
     ).toThrow(/registry and database disagree/u);
+  });
+
+  it('refuses lifecycle writes through a symlinked workspace database', () => {
+    const main = repository();
+    const registry = registryRoot();
+    const workspace = createWorkspace(
+      main.root,
+      { name: 'Product', memberName: 'main', mode: 'fresh' },
+      { registryRoot: registry },
+    );
+    const realDatabase = `${workspace.workspace.databasePath}.real`;
+    renameSync(workspace.workspace.databasePath, realDatabase);
+    symlinkSync(realDatabase, workspace.workspace.databasePath);
+
+    expect(() => leaveWorkspace(main.root, { registryRoot: registry })).toThrow(
+      /symlinked database path/u,
+    );
   });
 });

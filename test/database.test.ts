@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 
@@ -15,6 +16,23 @@ afterEach(() => {
 });
 
 describe('database workspace migration', () => {
+  it('bounds implicit names for valid repositories with long basenames', () => {
+    const parent = createTestRepository({ initialize: false });
+    repositories.push(parent);
+    const root = path.join(parent.root, 'r'.repeat(120));
+    mkdirSync(root);
+    execFileSync('git', ['init', '--initial-branch=main'], { cwd: root, stdio: 'ignore' });
+
+    const database = openDatabase(resolveRepository(root));
+    expect(database.prepare('SELECT name FROM workspace_metadata').get()).toEqual({
+      name: 'r'.repeat(100),
+    });
+    expect(database.prepare('SELECT name FROM worktrees').get()).toEqual({
+      name: 'r'.repeat(100),
+    });
+    database.close();
+  });
+
   it('creates an implicit one-member workspace at the standalone database path', () => {
     const repository = createTestRepository();
     repositories.push(repository);

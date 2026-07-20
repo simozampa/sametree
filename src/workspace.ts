@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -23,6 +24,7 @@ const REPOSITORY_BINDING_FILE = 'repository.json';
 const WORKTREE_BINDING_FILE = 'worktree.json';
 const WORKSPACE_OPERATION_LOCK_FILE = 'workspace-operation.sqlite3';
 const PENDING_WORKSPACE_FILE = 'pending-workspace.json';
+const PENDING_JOIN_FILE = 'pending-join.json';
 
 const identifierSchema = z
   .string()
@@ -66,10 +68,20 @@ const pendingWorkspaceCreationSchema = z
   })
   .strict();
 
+const pendingWorkspaceJoinSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    workspaceId: identifierSchema,
+    memberName: z.string().trim().min(1).max(100),
+    mode: z.enum(['fresh', 'import-current']),
+  })
+  .strict();
+
 export type WorkspaceRegistration = z.infer<typeof workspaceRegistrationSchema>;
 export type RepositoryWorkspaceBinding = z.infer<typeof repositoryBindingSchema>;
 export type WorktreeWorkspaceBinding = z.infer<typeof worktreeBindingSchema>;
 export type PendingWorkspaceCreation = z.infer<typeof pendingWorkspaceCreationSchema>;
+export type PendingWorkspaceJoin = z.infer<typeof pendingWorkspaceJoinSchema>;
 
 export interface RegisteredWorkspace extends WorkspaceRegistration {
   directory: string;
@@ -228,6 +240,10 @@ function pendingWorkspacePath(repository: RepositoryContext): string {
   return path.join(repository.privateGitDirectory, 'sametree', PENDING_WORKSPACE_FILE);
 }
 
+function pendingWorkspaceJoinPath(repository: RepositoryContext): string {
+  return path.join(repository.privateGitDirectory, 'sametree', PENDING_JOIN_FILE);
+}
+
 export function registerWorkspace(
   input: Omit<WorkspaceRegistration, 'schemaVersion'>,
   options: WorkspaceRegistryOptions = {},
@@ -255,12 +271,24 @@ export function readRegisteredWorkspace(
   workspaceId: string,
   options: WorkspaceRegistryOptions = {},
 ): RegisteredWorkspace {
+  const registered = findRegisteredWorkspace(workspaceId, options);
+  if (!registered) {
+    throw new SameTreeError('WORKSPACE_ERROR', `Workspace '${workspaceId}' is not registered.`);
+  }
+  return registered;
+}
+
+export function findRegisteredWorkspace(
+  workspaceId: string,
+  options: WorkspaceRegistryOptions = {},
+): RegisteredWorkspace | null {
   const directory = workspaceDirectory(workspaceId, options);
-  const registration = parseFile(
+  const registration = readOptionalFile(
     path.join(directory, WORKSPACE_METADATA_FILE),
     workspaceRegistrationSchema,
     'workspace registration',
   );
+  if (!registration) return null;
   if (registration.id !== workspaceId) {
     throw new SameTreeError(
       'WORKSPACE_ERROR',
@@ -279,6 +307,26 @@ export function readRegisteredWorkspace(
   };
 }
 
+export function removeRegisteredWorkspace(
+  workspaceId: string,
+  options: WorkspaceRegistryOptions = {},
+): void {
+  const directory = workspaceDirectory(workspaceId, options);
+  assertNoSymlinkComponents(directory);
+  const registration = readOptionalFile(
+    path.join(directory, WORKSPACE_METADATA_FILE),
+    workspaceRegistrationSchema,
+    'workspace registration',
+  );
+  if (registration && registration.id !== workspaceId) {
+    throw new SameTreeError(
+      'WORKSPACE_ERROR',
+      'Refusing to remove a workspace registration with another identity.',
+    );
+  }
+  rmSync(directory, { recursive: true, force: true });
+}
+
 export function listRegisteredWorkspaces(
   options: WorkspaceRegistryOptions = {},
 ): RegisteredWorkspace[] {
@@ -294,7 +342,7 @@ export function listRegisteredWorkspaces(
     });
   }
   return entries
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.isDirectory() && entry.name !== '.locks')
     .map((entry) => readRegisteredWorkspace(entry.name, options))
     .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
 }
@@ -456,6 +504,54 @@ export function clearPendingWorkspaceCreation(repository: RepositoryContext): vo
   }
 }
 
+export function readPendingWorkspaceJoin(
+  repository: RepositoryContext,
+): PendingWorkspaceJoin | null {
+  return readOptionalFile(
+    pendingWorkspaceJoinPath(repository),
+    pendingWorkspaceJoinSchema,
+    'pending workspace join',
+  );
+}
+
+export function writePendingWorkspaceJoin(
+  repository: RepositoryContext,
+  input: Omit<PendingWorkspaceJoin, 'schemaVersion'>,
+): PendingWorkspaceJoin {
+  const pending = parseValue(
+    { schemaVersion: 1, ...input },
+    pendingWorkspaceJoinSchema,
+    'pending workspace join',
+  );
+  writeExclusiveOrMatch(
+    pendingWorkspaceJoinPath(repository),
+    pending,
+    pendingWorkspaceJoinSchema,
+    'pending workspace join',
+  );
+  return pending;
+}
+
+export function clearPendingWorkspaceJoin(repository: RepositoryContext): void {
+  const pendingPath = pendingWorkspaceJoinPath(repository);
+  assertNoSymlinkComponents(pendingPath);
+  try {
+    unlinkSync(pendingPath);
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') throw error;
+  }
+}
+
+export function clearMatchingPendingWorkspaceJoin(
+  repository: RepositoryContext,
+  expected: { memberName: string; workspaceId: string },
+): void {
+  const pending = readPendingWorkspaceJoin(repository);
+  if (pending?.workspaceId === expected.workspaceId && pending.memberName === expected.memberName) {
+    clearPendingWorkspaceJoin(repository);
+  }
+}
+
 export function clearWorktreeWorkspaceBinding(
   repository: RepositoryContext,
   expected: { workspaceId: string; worktreeId: string },
@@ -536,7 +632,17 @@ export function acquireWorkspaceOperationLock(
   repository: RepositoryContext,
   waitMilliseconds = 0,
 ): () => void {
-  return acquireSqliteLock(workspaceOperationLockPath(repository), waitMilliseconds);
+  return acquireWorkspaceOperationLockAt(repository.privateGitDirectory, waitMilliseconds);
+}
+
+export function acquireWorkspaceOperationLockAt(
+  privateGitDirectory: string,
+  waitMilliseconds = 0,
+): () => void {
+  return acquireSqliteLock(
+    path.join(privateGitDirectory, 'sametree', WORKSPACE_OPERATION_LOCK_FILE),
+    waitMilliseconds,
+  );
 }
 
 export function acquireRepositoryOperationLock(
@@ -552,6 +658,18 @@ export function acquireRepositoryOperationLockAt(
 ): () => void {
   return acquireSqliteLock(
     path.join(commonGitDirectory, 'sametree', 'repository-operation.sqlite3'),
+    waitMilliseconds,
+  );
+}
+
+export function acquireRegisteredWorkspaceOperationLock(
+  workspaceId: string,
+  options: WorkspaceRegistryOptions = {},
+  waitMilliseconds = 0,
+): () => void {
+  const id = parseValue(workspaceId, identifierSchema, 'workspace ID');
+  return acquireSqliteLock(
+    path.join(registryRoot(options), '.locks', `${id}.sqlite3`),
     waitMilliseconds,
   );
 }

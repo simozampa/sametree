@@ -1,10 +1,11 @@
 # Architecture
 
-SameTree is a local-first coordination layer for a small number of cooperative coding agents sharing one Git working tree.
+SameTree is a local-first coordination layer for a small number of cooperative coding agents sharing one physical working tree or an explicit workspace of local repository worktrees.
 
 ## Design Goals
 
 - Work in an existing, possibly dirty working tree.
+- Share coordination across repositories and linked worktrees without moving or copying files.
 - Let independently launched Claude Code and OpenCode processes coordinate.
 - Require no daemon, container, network port, or external database.
 - Preserve task, message, claim, policy, and handoff state across agent restarts.
@@ -35,29 +36,51 @@ SameTree is a local-first coordination layer for a small number of cooperative c
                                                 └────────────────────┘
 ```
 
-Each MCP client owns one server child process and one SameTree session. A heartbeat every 20 seconds renews the session, tasks, and path claims held by that process. CLI commands open their own sessions and leave acquired leases alive until explicit release or expiry; a later CLI process cannot renew an earlier process's session. Built-in CLI, streaming, and MCP sessions retain durable session rows but omit lifecycle audit events to keep the event stream focused on coordination.
+Each MCP client owns one server child process and one SameTree session. Every session has a home member and records the branch on which it started. A heartbeat every 20 seconds renews the session, tasks, and claims held by that process, including claims targeting other workspace members. CLI commands open their own sessions and leave acquired leases alive until explicit release or expiry; a later CLI process cannot renew an earlier process's session. Built-in CLI, streaming, and MCP sessions retain durable session rows but omit lifecycle audit events to keep the event stream focused on coordination.
 
 The CLI and MCP server call the same `Coordinator` domain service. Neither adapter contains coordination rules.
 
-Each harness also owns a message follower with the same generated agent identity as its MCP child. The follower reserves one eligible message at a time. Claude Code treats each monitor line as accepted delivery. OpenCode writes the message ID back only after `promptAsync` accepts the injected prompt. Delivery records deduplicate adapter restarts without changing inbox read receipts.
+Each harness also owns a message follower with the same generated workspace-global agent identity as its MCP child. The follower reserves one eligible message at a time. Claude Code treats each monitor line as accepted delivery. OpenCode writes the message ID back only after `promptAsync` accepts the injected prompt. Delivery records deduplicate adapter restarts without changing inbox read receipts.
 
-## State Location
+## Workspace And Routing Model
 
-SameTree asks Git for the absolute, worktree-specific private directory:
+Standalone mode remains zero-configuration. SameTree asks Git for the absolute private worktree directory and stores state at:
 
 ```bash
-git rev-parse --absolute-git-dir
+<private-git-directory>/sametree/state.sqlite3
 ```
 
-It appends `sametree/state.sqlite3` without resolving child symlinks, allowing the database opener to reject a symlinked state directory safely.
+The schema still represents this as an implicit workspace with one repository and one member. Linked worktrees are independent in standalone mode because each has a different private Git directory.
 
-This is preferable to a tracked `.sametree/state.sqlite3` because SQLite WAL sidecars should not be synchronized by Git. It also handles repositories where `.git` is a file and gives linked worktrees independent coordination state.
+Explicit workspace registrations live at `$XDG_DATA_HOME/sametree/workspaces`, falling back to `~/.local/share/sametree/workspaces`. Each workspace contains:
+
+```text
+<registry>/<workspace-id>/workspace.json
+<registry>/<workspace-id>/state.sqlite3
+```
+
+Joining writes two untracked bindings:
+
+```text
+<common-git-directory>/sametree/repository.json
+<private-git-directory>/sametree/worktree.json
+```
+
+The common binding prevents linked worktrees from splitting one Git repository across explicit workspaces. The private binding identifies one member and routes only that physical worktree to the shared database. Unbound siblings remain standalone. All processes must resolve the binding through the same registry root, selected by `SAMETREE_WORKSPACE_REGISTRY` or the XDG default.
+
+Workspace-global state includes agents, tasks, dependencies, messages, handoffs, audit sequence, and session rows. Sessions have one home member; tasks may tag zero or more affected members; claims target exactly one member; policy files and acknowledgements are member-scoped.
 
 Versioned policy and role documents remain under the tracked `.sametree/` directory. Operational state and collaboration policy therefore have separate lifecycles.
 
+## Workspace Transitions
+
+Creating and joining a workspace requires an explicit state decision. Fresh mode ignores the standalone database. Import mode copies its normalized rows into the shared database, preserves entity IDs, remaps member context, assigns new workspace-global event sequences, and records source sequences. Any identity collision aborts the whole import. The source database remains in place but is not synchronized after joining.
+
+Private-worktree and common-repository SQLite operation locks serialize session startup with create, add, leave, prune, and relink for each affected member. Shared database changes use `BEGIN IMMEDIATE`; binding writes are identity-checked and ordered so interrupted cleanup can be retried. Leave and prune retire members without deleting historical rows. Relink requires the original private and common Git identity, so it recovers moved worktrees but cannot substitute a clone.
+
 ## Why SQLite Instead of JSONL?
 
-Append-only JSONL is inspectable, but compound operations still need cross-process locking. Examples include claiming a task only if its dependencies are complete, acquiring several paths all-or-nothing, accepting a handoff only if its task revision is unchanged, or atomically moving live task and path ownership after an explicit user-authorized takeover.
+Append-only JSONL is inspectable, but compound operations still need cross-process locking. Examples include claiming a task only if its dependencies are complete, acquiring paths across several members all-or-nothing, accepting a handoff only if its task revision is unchanged, importing a standalone database, or atomically moving live task and path ownership after a user-authorized takeover.
 
 SQLite provides:
 
@@ -101,28 +124,28 @@ A typical mutation is:
 6. Append an audit event in the same transaction.
 7. Commit and return the committed representation.
 
-No Git command, filesystem traversal, or network operation runs inside a database transaction.
+Input normalization and broad filesystem inspection happen before a transaction. Member availability is rechecked in the write transaction, and lifecycle Git-identity checks are repeated while holding the affected member's operation locks. Claim path normalization happens before its transaction and availability is rechecked inside it. SameTree performs no network operations.
 
-Status queries observe Git's porcelain-v2 branch and worktree state immediately before reading coordination rows. The command has a bounded runtime and output buffer, includes configured submodule changes, and uses symbolic HEAD to distinguish detached mode from a branch literally named `(detached)`. This derived state is never persisted, so a long-running MCP process reflects branch switches, commits, and dirty changes on its next status call.
+Status observes full porcelain-v2 branch, commit, and dirty state for the caller's current member. It also refreshes each available member's cheap HEAD descriptor. A branch transition records `worktree.branch_changed`; active sessions started on a different branch produce `BRANCH_CHANGED`. Ordinary commits on one branch and detached-HEAD commits do not create false branch-switch events. Branch changes do not cancel leases.
 
 ## Path Safety
 
 Claims accept exact files and recursive directory trees, not arbitrary globs. Predictable overlap is more important than compact syntax.
 
-Before a claim reaches SQLite, SameTree:
+Before a claim reaches SQLite, SameTree resolves the target member and:
 
 - Rejects empty paths, NULs, absolute escapes, and `..` traversal.
 - Resolves the deepest existing ancestor to catch a future path below an escaping symlink.
 - Stores repository-relative POSIX paths.
 - Normalizes Unicode to NFC.
-- Uses a case-folded comparison key when Git reports `core.ignorecase=true`.
+- Uses that member repository's `core.ignorecase` setting for the comparison key.
 - Compares tree prefixes only at path-component boundaries.
 
-Batch acquisition is atomic. An overlap with another agent rejects the entire batch.
+Batch acquisition across members is atomic. An overlap with another agent in the same physical member rejects the entire batch. Matching paths in linked worktrees of one repository are allowed with `LINKED_WORKTREE_OVERLAP`, because they may conflict later during branch integration. Matching paths in unrelated repositories neither conflict nor warn.
 
 ## Leases and Crashes
 
-Sessions, task execution, claims, and handoffs use wall-clock expiries. A daemonless design cannot provide a shared persistent monotonic clock.
+Sessions, task execution, claims, and handoffs use wall-clock expiries. A daemonless design cannot provide a shared persistent monotonic clock. Retiring a member closes sessions whose home is that member; closed sessions cannot acquire, renew, accept, or update work. Claims targeting an unavailable member are not renewed or transferable.
 
 Graceful MCP shutdown closes the session but leaves its claims and execution lease visible until explicit release or expiry. This preserves pending handoffs across normal client shutdown. Expired in-progress work is not silently marked ready or exposed as peer-claimable work. Its assignment remains durable until the owner resumes it or the user explicitly reassigns it.
 
@@ -142,10 +165,12 @@ SameTree is not fully event-sourced. Normalized tables hold current state, while
 
 Audit consumers poll after a sequence cursor. Resource subscriptions remain unnecessary because the audit stream is for context refresh and debugging; addressed messages use the separate durable follower and native harness adapters.
 
+Events in an explicit workspace use one global sequence and carry member/worktree origin where applicable. Imported events receive new sequences while retaining source workspace and sequence metadata internally.
+
 Built-in adapters keep process history in the session table without adding start and close events. This keeps the audit stream focused on tasks, claims, messages, handoffs, and policy changes while preserving session diagnostics.
 
 ## Security Model
 
-SameTree validates paths and SQL inputs, refuses symlinked state paths, never loads SQLite extensions, and stores its database with restrictive permissions where supported.
+SameTree validates paths and SQL inputs, refuses symlinked registry and state paths, never loads SQLite extensions, and stores databases and bindings with restrictive permissions where supported. Registry databases must remain on a local filesystem, and every member must be locally accessible on one machine.
 
 It is not a security boundary between processes sharing an operating-system account. Such processes can edit files directly, bypass Git hooks, inspect the local database, or impersonate another agent name. Use separate sandboxes or worktrees for mutually untrusted agents.

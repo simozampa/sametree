@@ -14,6 +14,7 @@ import { VERSION } from './version.js';
 import { followMessages, watchEvents } from './watch.js';
 import {
   addWorkspaceMember,
+  cancelWorkspaceCreation,
   createWorkspace,
   diagnoseWorkspace,
   leaveWorkspace,
@@ -238,7 +239,11 @@ program
   .description('Check Git, SQLite, policy, and state integrity.')
   .action((_options: unknown, command: Command) => {
     const options = command.optsWithGlobals<GlobalOptions>();
-    print(diagnoseRepository(options.cwd));
+    print(
+      diagnoseRepository(options.cwd, {
+        ...(options.workspaceRegistry ? { registryRoot: options.workspaceRegistry } : {}),
+      }),
+    );
   });
 
 const workspace = program.command('workspace').description('Manage multi-repository workspaces.');
@@ -296,6 +301,18 @@ workspace
       );
     },
   );
+
+workspace
+  .command('cancel-create')
+  .description('Cancel a pending workspace creation before a member was recorded.')
+  .action((_options: unknown, command: Command) => {
+    const globals = command.optsWithGlobals<GlobalOptions>();
+    print(
+      cancelWorkspaceCreation(globals.cwd, {
+        ...(globals.workspaceRegistry ? { registryRoot: globals.workspaceRegistry } : {}),
+      }),
+    );
+  });
 
 workspace.command('status').action((_options: unknown, command: Command) => {
   const globals = command.optsWithGlobals<GlobalOptions>();

@@ -48,6 +48,11 @@ function assertNoSymlinkComponents(target: string): void {
   }
 }
 
+export function assertDatabasePathSafe(databasePath: string): void {
+  assertNoSymlinkComponents(path.dirname(databasePath));
+  assertNoSymlinkComponents(databasePath);
+}
+
 const BROADCAST_RECIPIENT_SCHEMA = `
   CREATE TABLE IF NOT EXISTS broadcast_recipients (
     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -291,7 +296,7 @@ function tableHasColumn(database: DatabaseType, table: string, column: string): 
 }
 
 function implicitMember(repository: RepositoryContext): DatabaseMemberContext {
-  const name = path.basename(repository.root);
+  const name = [...path.basename(repository.root)].slice(0, 100).join('');
   return {
     workspaceId: createId('workspace'),
     workspaceName: name,
@@ -668,7 +673,7 @@ export function openDatabase(
   const stateDirectory = path.dirname(databasePath);
   assertNoSymlinkComponents(stateDirectory);
   mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
-  assertNoSymlinkComponents(databasePath);
+  assertDatabasePathSafe(databasePath);
 
   const database = new Database(databasePath, { timeout: 2_500 });
   try {
