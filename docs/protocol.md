@@ -136,6 +136,8 @@ Automatic capture happens at the harness's proposal boundary:
 - Current OpenCode versions publish the finalized `.opencode/plans/` file from `tool.execute.before` when Plan calls `plan_exit`, before its Build-agent approval question.
 - OpenCode ignores child-session and ordinary Plan responses because those turns can be clarification or progress updates rather than finalized proposals.
 
+Claude Code publication fails open. Its wrapper forwards the hook payload, waits at most two seconds, suppresses SameTree failures, and always returns success, so a missing executable, unavailable database, invalid payload, or hung publication cannot prevent `ExitPlanMode` from presenting the proposal. OpenCode catches publication errors inside its adapter rather than turning them into SameTree coordination decisions. In either harness, a failed proposal may be absent from SameTree until a later successful publication.
+
 Every new revision sends its full body to each live peer as an addressed message on `plan:<plan-id>`. The notification states that the proposal is context rather than authorization. SameTree does not assign a reviewer, transfer a task, or authorize implementation. Agents that start later can discover current summaries through status or plan listing and retrieve any immutable revision explicitly.
 
 The CLI exposes `sametree plan publish`, `sametree plan show`, and `sametree plan list`. MCP exposes `sametree_plan_publish`, `sametree_plan_get`, and `sametree_plan_list`. Listing is ordered by immutable plan creation time so pagination remains stable when older plans receive revisions.

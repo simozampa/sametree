@@ -1003,6 +1003,7 @@ export class Coordinator {
         dependencies,
         members: members.map((member) => member.name),
         priority,
+        title,
       });
       return this.#task(id);
     });
@@ -1296,6 +1297,7 @@ export class Coordinator {
         );
       this.#recordEvent(task.assignee ? 'task.claimed' : 'task.adopted', 'task', taskId, {
         previousAssignee: task.assignee,
+        title: task.title,
         ...(adoptionReason
           ? { previousRevision: task.revision, reason: adoptionReason, userAuthorized: true }
           : {}),
@@ -1378,6 +1380,7 @@ export class Coordinator {
         blockers,
         newStatus: startExecution ? 'in_progress' : task.status,
         reason,
+        title: task.title,
         userAuthorized: true,
       });
       return { task: this.#task(taskId), claims };
@@ -1462,6 +1465,7 @@ export class Coordinator {
       }
       this.#recordEvent('task.updated', 'task', taskId, {
         fromStatus: task.status,
+        title: task.title,
         toStatus: status,
         ...(members ? { members: members.map((member) => member.name) } : {}),
       });

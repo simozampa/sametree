@@ -75,42 +75,87 @@ function liveness(coordinator: Coordinator, signal?: AbortSignal) {
   };
 }
 
-function payloadSummary(event: CoordinationEvent): string {
+function text(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function count(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function taskName(event: CoordinationEvent): string {
+  const title = text(event.payload.title);
+  return title ? `"${title}"` : event.entityId;
+}
+
+function claimPaths(value: unknown): string {
+  if (!Array.isArray(value)) return '';
+  const paths = value.flatMap((entry) => {
+    if (typeof entry === 'string') return [{ member: '', path: entry }];
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return [];
+    const member = text(Reflect.get(entry, 'member'));
+    const path = text(Reflect.get(entry, 'path'));
+    return path ? [{ member, path }] : [];
+  });
+  return paths
+    .map((entry) => (entry.member ? `${entry.member}:${entry.path}` : entry.path))
+    .join(', ');
+}
+
+function eventDescription(event: CoordinationEvent): string {
   const payload = event.payload;
   switch (event.kind) {
-    case 'claim.acquired':
-      return Array.isArray(payload.paths) ? payload.paths.join(', ') : '';
-    case 'claim.released':
-      return `${String(payload.released ?? 0)} released`;
+    case 'claim.acquired': {
+      const paths = claimPaths(payload.paths);
+      return `${event.actor}: claimed ${paths || event.entityId}`;
+    }
+    case 'claim.released': {
+      const released = count(payload.released);
+      return `${event.actor}: released ${released} ${released === 1 ? 'claim' : 'claims'}`;
+    }
     case 'handoff.offered':
-      return `${String(payload.taskId ?? '')} -> ${String(payload.to ?? '')}`;
+      return `${event.actor} -> ${text(payload.to) || 'unknown'}: offered a handoff for ${text(payload.taskId) || event.entityId}`;
     case 'handoff.accepted':
     case 'handoff.rejected':
-      return String(payload.taskId ?? '');
-    case 'message.sent':
-      return payload.recipient ? `-> ${String(payload.recipient)}` : '-> broadcast';
+      return `${event.actor}: ${event.kind === 'handoff.accepted' ? 'accepted' : 'rejected'} the handoff for ${text(payload.taskId) || event.entityId}`;
+    case 'message.sent': {
+      const recipient = text(payload.recipient) || 'broadcast';
+      return `${event.actor} -> ${recipient}: sent a message`;
+    }
+    case 'message.acknowledged':
+      return `${event.actor}: acknowledged a message`;
     case 'plan.published':
+      return `${event.actor}: published plan "${text(payload.title) || event.entityId}" (revision ${String(payload.revision ?? '')})`;
     case 'plan.revised':
-      return `revision ${String(payload.revision ?? '')}: ${String(payload.title ?? '')}`;
-    case 'task.created':
-      return String(payload.priority ?? '');
-    case 'task.updated':
-      return `${String(payload.fromStatus ?? '')} -> ${String(payload.toStatus ?? '')}`;
+      return `${event.actor}: revised plan "${text(payload.title) || event.entityId}" (revision ${String(payload.revision ?? '')})`;
+    case 'task.created': {
+      const priority = text(payload.priority);
+      return `${event.actor}: created task ${taskName(event)}${priority ? ` (${priority} priority)` : ''}`;
+    }
+    case 'task.updated': {
+      const from = text(payload.fromStatus);
+      const to = text(payload.toStatus);
+      if (to === 'done') return `${event.actor}: completed task ${taskName(event)}`;
+      if (from && to && from !== to) {
+        return `${event.actor}: moved task ${taskName(event)} from ${from} to ${to}`;
+      }
+      return `${event.actor}: updated task ${taskName(event)}`;
+    }
     case 'task.claimed':
+      return `${event.actor}: started task ${taskName(event)}`;
+    case 'task.adopted':
+      return `${event.actor}: adopted task ${taskName(event)}`;
     case 'task.taken_over':
     case 'task.force_taken_over':
-      return payload.previousAssignee ? `from ${String(payload.previousAssignee)}` : '';
+      return `${event.actor}: took over task ${taskName(event)}${payload.previousAssignee ? ` from ${String(payload.previousAssignee)}` : ''}`;
     default:
-      return '';
+      return `${event.actor}: ${event.kind} ${event.entityType}:${event.entityId}`;
   }
 }
 
 export function formatEvent(event: CoordinationEvent): string {
   const time = new Date(event.createdAt).toISOString().slice(11, 19);
-  const subject = `${event.entityType}:${event.entityId}`;
-  const summary = payloadSummary(event);
-  const line = `${time}  ${event.actor.padEnd(20)} ${event.kind.padEnd(21)} ${subject}${summary ? `  ${summary}` : ''}`;
-  return terminalSafe(line);
+  return terminalSafe(`${time}  ${eventDescription(event)}`);
 }
 
 export function formatMessage(message: Message): string {
