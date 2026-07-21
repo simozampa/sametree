@@ -8,7 +8,7 @@ SameTree is a local-first coordination layer for a small number of cooperative c
 - Share coordination across repositories and linked worktrees without moving or copying files.
 - Let independently launched Claude Code and OpenCode processes coordinate.
 - Require no daemon, container, network port, or external database.
-- Preserve task, message, claim, policy, and handoff state across agent restarts.
+- Preserve task, proposed-plan, message, claim, policy, and handoff state across agent restarts.
 - Make conflicting state transitions atomic and auditable.
 - Keep adapters thin enough that MCP and CLI behavior cannot diverge.
 
@@ -42,6 +42,8 @@ The CLI and MCP server call the same `Coordinator` domain service. Neither adapt
 
 Each harness also owns a message follower with the same generated workspace-global agent identity as its MCP child. The follower reserves one eligible message at a time. Claude Code treats each monitor line as accepted delivery. OpenCode writes the message ID back only after `promptAsync` accepts the injected prompt. Delivery records deduplicate adapter restarts without changing inbox read receipts.
 
+Harness adapters publish proposed plans through the CLI at a stable boundary before implementation approval. Claude Code supplies the plan body directly to an `ExitPlanMode` hook. OpenCode's project plugin reads the finalized Plan file when `plan_exit` begins; it does not infer finality from ordinary Plan responses because those may only ask for clarification or report progress. Database uniqueness uses harness plus native session rather than process identity, so resuming one harness session cannot create a second plan merely because its process-derived agent name changed.
+
 ## Workspace And Routing Model
 
 Standalone mode remains zero-configuration. SameTree asks Git for the absolute private worktree directory and stores state at:
@@ -68,7 +70,7 @@ Joining writes two untracked bindings:
 
 The common binding prevents linked worktrees from splitting one Git repository across explicit workspaces. The private binding identifies one member and routes only that physical worktree to the shared database. Unbound siblings remain standalone. All processes must resolve the binding through the same registry root, selected by `SAMETREE_WORKSPACE_REGISTRY` or the XDG default.
 
-Workspace-global state includes agents, tasks, dependencies, messages, handoffs, audit sequence, and session rows. Sessions have one home member; tasks may tag zero or more affected members; claims target exactly one member; policy files and acknowledgements are member-scoped.
+Workspace-global state includes agents, tasks, dependencies, plans and immutable plan revisions, messages, handoffs, audit sequence, and session rows. Sessions have one home member; tasks may tag zero or more affected members; claims target exactly one member; policy files and acknowledgements are member-scoped.
 
 Versioned policy and role documents remain under the tracked `.sametree/` directory. Operational state and collaboration policy therefore have separate lifecycles.
 
@@ -80,7 +82,7 @@ Private-worktree and common-repository SQLite operation locks serialize session 
 
 ## Why SQLite Instead of JSONL?
 
-Append-only JSONL is inspectable, but compound operations still need cross-process locking. Examples include claiming a task only if its dependencies are complete, acquiring paths across several members all-or-nothing, accepting a handoff only if its task revision is unchanged, importing a standalone database, or atomically moving live task and path ownership after a user-authorized takeover.
+Append-only JSONL is inspectable, but compound operations still need cross-process locking. Examples include publishing one idempotent plan revision and all live-peer notifications, claiming a task only if its dependencies are complete, acquiring paths across several members all-or-nothing, accepting a handoff only if its task revision is unchanged, importing a standalone database, or atomically moving live task and path ownership after a user-authorized takeover.
 
 SQLite provides:
 
@@ -167,7 +169,7 @@ Audit consumers poll after a sequence cursor. Resource subscriptions remain unne
 
 Events in an explicit workspace use one global sequence and carry member/worktree origin where applicable. Imported events receive new sequences while retaining source workspace and sequence metadata internally.
 
-Built-in adapters keep process history in the session table without adding start and close events. This keeps the audit stream focused on tasks, claims, messages, handoffs, and policy changes while preserving session diagnostics.
+Built-in adapters keep process history in the session table without adding start and close events. This keeps the audit stream focused on tasks, plans, claims, messages, handoffs, and policy changes while preserving session diagnostics.
 
 ## Security Model
 

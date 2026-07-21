@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node.js 22+](https://img.shields.io/badge/node-%3E%3D22.12-339933.svg)](package.json)
 
-SameTree gives coding agents shared tasks, path claims, messages, handoffs, and policy. It runs locally through MCP, with no daemon, cloud service, or external database service.
+SameTree gives coding agents shared tasks, proposed plans, path claims, messages, handoffs, and policy. It runs locally through MCP, with no daemon, cloud service, or external database service.
 
 <p align="center">
   <img src="docs/demo.svg" alt="SameTree setup, task and path ownership, conflict prevention, and agent messaging" width="100%">
@@ -16,6 +16,7 @@ SameTree gives coding agents shared tasks, path claims, messages, handoffs, and 
 
 - Keep user-assigned work and agent activity visible in one place.
 - Surface conflicting path claims before cooperative agents edit the same files.
+- Share proposed plans automatically before implementation starts.
 - Deliver peer messages directly to active Claude Code and OpenCode sessions.
 - Coordinate several repositories or linked worktrees when one checkout is not enough.
 - Keep operational state local and outside tracked files.
@@ -30,11 +31,11 @@ npm install --global sametree
 
 This installs the `sametree` CLI and `sametree-mcp` server.
 
-> SameTree is pre-1.0 alpha software. Back up important coordination state before upgrades. When upgrading from 0.1.x, stop active agents and read the [upgrade guide](docs/upgrading.md) before opening existing state with 0.2.0.
+> SameTree is pre-1.0 alpha software. Back up important coordination state before upgrades. Stop active agents and read the [upgrade guide](docs/upgrading.md) before opening existing state with a newer SameTree release.
 
 ## Quick Start
 
-Run setup in every working tree that will launch a harness. Setup installs or updates a user-scoped Claude Code plugin and a project-scoped OpenCode integration that can inject peer messages into active sessions.
+Run setup in every working tree that will launch a harness. Setup installs or updates integrations that inject peer messages and automatically publish proposed Claude Code and OpenCode plans.
 
 ```bash
 cd /path/to/your/project
@@ -83,6 +84,7 @@ Automatic OpenCode delivery requires a local TUI process. Attach mode reports th
 ## Coordination Model
 
 - Tasks record work already assigned by the user; they are not a peer-managed queue.
+- Plans are revisioned shared context; publishing one does not assign review or implementation work.
 - Claims identify files an agent intends to edit and reject hard conflicts in the same working tree.
 - Messages and handoffs carry context but never change an agent's scope without user authorization.
 - Linked-worktree overlaps produce integration warnings rather than pretending branches cannot diverge.
@@ -123,7 +125,7 @@ No. Agents can coordinate in the same live checkout when their work is intertwin
 
 ### How do coding agents share context across sessions?
 
-SameTree stores tasks, messages, handoffs, claims, and policy acknowledgements in local SQLite. Its Claude Code and OpenCode adapters deliver addressed messages to active sessions.
+SameTree stores tasks, proposed plans, messages, handoffs, claims, and policy acknowledgements in local SQLite. Its Claude Code and OpenCode adapters publish plans and deliver addressed messages to active sessions.
 
 ### Is SameTree a Conductor alternative?
 

@@ -1,5 +1,19 @@
 # Upgrading SameTree
 
+## Upgrade To 0.3.0
+
+Version 0.3.0 adds automatic proposed-plan sharing for Claude Code and OpenCode, immutable plan revisions, peer notifications, and CLI/MCP plan access. It upgrades coordination databases from schema 4 to schema 5. SameTree 0.2.x cannot read schema 5, so prepare rollback backups before any 0.3 command opens existing state.
+
+1. Finish or pause work and stop every Claude Code, OpenCode, SameTree MCP, watcher, message follower, and other process using the standalone or workspace database.
+2. Back up each standalone or explicit workspace `state.sqlite3` with any `-wal` and `-shm` sidecars as one coherent set while all processes are stopped.
+3. Install `npm install --global sametree@0.3.0`.
+4. Rerun `sametree setup --claude --opencode` in every physical worktree that launches a harness, omitting unused harnesses. This updates the Claude plugin with its `ExitPlanMode` hook and installs the managed `.opencode/plugins/sametree-plan-publisher.ts` project plugin. Review setup statuses and tracked-file diffs.
+5. Restart the harnesses. The first 0.3 coordination or diagnostic command migrates the selected database in place.
+
+Do not run 0.2.x and 0.3 processes against the same database. Schema 5 adds `plans` and `plan_revisions`; all schema-4 coordination state and IDs are preserved. Existing workspace imports also copy plan state and reject plan identity collisions.
+
+For rollback, stop every 0.3 process, remove the complete schema-5 database set, and restore the exact coherent schema-4 backup before reinstalling 0.2.x. There is no automatic schema downgrade. Rerun the older setup so harness integrations match the restored package version; plans published after upgrading are absent from the schema-4 backup.
+
 ## Upgrade To 0.2.0
 
 Version 0.2.0 adds explicit multi-repository workspaces, linked-worktree integration warnings, member-qualified tasks, claims, and policies, and workspace lifecycle recovery. It upgrades coordination databases from schema 3 to schema 4. SameTree 0.1.x cannot read schema 4, so prepare rollback backups before any 0.2 command opens existing state.
