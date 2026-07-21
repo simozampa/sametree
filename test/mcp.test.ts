@@ -74,7 +74,11 @@ describe('MCP server', () => {
     const response = await client.callTool({ name: 'sametree_status', arguments: {} });
 
     expect(tools.tools.map((tool) => tool.name)).toEqual(
-      expect.arrayContaining(['sametree_claim_acquire', 'sametree_task_force_takeover']),
+      expect.arrayContaining([
+        'sametree_claim_acquire',
+        'sametree_plan_publish',
+        'sametree_task_force_takeover',
+      ]),
     );
     expect(response.isError).not.toBe(true);
     expect(response.structuredContent).toMatchObject({
@@ -86,6 +90,48 @@ describe('MCP server', () => {
     const content = response.content as Array<{ text?: string; type: string }>;
     const text = content.find((item) => item.type === 'text')?.text;
     expect(text).not.toContain('\n');
+  });
+
+  it('publishes and reads proposed plans over MCP', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [mcpPath],
+      cwd: repository.root,
+      env: {
+        ...getDefaultEnvironment(),
+        SAMETREE_AGENT: 'mcp-planner',
+        SAMETREE_HARNESS: 'claude-code',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'sametree-test', version: '1.0.0' });
+    clients.push(client);
+    await client.connect(transport);
+
+    const published = await client.callTool({
+      name: 'sametree_plan_publish',
+      arguments: {
+        body: '# MCP plan\n\nReview this proposal.',
+        sourceSessionId: 'claude-session',
+        sourceEventId: 'tool-use',
+      },
+    });
+    const plan = published.structuredContent as { result: { id: string } };
+    const listed = await client.callTool({ name: 'sametree_plan_list', arguments: {} });
+    const shown = await client.callTool({
+      name: 'sametree_plan_get',
+      arguments: { planId: plan.result.id },
+    });
+
+    expect(published.isError).not.toBe(true);
+    expect(listed.structuredContent).toMatchObject({
+      result: [expect.objectContaining({ id: plan.result.id, title: 'MCP plan' })],
+    });
+    expect(shown.structuredContent).toMatchObject({
+      result: { id: plan.result.id, body: expect.stringContaining('Review this proposal.') },
+    });
   });
 
   it('resolves a shared workspace and home member with a custom registry', async () => {

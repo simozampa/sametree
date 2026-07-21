@@ -241,6 +241,74 @@ server.registerTool(
 );
 
 server.registerTool(
+  'sametree_plan_publish',
+  {
+    title: 'Publish a proposed plan',
+    description:
+      'Publish an immutable proposed-plan revision for peer awareness. Publication never assigns review or implementation work.',
+    inputSchema: {
+      body: z.string().min(1).max(48_000),
+      sourceSessionId: z.string().min(1).max(200),
+      sourceEventId: z.string().min(1).max(200),
+      title: z.string().min(1).max(200).optional(),
+      taskId: z.string().optional(),
+    },
+    outputSchema,
+    annotations: { idempotentHint: true },
+  },
+  ({ body, sourceSessionId, sourceEventId, title, taskId }) =>
+    execute(() =>
+      coordinator.publishPlan({
+        body,
+        sourceSessionId,
+        sourceEventId,
+        ...(title !== undefined ? { title } : {}),
+        ...(taskId !== undefined ? { taskId } : {}),
+      }),
+    ),
+);
+
+server.registerTool(
+  'sametree_plan_get',
+  {
+    title: 'Read a proposed plan',
+    description: 'Read the current or a specific immutable revision of a shared proposed plan.',
+    inputSchema: {
+      planId: z.string(),
+      revision: z.number().int().positive().optional(),
+    },
+    outputSchema,
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  ({ planId, revision }) => execute(() => coordinator.getPlan(planId, revision)),
+);
+
+server.registerTool(
+  'sametree_plan_list',
+  {
+    title: 'List proposed plans',
+    description: 'List current shared plan revisions without their full Markdown bodies.',
+    inputSchema: {
+      after: z.string().optional(),
+      author: z.string().optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+      taskId: z.string().optional(),
+    },
+    outputSchema,
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  ({ after, author, limit, taskId }) =>
+    execute(() =>
+      coordinator.listPlans({
+        ...(after !== undefined ? { after } : {}),
+        ...(author !== undefined ? { author } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+        ...(taskId !== undefined ? { taskId } : {}),
+      }),
+    ),
+);
+
+server.registerTool(
   'sametree_claim_acquire',
   {
     title: 'Claim paths',

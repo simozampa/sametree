@@ -297,6 +297,70 @@ describe('CLI', () => {
     expect(result.stderr).toContain('USER_AUTHORIZATION_REQUIRED');
   });
 
+  it('publishes plan Markdown from stdin and exposes current summaries', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const body = '# CLI plan\n\n1. Inspect the contract.\n2. Add coverage.\n';
+    const published = await runCli(
+      repository.root,
+      'planner',
+      [
+        '--harness',
+        'opencode',
+        'plan',
+        'publish',
+        '--source-session',
+        'session-one',
+        '--source-event',
+        'message-one',
+        '--body-stdin',
+      ],
+      body,
+    );
+    const plan = JSON.parse(published.stdout) as { id: string; revision: number };
+    const listed = await runCli(repository.root, 'observer', ['plan', 'list']);
+    const shown = await runCli(repository.root, 'observer', ['plan', 'show', plan.id]);
+
+    expect(published).toMatchObject({ code: 0, stderr: '' });
+    expect(plan.revision).toBe(1);
+    expect(JSON.parse(listed.stdout)).toEqual([
+      expect.objectContaining({ id: plan.id, revision: 1, title: 'CLI plan' }),
+    ]);
+    expect(JSON.parse(shown.stdout)).toMatchObject({ id: plan.id, body: body.trim() });
+  });
+
+  it('publishes an ExitPlanMode payload without writing hook output', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const result = await runCli(
+      repository.root,
+      undefined,
+      ['hook', 'claude-plan'],
+      JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        session_id: 'session-claude',
+        tool_name: 'ExitPlanMode',
+        tool_use_id: 'tool-plan-one',
+        tool_input: { plan: '# Claude plan\n\n1. Implement it.' },
+      }),
+    );
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    const plans = observer.listPlans();
+    const summary = plans[0];
+    if (!summary) throw new Error('Expected the Claude hook to publish a plan.');
+    const plan = observer.getPlan(summary.id);
+    observer.close();
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(plan).toMatchObject({
+      author: 'claude-code-session-claude',
+      body: '# Claude plan\n\n1. Implement it.',
+      sourceHarness: 'claude-code',
+      sourceEventId: 'tool-plan-one',
+      sourceSessionId: 'session-claude',
+    });
+  });
+
   it('grants exactly one of two competing process claims', async () => {
     const repository = createTestRepository();
     repositories.push(repository);

@@ -447,6 +447,147 @@ describe('Coordinator', () => {
     expect(author.inbox({ unreadOnly: true })).toHaveLength(1);
   });
 
+  it('publishes revisioned plans idempotently and notifies live peers', () => {
+    const { open } = setup(() => 1_000);
+    const author = open('author');
+    const reviewer = open('reviewer');
+    const first = author.publishPlan({
+      body: '# Validation plan\n\n1. Reject empty arrays.\n2. Add regression coverage.',
+      sourceSessionId: 'session-plan',
+      sourceEventId: 'event-one',
+    });
+
+    expect(first).toMatchObject({
+      author: 'author',
+      revision: 1,
+      sourceHarness: 'other',
+      title: 'Validation plan',
+    });
+    expect(reviewer.inbox()).toEqual([
+      expect.objectContaining({
+        sender: 'author',
+        subject: 'Plan from author: Validation plan',
+        threadId: `plan:${first.id}`,
+      }),
+    ]);
+    expect(
+      author.publishPlan({
+        body: first.body,
+        sourceSessionId: 'session-plan',
+        sourceEventId: 'event-one',
+      }),
+    ).toEqual(first);
+
+    const revised = author.publishPlan({
+      body: '# Validation plan\n\n1. Reject empty arrays.\n2. Add property coverage.',
+      sourceSessionId: 'session-plan',
+      sourceEventId: 'event-two',
+    });
+    expect(revised.revision).toBe(2);
+    expect(author.getPlan(first.id, 1).body).toContain('regression coverage');
+    expect(author.listPlans()).toEqual([
+      expect.objectContaining({ id: first.id, revision: 2, title: 'Validation plan' }),
+    ]);
+    expect(reviewer.inbox()).toHaveLength(2);
+    expect(
+      author.events({ limit: 100 }).filter((event) => event.kind.startsWith('plan.')),
+    ).toHaveLength(2);
+
+    expect(() =>
+      author.publishPlan({
+        body: '# Different plan',
+        sourceSessionId: 'session-plan',
+        sourceEventId: 'event-one',
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'PLAN_CONFLICT' }));
+  });
+
+  it('keeps plans visible to agents that register after publication', () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const author = Coordinator.open({ cwd: repository.root, agent: 'author', clock: () => 1_000 });
+    coordinators.push(author);
+    const plan = author.publishPlan({
+      body: '# Durable proposal\n\nShare this with future sessions.',
+      sourceSessionId: 'session-plan',
+      sourceEventId: 'event-one',
+    });
+    const future = Coordinator.open({ cwd: repository.root, agent: 'future', clock: () => 1_000 });
+    coordinators.push(future);
+
+    expect(future.inbox()).toEqual([]);
+    expect(future.snapshot().plans).toEqual([
+      expect.objectContaining({ id: plan.id, revision: 1, title: 'Durable proposal' }),
+    ]);
+    expect(future.getPlan(plan.id).body).toContain('future sessions');
+  });
+
+  it('deduplicates a resumed harness session after its process identity changes', () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const firstProcess = Coordinator.open({
+      cwd: repository.root,
+      agent: 'opencode-100',
+      harness: 'opencode',
+    });
+    const resumedProcess = Coordinator.open({
+      cwd: repository.root,
+      agent: 'opencode-200',
+      harness: 'opencode',
+    });
+    coordinators.push(firstProcess, resumedProcess);
+    const first = firstProcess.publishPlan({
+      body: '# Stable session\n\nResume without duplicating this proposal.',
+      sourceSessionId: 'session-stable',
+      sourceEventId: 'message-stable',
+    });
+
+    expect(
+      resumedProcess.publishPlan({
+        body: first.body,
+        sourceSessionId: 'session-stable',
+        sourceEventId: 'message-stable',
+      }),
+    ).toEqual(first);
+    expect(resumedProcess.listPlans()).toHaveLength(1);
+
+    const revised = resumedProcess.publishPlan({
+      body: '# Stable session\n\nPublish one revision after resuming.',
+      sourceSessionId: 'session-stable',
+      sourceEventId: 'message-revised',
+    });
+    expect(revised).toMatchObject({ id: first.id, author: 'opencode-200', revision: 2 });
+  });
+
+  it('keeps plan pagination stable when an earlier plan is revised', () => {
+    let now = 1_000;
+    const { open } = setup(() => now);
+    const author = open('author');
+    const first = author.publishPlan({
+      body: '# First plan',
+      sourceSessionId: 'session-first',
+      sourceEventId: 'event-first',
+    });
+    now = 2_000;
+    const second = author.publishPlan({
+      body: '# Second plan',
+      sourceSessionId: 'session-second',
+      sourceEventId: 'event-second',
+    });
+    expect(author.listPlans({ limit: 1 })).toEqual([expect.objectContaining({ id: second.id })]);
+
+    now = 3_000;
+    author.publishPlan({
+      body: '# First plan\n\nRevised after the first page was read.',
+      sourceSessionId: 'session-first',
+      sourceEventId: 'event-first-revised',
+    });
+
+    expect(author.listPlans({ after: second.id, limit: 1 })).toEqual([
+      expect.objectContaining({ id: first.id, revision: 2 }),
+    ]);
+  });
+
   it('reserves each unread message for only one live follower without acknowledging it', () => {
     const { open } = setup();
     const sender = open('sender');
@@ -542,7 +683,7 @@ describe('Coordinator', () => {
     });
     expect(
       verification.prepare('SELECT MAX(version) AS version FROM schema_migrations').get(),
-    ).toEqual({ version: 4 });
+    ).toEqual({ version: 5 });
     verification.close();
   });
 

@@ -79,6 +79,35 @@ export interface Message {
   readAt: number | null;
 }
 
+export interface Plan {
+  id: string;
+  author: string;
+  taskId: string | null;
+  sourceHarness: Harness;
+  sourceSessionId: string;
+  revision: number;
+  title: string;
+  body: string;
+  contentHash: string;
+  sourceEventId: string;
+  createdAt: number;
+  updatedAt: number;
+  revisionCreatedAt: number;
+}
+
+export interface PlanSummary {
+  id: string;
+  author: string;
+  taskId: string | null;
+  sourceHarness: Harness;
+  sourceSessionId: string;
+  revision: number;
+  title: string;
+  contentHash: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface Handoff {
   id: string;
   taskId: string;
@@ -156,6 +185,7 @@ export interface CoordinationSnapshot {
   sessions: Session[];
   agents: Agent[];
   tasks: Task[];
+  plans: PlanSummary[];
   claims: PathClaim[];
   unreadMessages: number;
   pendingHandoffs: number;

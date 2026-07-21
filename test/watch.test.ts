@@ -75,6 +75,20 @@ describe('event watch', () => {
     );
   });
 
+  it('formats proposed plan revisions without printing their bodies', () => {
+    const formatted = formatEvent(
+      event(8, {
+        kind: 'plan.revised',
+        entityType: 'plan',
+        entityId: 'plan-1',
+        payload: { revision: 2, title: 'Validation plan' },
+      }),
+    );
+
+    expect(formatted).toContain('plan.revised');
+    expect(formatted).toContain('revision 2: Validation plan');
+  });
+
   it('neutralizes terminal control characters in human-readable output', () => {
     const formatted = formatEvent(
       event(1, {

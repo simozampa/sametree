@@ -28,6 +28,8 @@ import type {
   Harness,
   Message,
   PathClaim,
+  Plan,
+  PlanSummary,
   PolicyAcknowledgement,
   PolicyDocument,
   Session,
@@ -45,6 +47,7 @@ import { assertWorkspaceBindingReady } from './workspace-service.js';
 
 type Row = Record<string, unknown>;
 const MAX_HANDOFF_CONTEXT_BYTES = 100_000;
+const MAX_PLAN_BODY_CHARACTERS = 48_000;
 
 export interface CoordinatorOptions {
   agent: string;
@@ -111,6 +114,21 @@ export interface AcquireClaimInput {
   member?: string;
 }
 
+export interface PublishPlanInput {
+  body: string;
+  sourceSessionId: string;
+  sourceEventId: string;
+  title?: string;
+  taskId?: string;
+}
+
+export interface ListPlansOptions {
+  after?: string;
+  author?: string;
+  limit?: number;
+  taskId?: string;
+}
+
 function createId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
 }
@@ -124,6 +142,14 @@ function requireText(value: string, field: string, maximum: number): string {
     );
   }
   return normalized;
+}
+
+function planTitle(body: string): string {
+  const firstLine = body
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .find(Boolean);
+  return (firstLine?.replace(/^#{1,6}\s+/u, '') || 'Proposed plan').slice(0, 200);
 }
 
 function validateAgentName(name: string): string {
@@ -235,6 +261,34 @@ function mapMessage(row: Row): Message {
   };
 }
 
+function mapPlan(row: Row): Plan {
+  return {
+    id: stringValue(row, 'id'),
+    author: stringValue(row, 'author'),
+    taskId: nullableString(row, 'task_id'),
+    sourceHarness: stringValue(row, 'source_harness') as Harness,
+    sourceSessionId: stringValue(row, 'source_session_id'),
+    revision: numberValue(row, 'revision'),
+    title: stringValue(row, 'title'),
+    body: stringValue(row, 'body'),
+    contentHash: stringValue(row, 'content_hash'),
+    sourceEventId: stringValue(row, 'source_event_id'),
+    createdAt: numberValue(row, 'created_at'),
+    updatedAt: numberValue(row, 'updated_at'),
+    revisionCreatedAt: numberValue(row, 'revision_created_at'),
+  };
+}
+
+function planSummary(plan: Plan): PlanSummary {
+  const {
+    body: _body,
+    revisionCreatedAt: _revisionCreatedAt,
+    sourceEventId: _sourceEventId,
+    ...summary
+  } = plan;
+  return summary;
+}
+
 function mapHandoff(row: Row, now: number): Handoff {
   const storedStatus = stringValue(row, 'status') as Handoff['status'];
   return {
@@ -259,6 +313,7 @@ export class Coordinator {
   readonly repository: RepositoryContext;
   readonly config: SameTreeConfig;
   readonly agentName: string;
+  readonly harness: Harness;
   readonly sessionId: string;
   readonly workspace: WorkspaceContext | null;
   readonly worktreeId: string;
@@ -272,6 +327,7 @@ export class Coordinator {
     this.repository = resolveRepository(options.cwd);
     this.config = loadConfig(this.repository.root);
     this.agentName = validateAgentName(options.agent);
+    this.harness = options.harness ?? 'other';
     this.#clock = options.clock ?? Date.now;
     this.#recordSessionLifecycleEvents = options.recordSessionLifecycleEvents ?? true;
     const releaseWorkspaceLock = acquireWorkspaceOperationLock(this.repository, 2_500);
@@ -331,13 +387,7 @@ export class Coordinator {
                  role = excluded.role,
                  last_seen_at = excluded.last_seen_at`,
             )
-            .run(
-              this.agentName,
-              options.harness ?? 'other',
-              options.role ?? 'implementer',
-              now,
-              now,
-            );
+            .run(this.agentName, this.harness, options.role ?? 'implementer', now, now);
           this.#database
             .prepare(
               `INSERT INTO sessions
@@ -359,7 +409,7 @@ export class Coordinator {
           this.#refreshWorktreeHead(now);
           if (this.#recordSessionLifecycleEvents) {
             this.#recordEvent('session.started', 'session', this.sessionId, {
-              harness: options.harness ?? 'other',
+              harness: this.harness,
               role: options.role ?? 'implementer',
             });
           }
@@ -651,6 +701,30 @@ export class Coordinator {
       | undefined;
     if (!row) throw new SameTreeError('NOT_FOUND', `Task '${taskId}' does not exist.`);
     return mapTask(row, this.#dependencies(taskId), this.#taskMembers(taskId));
+  }
+
+  #plan(planId: string, revision?: number): Plan {
+    const row = this.#database
+      .prepare(
+        `SELECT plan.*, revision.revision, revision.title, revision.body,
+                revision.content_hash, revision.source_event_id,
+                revision.created_at AS revision_created_at
+         FROM plans plan
+         JOIN plan_revisions revision
+           ON revision.plan_id = plan.id
+          AND revision.revision = COALESCE(?, plan.current_revision)
+         WHERE plan.id = ?`,
+      )
+      .get(revision ?? null, planId) as Row | undefined;
+    if (!row) {
+      throw new SameTreeError(
+        'NOT_FOUND',
+        revision === undefined
+          ? `Plan '${planId}' does not exist.`
+          : `Plan '${planId}' has no revision ${revision}.`,
+      );
+    }
+    return mapPlan(row);
   }
 
   #unfinishedDependencies(taskId: string): string[] {
@@ -978,6 +1052,189 @@ export class Coordinator {
       const id = stringValue(row, 'id');
       return mapTask(row, this.#dependencies(id), this.#taskMembers(id));
     });
+  }
+
+  publishPlan(input: PublishPlanInput): Plan {
+    const body = requireText(input.body, 'Plan body', MAX_PLAN_BODY_CHARACTERS);
+    const title = input.title ? requireText(input.title, 'Plan title', 200) : planTitle(body);
+    const sourceSessionId = requireText(input.sourceSessionId, 'Source session ID', 200);
+    const sourceEventId = requireText(input.sourceEventId, 'Source event ID', 200);
+    const contentHash = createHash('sha256').update(body).digest('hex');
+    const now = this.#clock();
+
+    return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
+      if (input.taskId) this.#task(input.taskId);
+      const stored = this.#database
+        .prepare(
+          `SELECT * FROM plans
+           WHERE source_harness = ? AND source_session_id = ?`,
+        )
+        .get(this.harness, sourceSessionId) as Row | undefined;
+      const planId = stored ? stringValue(stored, 'id') : createId('plan');
+      if (stored && input.taskId && nullableString(stored, 'task_id') !== input.taskId) {
+        throw new SameTreeError(
+          'PLAN_CONFLICT',
+          `Plan '${planId}' is already associated with another task.`,
+          { taskId: nullableString(stored, 'task_id') },
+        );
+      }
+
+      if (stored) {
+        const existing = this.#database
+          .prepare(
+            `SELECT revision, title, body, content_hash FROM plan_revisions
+             WHERE plan_id = ? AND source_event_id = ?`,
+          )
+          .get(planId, sourceEventId) as Row | undefined;
+        if (existing) {
+          if (
+            stringValue(existing, 'title') !== title ||
+            stringValue(existing, 'body') !== body ||
+            stringValue(existing, 'content_hash') !== contentHash
+          ) {
+            throw new SameTreeError(
+              'PLAN_CONFLICT',
+              `Source event '${sourceEventId}' was already published with different content.`,
+              { planId, revision: numberValue(existing, 'revision') },
+            );
+          }
+          return this.#plan(planId, numberValue(existing, 'revision'));
+        }
+      }
+
+      const revision = stored ? numberValue(stored, 'current_revision') + 1 : 1;
+      if (!stored) {
+        this.#database
+          .prepare(
+            `INSERT INTO plans
+              (id, author, task_id, source_harness, source_session_id,
+               current_revision, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            planId,
+            this.agentName,
+            input.taskId ?? null,
+            this.harness,
+            sourceSessionId,
+            revision,
+            now,
+            now,
+          );
+      }
+      this.#database
+        .prepare(
+          `INSERT INTO plan_revisions
+            (plan_id, revision, title, body, content_hash, source_event_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(planId, revision, title, body, contentHash, sourceEventId, now);
+      if (stored) {
+        this.#database
+          .prepare('UPDATE plans SET author = ?, current_revision = ?, updated_at = ? WHERE id = ?')
+          .run(this.agentName, revision, now, planId);
+      }
+
+      const peers = this.#database
+        .prepare(
+          `SELECT DISTINCT agent_name FROM sessions
+           WHERE agent_name <> ? AND status = 'active' AND expires_at > ?
+           ORDER BY agent_name`,
+        )
+        .all(this.agentName, now) as Row[];
+      const threadId = `plan:${planId}`;
+      const subject = `Plan from ${this.agentName}: ${title}`.slice(0, 200);
+      const notificationBody = `${this.agentName} published proposed plan ${planId} revision ${revision}. This is shared context, not authorization to change scope.\n\n${body}`;
+      for (const peer of peers) {
+        const recipient = stringValue(peer, 'agent_name');
+        const messageId = createId('message');
+        this.#database
+          .prepare(
+            `INSERT INTO messages
+              (id, sender, recipient, subject, body, thread_id, task_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            messageId,
+            this.agentName,
+            recipient,
+            subject,
+            notificationBody,
+            threadId,
+            input.taskId ?? nullableString(stored ?? {}, 'task_id'),
+            now,
+          );
+        this.#recordEvent('message.sent', 'message', messageId, {
+          planId,
+          planRevision: revision,
+          recipient,
+          taskId: input.taskId ?? nullableString(stored ?? {}, 'task_id'),
+        });
+      }
+      this.#recordEvent(stored ? 'plan.revised' : 'plan.published', 'plan', planId, {
+        contentHash,
+        notifiedAgents: peers.map((peer) => stringValue(peer, 'agent_name')),
+        revision,
+        taskId: input.taskId ?? nullableString(stored ?? {}, 'task_id'),
+        title,
+      });
+      return this.#plan(planId, revision);
+    });
+  }
+
+  getPlan(planId: string, revision?: number): Plan {
+    if (revision !== undefined && (!Number.isSafeInteger(revision) || revision < 1)) {
+      throw new SameTreeError('INVALID_INPUT', 'Plan revision must be a positive integer.');
+    }
+    return this.#plan(planId, revision);
+  }
+
+  listPlans(options: ListPlansOptions = {}): PlanSummary[] {
+    const limit = options.limit ?? 25;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new SameTreeError('INVALID_INPUT', 'Plan list limit must be between 1 and 100.');
+    }
+    const conditions: string[] = [];
+    const parameters: Array<number | string> = [];
+    if (options.author) {
+      conditions.push('plan.author = ?');
+      parameters.push(validateAgentName(options.author));
+    }
+    if (options.taskId) {
+      conditions.push('plan.task_id = ?');
+      parameters.push(options.taskId);
+    }
+    if (options.after) {
+      const cursor = this.#database
+        .prepare('SELECT created_at, id FROM plans WHERE id = ?')
+        .get(options.after) as Row | undefined;
+      if (!cursor) {
+        throw new SameTreeError('NOT_FOUND', `Plan cursor '${options.after}' does not exist.`);
+      }
+      conditions.push('(plan.created_at < ? OR (plan.created_at = ? AND plan.id < ?))');
+      parameters.push(
+        numberValue(cursor, 'created_at'),
+        numberValue(cursor, 'created_at'),
+        stringValue(cursor, 'id'),
+      );
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    parameters.push(limit);
+    const rows = this.#database
+      .prepare(
+        `SELECT plan.*, revision.revision, revision.title, revision.body,
+                revision.content_hash, revision.source_event_id,
+                revision.created_at AS revision_created_at
+         FROM plans plan
+         JOIN plan_revisions revision
+           ON revision.plan_id = plan.id AND revision.revision = plan.current_revision
+         ${where}
+          ORDER BY plan.created_at DESC, plan.id DESC
+         LIMIT ?`,
+      )
+      .all(...parameters) as Row[];
+    return rows.map((row) => planSummary(mapPlan(row)));
   }
 
   claimTask(taskId: string, authorization: UserAuthorizedTaskInput = {}): Task {
@@ -2008,6 +2265,7 @@ export class Coordinator {
           const id = stringValue(row, 'id');
           return mapTask(row, this.#dependencies(id), this.#taskMembers(id));
         }),
+        plans: this.listPlans(),
         claims,
         unreadMessages: numberValue(unread, 'count'),
         pendingHandoffs: numberValue(handoffs, 'count'),

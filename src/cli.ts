@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { Command, Option } from 'commander';
 
@@ -92,24 +93,37 @@ function claimReceipts(claims: PathClaim[]) {
 function openCoordinator(
   command: Command,
   coordinatorOptions: { recordSessionLifecycleEvents?: boolean } = {},
+  identity: { agent?: string; harness?: Harness; role?: string } = {},
 ): Coordinator {
   const options = command.optsWithGlobals<GlobalOptions>();
   return Coordinator.open({
-    agent: options.agent ?? process.env.SAMETREE_AGENT ?? '',
+    agent: identity.agent ?? options.agent ?? process.env.SAMETREE_AGENT ?? '',
     cwd: options.cwd,
-    harness: options.harness,
-    role: options.role,
+    harness: identity.harness ?? options.harness,
+    role: identity.role ?? options.role,
     ...(options.workspaceRegistry ? { workspaceRegistryRoot: options.workspaceRegistry } : {}),
     ...coordinatorOptions,
   });
 }
 
-function runWithCoordinator<T>(command: Command, operation: (coordinator: Coordinator) => T): void {
-  const coordinator = openCoordinator(command, { recordSessionLifecycleEvents: false });
+function runWithCoordinator<T>(
+  command: Command,
+  operation: (coordinator: Coordinator) => T,
+  options: {
+    identity?: { agent?: string; harness?: Harness; role?: string };
+    printResult?: boolean;
+  } = {},
+): void {
+  const coordinator = openCoordinator(
+    command,
+    { recordSessionLifecycleEvents: false },
+    options.identity,
+  );
   let operationFailed = false;
   let operationError: unknown;
   try {
-    print(operation(coordinator));
+    const result = operation(coordinator);
+    if (options.printResult !== false) print(result);
   } catch (error) {
     operationFailed = true;
     operationError = error;
@@ -558,6 +572,73 @@ task
     },
   );
 
+const plan = program.command('plan').description('Publish and inspect shared proposed plans.');
+
+plan
+  .command('publish')
+  .requiredOption('--source-session <id>', 'harness session that produced the plan')
+  .requiredOption('--source-event <id>', 'idempotent harness event for this revision')
+  .option('--title <text>', 'plan title; defaults to the first Markdown heading')
+  .option('--task <id>', 'related SameTree task')
+  .option('--body <text>', 'plan Markdown')
+  .option('--body-stdin', 'read plan Markdown from stdin')
+  .action(
+    (
+      options: {
+        body?: string;
+        bodyStdin?: boolean;
+        sourceEvent: string;
+        sourceSession: string;
+        task?: string;
+        title?: string;
+      },
+      command: Command,
+    ) => {
+      if (Boolean(options.body) === Boolean(options.bodyStdin)) {
+        throw new SameTreeError('INVALID_INPUT', 'Provide exactly one of --body or --body-stdin.');
+      }
+      const body = options.bodyStdin ? readFileSync(0, 'utf8') : (options.body ?? '');
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.publishPlan({
+          body,
+          sourceSessionId: options.sourceSession,
+          sourceEventId: options.sourceEvent,
+          ...(options.title ? { title: options.title } : {}),
+          ...(options.task ? { taskId: options.task } : {}),
+        }),
+      );
+    },
+  );
+
+plan
+  .command('show <plan-id>')
+  .option('--revision <number>', 'specific immutable revision', integer)
+  .action((planId: string, options: { revision?: number }, command: Command) => {
+    runWithCoordinator(command, (coordinator) => coordinator.getPlan(planId, options.revision));
+  });
+
+plan
+  .command('list')
+  .option('--author <agent>', 'filter by plan author')
+  .option('--task <id>', 'filter by related task')
+  .option('--after <plan-id>', 'continue after this plan cursor')
+  .option('--limit <number>', 'maximum plans', integer, 25)
+  .action(
+    (
+      options: { after?: string; author?: string; limit: number; task?: string },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.listPlans({
+          ...(options.after ? { after: options.after } : {}),
+          ...(options.author ? { author: options.author } : {}),
+          ...(options.task ? { taskId: options.task } : {}),
+          limit: options.limit,
+        }),
+      );
+    },
+  );
+
 const claim = program.command('claim').description('Coordinate cooperative path leases.');
 
 claim
@@ -840,6 +921,43 @@ hook
     const globals = command.optsWithGlobals<GlobalOptions>();
     print(checkCommitMessage(messagePath, globals.cwd));
   });
+hook.command('claude-plan').action((_options: unknown, command: Command) => {
+  const input = objectJson(readFileSync(0, 'utf8'));
+  const toolInput = input.tool_input;
+  const sessionId = input.session_id;
+  const sourceEventId = input.tool_use_id;
+  if (
+    input.hook_event_name !== 'PreToolUse' ||
+    input.tool_name !== 'ExitPlanMode' ||
+    typeof toolInput !== 'object' ||
+    toolInput === null ||
+    Array.isArray(toolInput) ||
+    typeof Reflect.get(toolInput, 'plan') !== 'string' ||
+    typeof sessionId !== 'string' ||
+    typeof sourceEventId !== 'string'
+  ) {
+    throw new SameTreeError('INVALID_INPUT', 'Expected a Claude ExitPlanMode hook payload.');
+  }
+  const suffix = sessionId.replace(/[^A-Za-z0-9._-]/gu, '-').replace(/^-+|-+$/gu, '');
+  const agent = process.env.SAMETREE_AGENT || `claude-code-${suffix || process.pid}`.slice(0, 80);
+  runWithCoordinator(
+    command,
+    (coordinator) =>
+      coordinator.publishPlan({
+        body: Reflect.get(toolInput, 'plan'),
+        sourceSessionId: sessionId,
+        sourceEventId,
+      }),
+    {
+      identity: {
+        agent,
+        harness: 'claude-code',
+        role: process.env.SAMETREE_ROLE ?? 'implementer',
+      },
+      printResult: false,
+    },
+  );
+});
 
 program.exitOverride();
 

@@ -89,6 +89,9 @@ function payloadSummary(event: CoordinationEvent): string {
       return String(payload.taskId ?? '');
     case 'message.sent':
       return payload.recipient ? `-> ${String(payload.recipient)}` : '-> broadcast';
+    case 'plan.published':
+    case 'plan.revised':
+      return `revision ${String(payload.revision ?? '')}: ${String(payload.title ?? '')}`;
     case 'task.created':
       return String(payload.priority ?? '');
     case 'task.updated':

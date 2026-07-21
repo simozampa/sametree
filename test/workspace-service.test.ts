@@ -123,6 +123,11 @@ describe('workspace operations', () => {
       title: 'Import my member tag',
       members: [path.basename(source.root)],
     });
+    const plan = standalone.publishPlan({
+      body: '# Imported plan\n\nPreserve this proposal.',
+      sourceSessionId: 'source-session',
+      sourceEventId: 'source-event',
+    });
     standalone.close();
     const sourceDatabasePath = resolveRepository(source.root).databasePath;
     const sourceDatabase = new Database(sourceDatabasePath, { readonly: true });
@@ -141,6 +146,9 @@ describe('workspace operations', () => {
     const workspaceCoordinator = open(source.root, 'observer', registry);
     expect(workspaceCoordinator.listTasks()).toContainEqual(
       expect.objectContaining({ id: task.id, members: [] }),
+    );
+    expect(workspaceCoordinator.listPlans()).toContainEqual(
+      expect.objectContaining({ id: plan.id, revision: 1, title: 'Imported plan' }),
     );
     expect(workspaceCoordinator.listTasks()).toContainEqual(
       expect.objectContaining({ id: taggedTask.id, members: ['frontend'] }),
@@ -167,6 +175,58 @@ describe('workspace operations', () => {
         { registryRoot: registry, now: 2_000 },
       ),
     ).toMatchObject({ imported: false, member: { id: joined.member.id } });
+  });
+
+  it('rejects imported plans with the same harness session identity atomically', () => {
+    const frontend = repository();
+    const backend = repository();
+    const registry = registryRoot();
+    const frontendAgent = open(frontend.root, 'frontend-author');
+    frontendAgent.publishPlan({
+      body: '# Frontend plan',
+      sourceSessionId: 'shared-harness-session',
+      sourceEventId: 'frontend-event',
+    });
+    frontendAgent.close();
+    const backendAgent = open(backend.root, 'backend-author');
+    backendAgent.publishPlan({
+      body: '# Backend plan',
+      sourceSessionId: 'shared-harness-session',
+      sourceEventId: 'backend-event',
+    });
+    backendAgent.close();
+    const workspace = createWorkspace(
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'import-current' },
+      { registryRoot: registry },
+    );
+
+    expect(() =>
+      addWorkspaceMember(
+        backend.root,
+        {
+          workspaceId: workspace.workspace.id,
+          memberName: 'backend',
+          mode: 'import-current',
+        },
+        { registryRoot: registry },
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: 'WORKSPACE_ERROR',
+        message: expect.stringContaining(
+          "source identity 'other:shared-harness-session' already exists",
+        ),
+      }),
+    );
+    expect(
+      resolveWorkspaceBinding(resolveRepository(backend.root), { registryRoot: registry }),
+    ).toBeNull();
+
+    const observer = open(frontend.root, 'observer', registry);
+    expect(observer.listPlans()).toEqual([
+      expect.objectContaining({ author: 'frontend-author', title: 'Frontend plan' }),
+    ]);
   });
 
   it('recovers a member inserted before its source transition was recorded', () => {
@@ -355,6 +415,11 @@ describe('workspace operations', () => {
       subject: 'Workspace message',
       body: 'Visible across members.',
     });
+    const plan = frontendAgent.publishPlan({
+      body: '# Shared plan\n\nCoordinate this proposal across members.',
+      sourceSessionId: 'frontend-session',
+      sourceEventId: 'frontend-plan',
+    });
 
     expect(serverAgent.listTasks().map((item) => item.id)).toContain(task.id);
     expect(serverAgent.listTasks({ member: 'frontend' })).toEqual([
@@ -364,6 +429,10 @@ describe('workspace operations', () => {
       expect.arrayContaining([task.id, globalTask.id]),
     );
     expect(serverAgent.inbox().map((message) => message.subject)).toContain('Workspace message');
+    expect(serverAgent.listPlans()).toContainEqual(
+      expect.objectContaining({ id: plan.id, author: 'frontend-agent' }),
+    );
+    expect(serverAgent.inbox().map((message) => message.threadId)).toContain(`plan:${plan.id}`);
     frontendAgent.claimTask(task.id);
     const handoff = frontendAgent.offerHandoff({
       taskId: task.id,

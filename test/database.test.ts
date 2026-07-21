@@ -40,7 +40,7 @@ describe('database workspace migration', () => {
     const database = openDatabase(context, { now: 100 });
 
     expect(database.prepare('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual(
-      { version: 4 },
+      { version: 5 },
     );
     expect(database.prepare('SELECT name, implicit FROM workspace_metadata').get()).toEqual({
       name: path.basename(repository.root),
@@ -232,6 +232,7 @@ describe('database workspace migration', () => {
     });
     expect(migrated.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
     expect(migrated.pragma('foreign_key_check')).toEqual([]);
+    expect(migrated.prepare('SELECT COUNT(*) AS count FROM plans').get()).toEqual({ count: 0 });
     migrated.close();
   });
 

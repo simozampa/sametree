@@ -121,6 +121,39 @@ const TASK_WORKTREE_SCHEMA = `
     ON task_worktrees(worktree_id, task_id);
 `;
 
+const PLAN_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS plans (
+    id TEXT PRIMARY KEY,
+    author TEXT NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    source_harness TEXT NOT NULL CHECK(source_harness IN ('claude-code', 'opencode', 'other')),
+    source_session_id TEXT NOT NULL CHECK(length(source_session_id) BETWEEN 1 AND 200),
+    current_revision INTEGER NOT NULL CHECK(current_revision > 0),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(source_harness, source_session_id),
+    FOREIGN KEY (id, current_revision)
+      REFERENCES plan_revisions(plan_id, revision) DEFERRABLE INITIALLY DEFERRED,
+    CHECK(updated_at >= created_at)
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS plan_revisions (
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 200),
+    body TEXT NOT NULL CHECK(length(body) BETWEEN 1 AND 48000),
+    content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+    source_event_id TEXT NOT NULL CHECK(length(source_event_id) BETWEEN 1 AND 200),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (plan_id, revision),
+    UNIQUE (plan_id, source_event_id)
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS plans_created_idx ON plans(created_at, id);
+  CREATE INDEX IF NOT EXISTS plans_author_idx ON plans(author, created_at, id);
+  CREATE INDEX IF NOT EXISTS plans_task_idx ON plans(task_id, created_at, id);
+`;
+
 const INITIAL_SCHEMA = `
   CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -619,7 +652,7 @@ function migrate(
       .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
       .get() as { version: number };
 
-    if (current.version > 4) {
+    if (current.version > 5) {
       throw new SameTreeError(
         'DATABASE_ERROR',
         `This database uses unsupported schema version ${current.version}.`,
@@ -657,6 +690,14 @@ function migrate(
         .run(now);
     } else {
       migrateWorkspaceSchema(database, repository, member, now);
+    }
+    if (current.version < 5) {
+      database.exec(PLAN_SCHEMA);
+      database
+        .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)')
+        .run(now);
+    } else {
+      database.exec(PLAN_SCHEMA);
     }
     database.exec('COMMIT');
   } catch (error) {
