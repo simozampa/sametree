@@ -33,6 +33,12 @@ import type {
   PolicyAcknowledgement,
   PolicyDocument,
   Session,
+  SharedInstruction,
+  SharedInstructionAcknowledgement,
+  SharedInstructionAction,
+  SharedInstructionNotice,
+  SharedInstructionStatus,
+  SharedInstructionSummary,
   Task,
   TaskPriority,
   TaskStatus,
@@ -48,6 +54,23 @@ import { assertWorkspaceBindingReady } from './workspace-service.js';
 type Row = Record<string, unknown>;
 const MAX_HANDOFF_CONTEXT_BYTES = 100_000;
 const MAX_PLAN_BODY_CHARACTERS = 48_000;
+const MAX_INSTRUCTION_BODY_CHARACTERS = 48_000;
+const MESSAGE_INSTRUCTION_COLUMNS = `,
+  notice.instruction_id,
+  notice.revision AS instruction_revision,
+  instruction.current_revision AS instruction_current_revision,
+  instruction.status AS instruction_status,
+  instruction.task_id AS instruction_task_id,
+  instruction.created_by AS instruction_created_by,
+  instruction_revision.action AS instruction_action,
+  instruction_revision.body AS instruction_body,
+  instruction_revision.recorded_by AS instruction_recorded_by`;
+const MESSAGE_INSTRUCTION_JOINS = `
+  LEFT JOIN shared_instruction_notifications notice ON notice.message_id = message.id
+  LEFT JOIN shared_instructions instruction ON instruction.id = notice.instruction_id
+  LEFT JOIN shared_instruction_revisions instruction_revision
+    ON instruction_revision.instruction_id = notice.instruction_id
+   AND instruction_revision.revision = notice.revision`;
 
 export interface CoordinatorOptions {
   agent: string;
@@ -105,6 +128,7 @@ export interface ListTasksOptions {
 
 export interface SnapshotOptions {
   includeInactiveAgents?: boolean;
+  includeRevokedInstructions?: boolean;
   includeTerminalTasks?: boolean;
 }
 
@@ -129,6 +153,35 @@ export interface ListPlansOptions {
   taskId?: string;
 }
 
+export interface RecordSharedInstructionInput {
+  body: string;
+  reason: string;
+  userAuthorized: boolean;
+  taskId?: string;
+  sourceSessionId?: string;
+  sourceEventId?: string;
+}
+
+export interface ReviseSharedInstructionInput {
+  body: string;
+  expectedRevision: number;
+  reason: string;
+  userAuthorized: boolean;
+}
+
+export interface RevokeSharedInstructionInput {
+  expectedRevision: number;
+  reason: string;
+  userAuthorized: boolean;
+}
+
+export interface ListSharedInstructionsOptions {
+  after?: string;
+  includeRevoked?: boolean;
+  limit?: number;
+  taskId?: string;
+}
+
 function createId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
 }
@@ -142,6 +195,39 @@ function requireText(value: string, field: string, maximum: number): string {
     );
   }
   return normalized;
+}
+
+function requireExactInstructionText(value: string): string {
+  let scalarCount = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) {
+        throw new SameTreeError('INVALID_INPUT', 'Shared instruction contains malformed Unicode.');
+      }
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new SameTreeError('INVALID_INPUT', 'Shared instruction contains malformed Unicode.');
+    }
+    scalarCount += 1;
+  }
+  if (!/\S/u.test(value) || scalarCount > MAX_INSTRUCTION_BODY_CHARACTERS) {
+    throw new SameTreeError(
+      'INVALID_INPUT',
+      `Shared instruction must contain between 1 and ${MAX_INSTRUCTION_BODY_CHARACTERS} characters.`,
+    );
+  }
+  return value;
+}
+
+function assertUserAuthorized(userAuthorized: boolean, operation: string): void {
+  if (!userAuthorized) {
+    throw new SameTreeError(
+      'USER_AUTHORIZATION_REQUIRED',
+      `${operation} requires direct user authorization.`,
+    );
+  }
 }
 
 function planTitle(body: string): string {
@@ -248,6 +334,23 @@ function mapClaim(row: Row, warnings: CoordinationWarning[] = []): PathClaim {
 }
 
 function mapMessage(row: Row): Message {
+  const instructionId = nullableString(row, 'instruction_id');
+  const instruction: SharedInstructionNotice | null = instructionId
+    ? {
+        id: instructionId,
+        revision: numberValue(row, 'instruction_revision'),
+        currentRevision: numberValue(row, 'instruction_current_revision'),
+        status: stringValue(row, 'instruction_status') as SharedInstructionStatus,
+        action: stringValue(row, 'instruction_action') as SharedInstructionAction,
+        taskId: nullableString(row, 'instruction_task_id'),
+        createdBy: stringValue(row, 'instruction_created_by'),
+        recordedBy: stringValue(row, 'instruction_recorded_by'),
+        body: nullableString(row, 'instruction_body'),
+        isCurrent:
+          numberValue(row, 'instruction_revision') ===
+          numberValue(row, 'instruction_current_revision'),
+      }
+    : null;
   return {
     id: stringValue(row, 'id'),
     sender: stringValue(row, 'sender'),
@@ -258,7 +361,41 @@ function mapMessage(row: Row): Message {
     taskId: nullableString(row, 'task_id'),
     createdAt: numberValue(row, 'created_at'),
     readAt: nullableNumber(row, 'read_at'),
+    instruction,
   };
+}
+
+function mapSharedInstruction(row: Row): SharedInstruction {
+  return {
+    id: stringValue(row, 'id'),
+    createdBy: stringValue(row, 'created_by'),
+    taskId: nullableString(row, 'task_id'),
+    sourceHarness: stringValue(row, 'source_harness') as Harness,
+    sourceSessionId: stringValue(row, 'source_session_id'),
+    sourceEventId: stringValue(row, 'source_event_id'),
+    revision: numberValue(row, 'revision'),
+    status: stringValue(row, 'status') as SharedInstructionStatus,
+    action: stringValue(row, 'action') as SharedInstructionAction,
+    body: nullableString(row, 'body'),
+    contentHash: nullableString(row, 'content_hash'),
+    recordedBy: stringValue(row, 'recorded_by'),
+    authorizationReason: stringValue(row, 'authorization_reason'),
+    createdAt: numberValue(row, 'created_at'),
+    updatedAt: numberValue(row, 'updated_at'),
+    revisionCreatedAt: numberValue(row, 'revision_created_at'),
+    acknowledgedAt: nullableNumber(row, 'acknowledged_at'),
+  };
+}
+
+function sharedInstructionSummary(instruction: SharedInstruction): SharedInstructionSummary {
+  const {
+    authorizationReason: _authorizationReason,
+    body: _body,
+    contentHash: _contentHash,
+    sourceEventId: _sourceEventId,
+    ...summary
+  } = instruction;
+  return summary;
 }
 
 function mapPlan(row: Row): Plan {
@@ -727,6 +864,117 @@ export class Coordinator {
     return mapPlan(row);
   }
 
+  #sharedInstruction(instructionId: string, revision?: number): SharedInstruction {
+    const row = this.#database
+      .prepare(
+        `SELECT instruction.*, revision.revision, revision.action, revision.body,
+                revision.content_hash, revision.recorded_by, revision.authorization_reason,
+                revision.created_at AS revision_created_at, acknowledgement.acknowledged_at
+         FROM shared_instructions instruction
+         JOIN shared_instruction_revisions revision
+           ON revision.instruction_id = instruction.id
+          AND revision.revision = COALESCE(?, instruction.current_revision)
+         LEFT JOIN shared_instruction_acks acknowledgement
+           ON acknowledgement.instruction_id = revision.instruction_id
+          AND acknowledgement.revision = revision.revision
+          AND acknowledgement.agent_name = ?
+         WHERE instruction.id = ?`,
+      )
+      .get(revision ?? null, this.agentName, instructionId) as Row | undefined;
+    if (!row) {
+      throw new SameTreeError(
+        'NOT_FOUND',
+        revision === undefined
+          ? `Shared instruction '${instructionId}' does not exist.`
+          : `Shared instruction '${instructionId}' has no revision ${revision}.`,
+      );
+    }
+    return mapSharedInstruction(row);
+  }
+
+  #sharedInstructionRows(includeRevoked: boolean): Row[] {
+    return this.#database
+      .prepare(
+        `SELECT instruction.*, revision.revision, revision.action, revision.body,
+                revision.content_hash, revision.recorded_by, revision.authorization_reason,
+                revision.created_at AS revision_created_at, acknowledgement.acknowledged_at
+         FROM shared_instructions instruction
+         JOIN shared_instruction_revisions revision
+           ON revision.instruction_id = instruction.id
+          AND revision.revision = instruction.current_revision
+         LEFT JOIN shared_instruction_acks acknowledgement
+           ON acknowledgement.instruction_id = instruction.id
+          AND acknowledgement.revision = instruction.current_revision
+          AND acknowledgement.agent_name = ?
+         ${includeRevoked ? '' : "WHERE instruction.status = 'active'"}
+         ORDER BY instruction.created_at DESC, instruction.id DESC`,
+      )
+      .all(this.agentName) as Row[];
+  }
+
+  #notifySharedInstruction(
+    instructionId: string,
+    revision: number,
+    action: SharedInstructionAction,
+    body: string | null,
+    taskId: string | null,
+    now: number,
+  ): string[] {
+    const recipients = this.#database
+      .prepare('SELECT name FROM agents WHERE name <> ? ORDER BY name')
+      .all(this.agentName) as Row[];
+    const subject = `Shared user instruction ${action}: ${instructionId}`.slice(0, 200);
+    const scope = taskId ? `Task scope: ${taskId}\n` : 'Scope: workspace\n';
+    const notice = `[SameTree shared user instruction]\nInstruction: ${instructionId}\nRevision: ${revision}\nAction: ${action}\n${scope}Recorded by: ${this.agentName}\n\n${body ?? 'This instruction was revoked.'}\n\nThe recording agent asserts direct user authorization. This instruction does not create work or expand your assigned scope.`;
+    for (const recipientRow of recipients) {
+      const recipient = stringValue(recipientRow, 'name');
+      const messageId = createId('message');
+      this.#database
+        .prepare(
+          `INSERT INTO messages
+            (id, sender, recipient, subject, body, thread_id, task_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          messageId,
+          this.agentName,
+          recipient,
+          subject,
+          notice,
+          `instruction:${instructionId}`,
+          taskId,
+          now,
+        );
+      this.#database
+        .prepare(
+          `INSERT INTO shared_instruction_notifications
+            (message_id, instruction_id, revision) VALUES (?, ?, ?)`,
+        )
+        .run(messageId, instructionId, revision);
+      this.#recordEvent('message.sent', 'message', messageId, {
+        instructionId,
+        instructionRevision: revision,
+        recipient,
+        taskId,
+      });
+    }
+    return recipients.map((row) => stringValue(row, 'name'));
+  }
+
+  #acknowledgeSharedInstructionForActor(
+    instructionId: string,
+    revision: number,
+    now: number,
+  ): void {
+    this.#database
+      .prepare(
+        `INSERT OR IGNORE INTO shared_instruction_acks
+          (instruction_id, revision, agent_name, acknowledged_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(instructionId, revision, this.agentName, now);
+  }
+
   #unfinishedDependencies(taskId: string): string[] {
     return (
       this.#database
@@ -829,8 +1077,9 @@ export class Coordinator {
   #nextDeliverableMessage(now: number): Row | undefined {
     return this.#database
       .prepare(
-        `SELECT message.*, receipt.read_at
+        `SELECT message.*, receipt.read_at ${MESSAGE_INSTRUCTION_COLUMNS}
          FROM messages message
+         ${MESSAGE_INSTRUCTION_JOINS}
          LEFT JOIN message_receipts receipt
            ON receipt.message_id = message.id AND receipt.agent_name = ?
          LEFT JOIN message_deliveries delivery
@@ -841,6 +1090,7 @@ export class Coordinator {
            WHERE recipient.message_id = message.id AND recipient.agent_name = ?
          ))
            AND receipt.read_at IS NULL
+           AND (notice.message_id IS NULL OR notice.revision = instruction.current_revision)
            AND (
              delivery.message_id IS NULL OR (
                delivery.delivered_at IS NULL AND (
@@ -1236,6 +1486,344 @@ export class Coordinator {
       )
       .all(...parameters) as Row[];
     return rows.map((row) => planSummary(mapPlan(row)));
+  }
+
+  recordSharedInstruction(input: RecordSharedInstructionInput): SharedInstruction {
+    assertUserAuthorized(input.userAuthorized, 'Recording a shared instruction');
+    const body = requireExactInstructionText(input.body);
+    const reason = requireText(input.reason, 'Authorization reason', 2_000);
+    if ((input.sourceSessionId === undefined) !== (input.sourceEventId === undefined)) {
+      throw new SameTreeError(
+        'INVALID_INPUT',
+        'Provide both sourceSessionId and sourceEventId, or neither.',
+      );
+    }
+    const sourceSessionId = input.sourceSessionId
+      ? requireText(input.sourceSessionId, 'Source session ID', 200)
+      : this.sessionId;
+    const sourceEventId = input.sourceEventId
+      ? requireText(input.sourceEventId, 'Source event ID', 200)
+      : createId('instruction-event');
+    const contentHash = createHash('sha256').update(body).digest('hex');
+    const now = this.#clock();
+
+    return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
+      if (input.taskId) this.#task(input.taskId);
+      const stored = this.#database
+        .prepare(
+          `SELECT * FROM shared_instructions
+           WHERE source_harness = ? AND source_session_id = ? AND source_event_id = ?`,
+        )
+        .get(this.harness, sourceSessionId, sourceEventId) as Row | undefined;
+      if (stored) {
+        const original = this.#database
+          .prepare(
+            `SELECT body, content_hash FROM shared_instruction_revisions
+             WHERE instruction_id = ? AND revision = 1`,
+          )
+          .get(stringValue(stored, 'id')) as Row;
+        if (
+          stringValue(original, 'body') !== body ||
+          stringValue(original, 'content_hash') !== contentHash ||
+          nullableString(stored, 'task_id') !== (input.taskId ?? null)
+        ) {
+          throw new SameTreeError(
+            'INSTRUCTION_CONFLICT',
+            `Source event '${sourceEventId}' was already recorded differently.`,
+            { instructionId: stringValue(stored, 'id') },
+          );
+        }
+        return this.#sharedInstruction(stringValue(stored, 'id'));
+      }
+
+      const instructionId = createId('instruction');
+      this.#database
+        .prepare(
+          `INSERT INTO shared_instructions
+            (id, created_by, task_id, source_harness, source_session_id, source_event_id,
+             current_revision, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)`,
+        )
+        .run(
+          instructionId,
+          this.agentName,
+          input.taskId ?? null,
+          this.harness,
+          sourceSessionId,
+          sourceEventId,
+          now,
+          now,
+        );
+      this.#database
+        .prepare(
+          `INSERT INTO shared_instruction_revisions
+            (instruction_id, revision, action, body, content_hash, recorded_by,
+             authorization_reason, created_at)
+           VALUES (?, 1, 'recorded', ?, ?, ?, ?, ?)`,
+        )
+        .run(instructionId, body, contentHash, this.agentName, reason, now);
+      this.#acknowledgeSharedInstructionForActor(instructionId, 1, now);
+      const notifiedAgents = this.#notifySharedInstruction(
+        instructionId,
+        1,
+        'recorded',
+        body,
+        input.taskId ?? null,
+        now,
+      );
+      this.#recordEvent('instruction.recorded', 'instruction', instructionId, {
+        contentHash,
+        notifiedAgents,
+        revision: 1,
+        taskId: input.taskId ?? null,
+        userAuthorized: true,
+      });
+      return this.#sharedInstruction(instructionId);
+    });
+  }
+
+  reviseSharedInstruction(
+    instructionId: string,
+    input: ReviseSharedInstructionInput,
+  ): SharedInstruction {
+    assertUserAuthorized(input.userAuthorized, 'Revising a shared instruction');
+    const body = requireExactInstructionText(input.body);
+    const reason = requireText(input.reason, 'Authorization reason', 2_000);
+    if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
+      throw new SameTreeError('INVALID_INPUT', 'Expected revision must be a positive integer.');
+    }
+    const contentHash = createHash('sha256').update(body).digest('hex');
+    const now = this.#clock();
+
+    return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
+      const current = this.#sharedInstruction(instructionId);
+      if (current.status === 'revoked') {
+        throw new SameTreeError(
+          'INSTRUCTION_CONFLICT',
+          `Shared instruction '${instructionId}' is revoked.`,
+        );
+      }
+      if (current.revision !== input.expectedRevision) {
+        throw new SameTreeError(
+          'INSTRUCTION_CONFLICT',
+          `Shared instruction '${instructionId}' changed from revision ${input.expectedRevision} to ${current.revision}.`,
+          { currentRevision: current.revision },
+        );
+      }
+      const revision = current.revision + 1;
+      this.#database
+        .prepare(
+          `INSERT INTO shared_instruction_revisions
+            (instruction_id, revision, action, body, content_hash, recorded_by,
+             authorization_reason, created_at)
+           VALUES (?, ?, 'revised', ?, ?, ?, ?, ?)`,
+        )
+        .run(instructionId, revision, body, contentHash, this.agentName, reason, now);
+      this.#database
+        .prepare(
+          `UPDATE shared_instructions
+           SET current_revision = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(revision, now, instructionId);
+      this.#acknowledgeSharedInstructionForActor(instructionId, revision, now);
+      const notifiedAgents = this.#notifySharedInstruction(
+        instructionId,
+        revision,
+        'revised',
+        body,
+        current.taskId,
+        now,
+      );
+      this.#recordEvent('instruction.revised', 'instruction', instructionId, {
+        contentHash,
+        notifiedAgents,
+        previousRevision: current.revision,
+        revision,
+        taskId: current.taskId,
+        userAuthorized: true,
+      });
+      return this.#sharedInstruction(instructionId);
+    });
+  }
+
+  revokeSharedInstruction(
+    instructionId: string,
+    input: RevokeSharedInstructionInput,
+  ): SharedInstruction {
+    assertUserAuthorized(input.userAuthorized, 'Revoking a shared instruction');
+    const reason = requireText(input.reason, 'Authorization reason', 2_000);
+    if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
+      throw new SameTreeError('INVALID_INPUT', 'Expected revision must be a positive integer.');
+    }
+    const now = this.#clock();
+
+    return immediateTransaction(this.#database, () => {
+      this.#assertActiveSession(now);
+      const current = this.#sharedInstruction(instructionId);
+      if (current.status === 'revoked') {
+        throw new SameTreeError(
+          'INSTRUCTION_CONFLICT',
+          `Shared instruction '${instructionId}' is already revoked.`,
+        );
+      }
+      if (current.revision !== input.expectedRevision) {
+        throw new SameTreeError(
+          'INSTRUCTION_CONFLICT',
+          `Shared instruction '${instructionId}' changed from revision ${input.expectedRevision} to ${current.revision}.`,
+          { currentRevision: current.revision },
+        );
+      }
+      const revision = current.revision + 1;
+      this.#database
+        .prepare(
+          `INSERT INTO shared_instruction_revisions
+            (instruction_id, revision, action, body, content_hash, recorded_by,
+             authorization_reason, created_at)
+           VALUES (?, ?, 'revoked', NULL, NULL, ?, ?, ?)`,
+        )
+        .run(instructionId, revision, this.agentName, reason, now);
+      this.#database
+        .prepare(
+          `UPDATE shared_instructions
+           SET current_revision = ?, status = 'revoked', updated_at = ? WHERE id = ?`,
+        )
+        .run(revision, now, instructionId);
+      this.#acknowledgeSharedInstructionForActor(instructionId, revision, now);
+      const notifiedAgents = this.#notifySharedInstruction(
+        instructionId,
+        revision,
+        'revoked',
+        null,
+        current.taskId,
+        now,
+      );
+      this.#recordEvent('instruction.revoked', 'instruction', instructionId, {
+        notifiedAgents,
+        previousRevision: current.revision,
+        revision,
+        taskId: current.taskId,
+        userAuthorized: true,
+      });
+      return this.#sharedInstruction(instructionId);
+    });
+  }
+
+  getSharedInstruction(instructionId: string, revision?: number): SharedInstruction {
+    if (revision !== undefined && (!Number.isSafeInteger(revision) || revision < 1)) {
+      throw new SameTreeError('INVALID_INPUT', 'Instruction revision must be a positive integer.');
+    }
+    return this.#sharedInstruction(instructionId, revision);
+  }
+
+  listSharedInstructions(options: ListSharedInstructionsOptions = {}): SharedInstructionSummary[] {
+    const limit = options.limit ?? 25;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new SameTreeError('INVALID_INPUT', 'Instruction list limit must be between 1 and 100.');
+    }
+    const conditions = options.includeRevoked ? [] : ["instruction.status = 'active'"];
+    const parameters: Array<number | string> = [this.agentName];
+    if (options.taskId) {
+      conditions.push('instruction.task_id = ?');
+      parameters.push(options.taskId);
+    }
+    if (options.after) {
+      const cursor = this.#database
+        .prepare('SELECT created_at, id FROM shared_instructions WHERE id = ?')
+        .get(options.after) as Row | undefined;
+      if (!cursor) {
+        throw new SameTreeError(
+          'NOT_FOUND',
+          `Shared instruction cursor '${options.after}' does not exist.`,
+        );
+      }
+      conditions.push(
+        '(instruction.created_at < ? OR (instruction.created_at = ? AND instruction.id < ?))',
+      );
+      parameters.push(
+        numberValue(cursor, 'created_at'),
+        numberValue(cursor, 'created_at'),
+        stringValue(cursor, 'id'),
+      );
+    }
+    parameters.push(limit);
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const rows = this.#database
+      .prepare(
+        `SELECT instruction.*, revision.revision, revision.action, revision.body,
+                revision.content_hash, revision.recorded_by, revision.authorization_reason,
+                revision.created_at AS revision_created_at, acknowledgement.acknowledged_at
+         FROM shared_instructions instruction
+         JOIN shared_instruction_revisions revision
+           ON revision.instruction_id = instruction.id
+          AND revision.revision = instruction.current_revision
+         LEFT JOIN shared_instruction_acks acknowledgement
+           ON acknowledgement.instruction_id = instruction.id
+          AND acknowledgement.revision = instruction.current_revision
+          AND acknowledgement.agent_name = ?
+         ${where}
+         ORDER BY instruction.created_at DESC, instruction.id DESC
+         LIMIT ?`,
+      )
+      .all(...parameters) as Row[];
+    return rows.map((row) => sharedInstructionSummary(mapSharedInstruction(row)));
+  }
+
+  acknowledgeSharedInstruction(
+    instructionId: string,
+    revision: number,
+  ): SharedInstructionAcknowledgement {
+    if (!Number.isSafeInteger(revision) || revision < 1) {
+      throw new SameTreeError('INVALID_INPUT', 'Instruction revision must be a positive integer.');
+    }
+    return immediateTransaction(this.#database, () => {
+      const current = this.#sharedInstruction(instructionId);
+      if (current.revision !== revision) {
+        throw new SameTreeError(
+          'INSTRUCTION_CONFLICT',
+          `Shared instruction '${instructionId}' is now revision ${current.revision}.`,
+          { currentRevision: current.revision },
+        );
+      }
+      const acknowledgedAt = this.#clock();
+      const newlyAcknowledged =
+        this.#database
+          .prepare(
+            `INSERT OR IGNORE INTO shared_instruction_acks
+              (instruction_id, revision, agent_name, acknowledged_at)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(instructionId, revision, this.agentName, acknowledgedAt).changes === 1;
+      this.#database
+        .prepare(
+          `INSERT INTO message_receipts (message_id, agent_name, read_at)
+           SELECT notice.message_id, ?, ?
+           FROM shared_instruction_notifications notice
+           JOIN messages message ON message.id = notice.message_id
+           WHERE notice.instruction_id = ? AND notice.revision = ? AND message.recipient = ?
+           ON CONFLICT(message_id, agent_name) DO UPDATE SET read_at = excluded.read_at`,
+        )
+        .run(this.agentName, acknowledgedAt, instructionId, revision, this.agentName);
+      if (newlyAcknowledged) {
+        this.#recordEvent('instruction.acknowledged', 'instruction', instructionId, {
+          action: current.action,
+          revision,
+        });
+      }
+      const stored = this.#database
+        .prepare(
+          `SELECT acknowledged_at FROM shared_instruction_acks
+           WHERE instruction_id = ? AND revision = ? AND agent_name = ?`,
+        )
+        .get(instructionId, revision, this.agentName) as Row;
+      return {
+        instructionId,
+        revision,
+        acknowledgedAt: numberValue(stored, 'acknowledged_at'),
+        newlyAcknowledged,
+      };
+    });
   }
 
   claimTask(taskId: string, authorization: UserAuthorizedTaskInput = {}): Task {
@@ -1761,18 +2349,22 @@ export class Coordinator {
         taskId: input.taskId ?? null,
         createdAt: now,
         readAt: null,
+        instruction: null,
       };
     });
   }
 
   inbox(options: { unreadOnly?: boolean; limit?: number } = {}): Message[] {
     const limit = Math.min(Math.max(options.limit ?? 50, 1), 500);
-    const unread = options.unreadOnly ? 'AND receipt.read_at IS NULL' : '';
+    const unread = options.unreadOnly
+      ? 'AND receipt.read_at IS NULL AND (notice.message_id IS NULL OR notice.revision = instruction.current_revision)'
+      : '';
     return (
       this.#database
         .prepare(
-          `SELECT message.*, receipt.read_at
+          `SELECT message.*, receipt.read_at ${MESSAGE_INSTRUCTION_COLUMNS}
            FROM messages message
+           ${MESSAGE_INSTRUCTION_JOINS}
            LEFT JOIN message_receipts receipt
              ON receipt.message_id = message.id AND receipt.agent_name = ?
            WHERE (message.recipient = ? OR EXISTS (
@@ -1851,8 +2443,9 @@ export class Coordinator {
     return immediateTransaction(this.#database, () => {
       const row = this.#database
         .prepare(
-          `SELECT message.*, receipt.read_at
+          `SELECT message.*, receipt.read_at ${MESSAGE_INSTRUCTION_COLUMNS}
            FROM messages message
+           ${MESSAGE_INSTRUCTION_JOINS}
            LEFT JOIN message_receipts receipt
              ON receipt.message_id = message.id AND receipt.agent_name = ?
            WHERE message.id = ?`,
@@ -2235,12 +2828,14 @@ export class Coordinator {
         .prepare(
           `SELECT COUNT(*) AS count
            FROM messages message
+           ${MESSAGE_INSTRUCTION_JOINS}
            LEFT JOIN message_receipts receipt
              ON receipt.message_id = message.id AND receipt.agent_name = ?
            WHERE (message.recipient = ? OR EXISTS (
              SELECT 1 FROM broadcast_recipients recipient
              WHERE recipient.message_id = message.id AND recipient.agent_name = ?
-           )) AND receipt.read_at IS NULL`,
+            )) AND receipt.read_at IS NULL
+              AND (notice.message_id IS NULL OR notice.revision = instruction.current_revision)`,
         )
         .get(this.agentName, this.agentName, this.agentName) as Row;
       const handoffs = this.#database
@@ -2257,6 +2852,9 @@ export class Coordinator {
         .get() as Row;
       const claims = this.listClaims();
       const claimWarnings = claims.flatMap((claim) => claim.warnings);
+      const instructions = this.#sharedInstructionRows(
+        options.includeRevokedInstructions ?? false,
+      ).map((row) => sharedInstructionSummary(mapSharedInstruction(row)));
 
       return {
         ...workspaceStatus,
@@ -2270,8 +2868,12 @@ export class Coordinator {
           return mapTask(row, this.#dependencies(id), this.#taskMembers(id));
         }),
         plans: this.listPlans(),
+        instructions,
         claims,
         unreadMessages: numberValue(unread, 'count'),
+        unacknowledgedInstructions: instructions.filter(
+          (instruction) => instruction.acknowledgedAt === null,
+        ).length,
         pendingHandoffs: numberValue(handoffs, 'count'),
         warnings: [...branchWarnings, ...claimWarnings],
         lastEventSequence: nullableNumber(lastEvent, 'sequence') ?? 0,

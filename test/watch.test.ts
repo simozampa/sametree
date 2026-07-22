@@ -37,6 +37,7 @@ function message(overrides: Partial<Message> = {}): Message {
     taskId: null,
     subject: 'Test message',
     body: 'Please review this.',
+    instruction: null,
     createdAt: Date.UTC(2026, 0, 1, 14, 2, 3),
     readAt: null,
     ...overrides,

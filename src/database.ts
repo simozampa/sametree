@@ -154,6 +154,74 @@ const PLAN_SCHEMA = `
   CREATE INDEX IF NOT EXISTS plans_task_idx ON plans(task_id, created_at, id);
 `;
 
+const SHARED_INSTRUCTION_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS shared_instructions (
+    id TEXT PRIMARY KEY,
+    created_by TEXT NOT NULL REFERENCES agents(name) ON DELETE RESTRICT,
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    source_harness TEXT NOT NULL CHECK(source_harness IN ('claude-code', 'opencode', 'other')),
+    source_session_id TEXT NOT NULL CHECK(length(source_session_id) BETWEEN 1 AND 200),
+    source_event_id TEXT NOT NULL CHECK(length(source_event_id) BETWEEN 1 AND 200),
+    current_revision INTEGER NOT NULL CHECK(current_revision > 0),
+    status TEXT NOT NULL CHECK(status IN ('active', 'revoked')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(source_harness, source_session_id, source_event_id),
+    FOREIGN KEY (id, current_revision)
+      REFERENCES shared_instruction_revisions(instruction_id, revision)
+      DEFERRABLE INITIALLY DEFERRED,
+    CHECK(updated_at >= created_at)
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS shared_instruction_revisions (
+    instruction_id TEXT NOT NULL REFERENCES shared_instructions(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    action TEXT NOT NULL CHECK(action IN ('recorded', 'revised', 'revoked')),
+    body TEXT,
+    content_hash TEXT,
+    recorded_by TEXT NOT NULL REFERENCES agents(name) ON DELETE RESTRICT,
+    authorization_reason TEXT NOT NULL CHECK(length(authorization_reason) BETWEEN 1 AND 2000),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (instruction_id, revision),
+    CHECK(
+      (revision = 1 AND action = 'recorded') OR
+      (revision > 1 AND action IN ('revised', 'revoked'))
+    ),
+    CHECK(
+      (action IN ('recorded', 'revised') AND body IS NOT NULL AND
+       length(body) BETWEEN 1 AND 48000 AND length(content_hash) = 64) OR
+      (action = 'revoked' AND body IS NULL AND content_hash IS NULL)
+    )
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS shared_instruction_acks (
+    instruction_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    agent_name TEXT NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+    acknowledged_at INTEGER NOT NULL,
+    PRIMARY KEY (instruction_id, revision, agent_name),
+    FOREIGN KEY (instruction_id, revision)
+      REFERENCES shared_instruction_revisions(instruction_id, revision) ON DELETE CASCADE
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS shared_instruction_notifications (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    instruction_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    FOREIGN KEY (instruction_id, revision)
+      REFERENCES shared_instruction_revisions(instruction_id, revision) ON DELETE CASCADE
+  ) STRICT;
+
+  CREATE INDEX IF NOT EXISTS shared_instructions_created_idx
+    ON shared_instructions(created_at, id);
+  CREATE INDEX IF NOT EXISTS shared_instructions_task_idx
+    ON shared_instructions(task_id, created_at, id);
+  CREATE INDEX IF NOT EXISTS shared_instruction_acks_agent_idx
+    ON shared_instruction_acks(agent_name, instruction_id, revision);
+  CREATE INDEX IF NOT EXISTS shared_instruction_notifications_revision_idx
+    ON shared_instruction_notifications(instruction_id, revision);
+`;
+
 const INITIAL_SCHEMA = `
   CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -652,7 +720,7 @@ function migrate(
       .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
       .get() as { version: number };
 
-    if (current.version > 5) {
+    if (current.version > 6) {
       throw new SameTreeError(
         'DATABASE_ERROR',
         `This database uses unsupported schema version ${current.version}.`,
@@ -698,6 +766,14 @@ function migrate(
         .run(now);
     } else {
       database.exec(PLAN_SCHEMA);
+    }
+    if (current.version < 6) {
+      database.exec(SHARED_INSTRUCTION_SCHEMA);
+      database
+        .prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?)')
+        .run(now);
+    } else {
+      database.exec(SHARED_INSTRUCTION_SCHEMA);
     }
     database.exec('COMMIT');
   } catch (error) {

@@ -5,6 +5,7 @@ export type ErrorCode =
   | 'GIT_STATUS_ERROR'
   | 'HANDOFF_CONFLICT'
   | 'HOOK_REFUSED'
+  | 'INSTRUCTION_CONFLICT'
   | 'INVALID_INPUT'
   | 'NOT_ASSIGNED'
   | 'NOT_FOUND'

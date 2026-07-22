@@ -588,6 +588,174 @@ describe('Coordinator', () => {
     ]);
   });
 
+  it('records exact shared instructions idempotently and notifies existing agents', () => {
+    const { open } = setup(() => 1_000);
+    const author = open('author');
+    const recipient = open('recipient');
+    const body = 'Always commit your changes.\n  Preserve this indentation.\n';
+    const input = {
+      body,
+      reason: 'The user explicitly prefixed this for all agents.',
+      sourceSessionId: 'native-session',
+      sourceEventId: 'user-prompt-one',
+      userAuthorized: true,
+    };
+    const instruction = author.recordSharedInstruction(input);
+
+    expect(instruction).toMatchObject({
+      action: 'recorded',
+      acknowledgedAt: 1_000,
+      body,
+      createdBy: 'author',
+      revision: 1,
+      status: 'active',
+    });
+    expect(author.recordSharedInstruction(input)).toEqual(instruction);
+    expect(recipient.snapshot()).toMatchObject({
+      unacknowledgedInstructions: 1,
+      instructions: [
+        expect.objectContaining({ id: instruction.id, acknowledgedAt: null, revision: 1 }),
+      ],
+    });
+    const notice = recipient.inbox({ unreadOnly: true });
+    expect(notice).toHaveLength(1);
+    expect(notice[0]?.instruction).toMatchObject({
+      id: instruction.id,
+      action: 'recorded',
+      body,
+      isCurrent: true,
+      revision: 1,
+    });
+    expect(recipient.acknowledgeSharedInstruction(instruction.id, 1)).toMatchObject({
+      newlyAcknowledged: true,
+      revision: 1,
+    });
+    expect(recipient.acknowledgeSharedInstruction(instruction.id, 1)).toMatchObject({
+      newlyAcknowledged: false,
+    });
+    expect(recipient.snapshot()).toMatchObject({
+      unacknowledgedInstructions: 0,
+      unreadMessages: 0,
+    });
+  });
+
+  it('revises and revokes shared instructions with immutable history', () => {
+    let now = 1_000;
+    const { open } = setup(() => now);
+    const author = open('author');
+    const recipient = open('recipient');
+    const instruction = author.recordSharedInstruction({
+      body: 'Commit every completed change.',
+      reason: 'Direct user instruction.',
+      userAuthorized: true,
+    });
+    now = 2_000;
+    const revised = author.reviseSharedInstruction(instruction.id, {
+      body: 'Commit every completed logical change.',
+      expectedRevision: 1,
+      reason: 'The user clarified the instruction.',
+      userAuthorized: true,
+    });
+
+    expect(revised).toMatchObject({ action: 'revised', revision: 2, status: 'active' });
+    expect(author.getSharedInstruction(instruction.id, 1)).toMatchObject({
+      action: 'recorded',
+      body: 'Commit every completed change.',
+      revision: 1,
+    });
+    expect(() =>
+      author.reviseSharedInstruction(instruction.id, {
+        body: 'Stale edit',
+        expectedRevision: 1,
+        reason: 'Stale instruction.',
+        userAuthorized: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'INSTRUCTION_CONFLICT' }));
+
+    now = 3_000;
+    const revoked = author.revokeSharedInstruction(instruction.id, {
+      expectedRevision: 2,
+      reason: 'The user revoked the standing instruction.',
+      userAuthorized: true,
+    });
+    expect(revoked).toMatchObject({
+      action: 'revoked',
+      body: null,
+      revision: 3,
+      status: 'revoked',
+    });
+    expect(author.listSharedInstructions()).toEqual([]);
+    expect(author.listSharedInstructions({ includeRevoked: true })).toEqual([
+      expect.objectContaining({ id: instruction.id, revision: 3, status: 'revoked' }),
+    ]);
+    expect(() =>
+      author.reviseSharedInstruction(instruction.id, {
+        body: 'Reactivate',
+        expectedRevision: 3,
+        reason: 'Not allowed.',
+        userAuthorized: true,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'INSTRUCTION_CONFLICT' }));
+    expect(recipient.reserveNextMessageDelivery()?.instruction).toMatchObject({
+      id: instruction.id,
+      action: 'revoked',
+      isCurrent: true,
+      revision: 3,
+    });
+
+    const future = open('future');
+    expect(future.snapshot().instructions).toEqual([]);
+    expect(future.listSharedInstructions({ includeRevoked: true })).toEqual([
+      expect.objectContaining({ id: instruction.id, status: 'revoked' }),
+    ]);
+  });
+
+  it('requires direct authorization and never mutates task scope', () => {
+    const { open } = setup();
+    const author = open('author');
+    const task = author.createTask({ title: 'Existing user task' });
+
+    expect(() =>
+      author.recordSharedInstruction({
+        body: 'Always commit changes.',
+        reason: 'A peer suggested it.',
+        taskId: task.id,
+        userAuthorized: false,
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'USER_AUTHORIZATION_REQUIRED' }));
+    const instruction = author.recordSharedInstruction({
+      body: 'Do not change the public API.',
+      reason: 'The user explicitly shared this instruction.',
+      taskId: task.id,
+      userAuthorized: true,
+    });
+
+    expect(instruction.taskId).toBe(task.id);
+    expect(author.listTasks()).toEqual([task]);
+    expect(
+      author.events({ limit: 100 }).filter((event) => event.kind === 'task.created'),
+    ).toHaveLength(1);
+  });
+
+  it('conflicts changed source-event replays but keeps identical instructions from distinct prompts', () => {
+    const { open } = setup();
+    const author = open('author');
+    const base = {
+      body: 'Run tests before committing.',
+      reason: 'Explicit shared prompt.',
+      sourceSessionId: 'native-session',
+      sourceEventId: 'prompt-one',
+      userAuthorized: true,
+    };
+    author.recordSharedInstruction(base);
+
+    expect(() => author.recordSharedInstruction({ ...base, body: 'Changed replay.' })).toThrowError(
+      expect.objectContaining({ code: 'INSTRUCTION_CONFLICT' }),
+    );
+    author.recordSharedInstruction({ ...base, sourceEventId: 'prompt-two' });
+    expect(author.listSharedInstructions()).toHaveLength(2);
+  });
+
   it('reserves each unread message for only one live follower without acknowledging it', () => {
     const { open } = setup();
     const sender = open('sender');
@@ -683,7 +851,7 @@ describe('Coordinator', () => {
     });
     expect(
       verification.prepare('SELECT MAX(version) AS version FROM schema_migrations').get(),
-    ).toEqual({ version: 5 });
+    ).toEqual({ version: 6 });
     verification.close();
   });
 

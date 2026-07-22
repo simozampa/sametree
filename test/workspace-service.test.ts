@@ -128,6 +128,19 @@ describe('workspace operations', () => {
       sourceSessionId: 'source-session',
       sourceEventId: 'source-event',
     });
+    const instruction = standalone.recordSharedInstruction({
+      body: 'Preserve imported behavior.',
+      reason: 'Explicit test instruction.',
+      sourceSessionId: 'instruction-session',
+      sourceEventId: 'instruction-event',
+      userAuthorized: true,
+    });
+    standalone.reviseSharedInstruction(instruction.id, {
+      body: 'Preserve all imported behavior.',
+      expectedRevision: 1,
+      reason: 'Explicit test revision.',
+      userAuthorized: true,
+    });
     standalone.close();
     const sourceDatabasePath = resolveRepository(source.root).databasePath;
     const sourceDatabase = new Database(sourceDatabasePath, { readonly: true });
@@ -150,6 +163,13 @@ describe('workspace operations', () => {
     expect(workspaceCoordinator.listPlans()).toContainEqual(
       expect.objectContaining({ id: plan.id, revision: 1, title: 'Imported plan' }),
     );
+    expect(workspaceCoordinator.listSharedInstructions()).toContainEqual(
+      expect.objectContaining({ id: instruction.id, revision: 2 }),
+    );
+    expect(workspaceCoordinator.getSharedInstruction(instruction.id, 1)).toMatchObject({
+      body: 'Preserve imported behavior.',
+      revision: 1,
+    });
     expect(workspaceCoordinator.listTasks()).toContainEqual(
       expect.objectContaining({ id: taggedTask.id, members: ['frontend'] }),
     );
@@ -227,6 +247,61 @@ describe('workspace operations', () => {
     expect(observer.listPlans()).toEqual([
       expect.objectContaining({ author: 'frontend-author', title: 'Frontend plan' }),
     ]);
+  });
+
+  it('rejects imported shared instructions with the same source identity atomically', () => {
+    const frontend = repository();
+    const backend = repository();
+    const registry = registryRoot();
+    const input = {
+      body: 'Run focused tests before sharing work.',
+      reason: 'Explicit shared prompt.',
+      sourceSessionId: 'shared-native-session',
+      sourceEventId: 'shared-native-event',
+      userAuthorized: true,
+    };
+    const frontendAgent = open(frontend.root, 'frontend-author');
+    frontendAgent.recordSharedInstruction(input);
+    frontendAgent.close();
+    const backendAgent = open(backend.root, 'backend-author');
+    backendAgent.recordSharedInstruction(input);
+    backendAgent.close();
+    const workspace = createWorkspace(
+      frontend.root,
+      { name: 'Product', memberName: 'frontend', mode: 'import-current' },
+      { registryRoot: registry },
+    );
+
+    expect(() =>
+      addWorkspaceMember(
+        backend.root,
+        {
+          workspaceId: workspace.workspace.id,
+          memberName: 'backend',
+          mode: 'import-current',
+        },
+        { registryRoot: registry },
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: 'WORKSPACE_ERROR',
+        message: expect.stringContaining(
+          "source identity 'other:shared-native-session:shared-native-event' already exists",
+        ),
+      }),
+    );
+    expect(
+      resolveWorkspaceBinding(resolveRepository(backend.root), { registryRoot: registry }),
+    ).toBeNull();
+
+    const observer = open(frontend.root, 'observer', registry);
+    const imported = observer.listSharedInstructions();
+    expect(imported).toEqual([expect.objectContaining({ createdBy: 'frontend-author' })]);
+    const importedInstruction = imported[0];
+    if (!importedInstruction) throw new Error('Expected imported shared instruction.');
+    expect(observer.getSharedInstruction(importedInstruction.id)).toMatchObject({
+      body: input.body,
+    });
   });
 
   it('recovers a member inserted before its source transition was recorded', () => {
