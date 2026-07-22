@@ -30,9 +30,9 @@ Create and add initialize missing `.sametree/` project files in the current memb
 
 ## Identity and Sessions
 
-An agent name is unique within one workspace and contains letters, numbers, `.`, `_`, or `-`. MCP adapters generate a process-scoped name from the harness's native session identifier, falling back to the MCP process ID. Set `SAMETREE_AGENT` when a durable human-readable identity such as `claude-reviewer` or `opencode-1` is required, but never reuse it for independent processes in the same workspace.
+An agent name is unique within one workspace and contains letters, numbers, `.`, `_`, or `-`. MCP adapters generate a process-scoped name from the harness's native session identifier, falling back to the MCP process ID. Automatic plan publication uses the same identity when available, while plan continuity is keyed by the stable harness and harness session ID so a resumed process does not duplicate a proposal. Set `SAMETREE_AGENT` when a durable human-readable identity such as `claude-reviewer` or `opencode-1` is required, but never reuse it for independent processes in the same workspace.
 
-A session represents one Coordinator-backed process lifetime and has one home member. It records the home member's starting branch and HEAD descriptor. Coordination CLI commands, MCP servers, watchers, and message followers create sessions; setup, workspace lifecycle, diagnostics, and hook commands that do not open the Coordinator do not. Built-in sessions remain in the session table for lease ownership and diagnostics but omit lifecycle audit events. Library callers emit `session.started` and `session.closed` by default and may disable them. An MCP heartbeat renews:
+A session represents one Coordinator-backed process lifetime and has one home member. It records the home member's starting branch and HEAD descriptor. Coordination CLI commands, MCP servers, watchers, message followers, and plan publishers create sessions; setup, workspace lifecycle, and diagnostics do not. Built-in sessions remain in the session table for lease ownership and diagnostics but omit lifecycle audit events. Library callers emit `session.started` and `session.closed` by default and may disable them. An MCP heartbeat renews:
 
 - The session expiry.
 - Active path claims owned by that session across available members.
@@ -126,6 +126,22 @@ Agents should inspect active claims before editing and acquire a narrow claim wh
 
 Claims expire unless renewed and should be released immediately when work ends. They are advisory and do not modify filesystem permissions.
 
+## Proposed Plans
+
+A proposed plan is durable, revisioned workspace context. It contains an author, source harness and session, optional task, title, Markdown body, content hash, and immutable source-event ID. A plan body is limited to 48,000 characters and its title to 200 characters. The first publication creates revision 1; later source events from the same harness session append immutable revisions. Replaying one source event with identical content is idempotent, while replaying it with different content returns `PLAN_CONFLICT`.
+
+Automatic capture happens at the harness's proposal boundary:
+
+- Claude Code publishes the `ExitPlanMode` plan from a `PreToolUse` plugin hook before approval.
+- Current OpenCode versions publish the finalized `.opencode/plans/` file from `tool.execute.before` when Plan calls `plan_exit`, before its Build-agent approval question.
+- OpenCode ignores child-session and ordinary Plan responses because those turns can be clarification or progress updates rather than finalized proposals.
+
+Claude Code publication fails open. Its wrapper forwards the hook payload, waits at most two seconds, suppresses SameTree failures, and always returns success, so a missing executable, unavailable database, invalid payload, or hung publication cannot prevent `ExitPlanMode` from presenting the proposal. OpenCode catches publication errors inside its adapter rather than turning them into SameTree coordination decisions. In either harness, a failed proposal may be absent from SameTree until a later successful publication.
+
+Every new revision sends its full body to each live peer as an addressed message on `plan:<plan-id>`. The notification states that the proposal is context rather than authorization. SameTree does not assign a reviewer, transfer a task, or authorize implementation. Agents that start later can discover current summaries through status or plan listing and retrieve any immutable revision explicitly.
+
+The CLI exposes `sametree plan publish`, `sametree plan show`, and `sametree plan list`. MCP exposes `sametree_plan_publish`, `sametree_plan_get`, and `sametree_plan_list`. Listing is ordered by immutable plan creation time so pagination remains stable when older plans receive revisions.
+
 ## Messages
 
 A message is immutable, non-authoritative peer context and contains:
@@ -177,7 +193,7 @@ Prompt policy is backed by optional Git hooks for rules that can be checked mech
 
 ## Events
 
-Every meaningful coordination mutation appends an event in the same transaction as current state. Explicit workspaces use one global sequence, and applicable events include member/worktree origin. Imported events receive new sequences while source sequence metadata is retained internally. Built-in process lifecycle churn is retained in session rows rather than copied into the event stream. Consumers call `sametree_events` with the last seen sequence and persist the returned maximum as their next cursor. Direct reads default to 25 events and accept an explicit limit up to 1,000; streaming watchers request larger pages internally.
+Every meaningful coordination mutation appends an event in the same transaction as current state. Explicit workspaces use one global sequence, and applicable events include member/worktree origin. Imported events receive new sequences while source sequence metadata is retained internally. Built-in process lifecycle churn is retained in session rows rather than copied into the event stream. Plan revisions append `plan.published` or `plan.revised` alongside peer-notification events. Consumers call `sametree_events` with the last seen sequence and persist the returned maximum as their next cursor. Direct reads default to 25 events and accept an explicit limit up to 1,000; streaming watchers request larger pages internally.
 
 Event polling is intended for context refresh and debugging. Current-state tools remain authoritative for decisions.
 
@@ -195,7 +211,8 @@ Expected failures return stable machine-readable codes:
 | `HOOK_REFUSED` | A configured Git policy check failed |
 | `INVALID_INPUT` | Input or repository configuration is invalid |
 | `NOT_ASSIGNED` | The actor does not own the requested entity |
-| `NOT_FOUND` | A referenced agent, task, message, or handoff is absent |
+| `NOT_FOUND` | A referenced agent, task, plan, message, or handoff is absent |
+| `PLAN_CONFLICT` | A harness plan event conflicts with an existing revision or task association |
 | `NOT_GIT_REPOSITORY` | The working directory is not a non-bare Git tree |
 | `POLICY_NOT_FOUND` | `.sametree/policy.md` is missing |
 | `TASK_BLOCKED` | Task dependencies are unfinished |

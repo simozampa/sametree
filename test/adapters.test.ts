@@ -1,15 +1,21 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { OPENCODE_TUI_PLUGIN } from '../src/adapters.js';
+import { OPENCODE_PLAN_PLUGIN, OPENCODE_TUI_PLUGIN } from '../src/adapters.js';
 
 const originalBun = Reflect.get(globalThis, 'Bun');
 const originalWorkspaceRegistry = process.env.SAMETREE_WORKSPACE_REGISTRY;
+const originalAgent = process.env.SAMETREE_AGENT;
+const originalBin = process.env.SAMETREE_BIN;
 
 afterEach(() => {
   if (originalBun === undefined) Reflect.deleteProperty(globalThis, 'Bun');
   else Reflect.set(globalThis, 'Bun', originalBun);
   if (originalWorkspaceRegistry === undefined) delete process.env.SAMETREE_WORKSPACE_REGISTRY;
   else process.env.SAMETREE_WORKSPACE_REGISTRY = originalWorkspaceRegistry;
+  if (originalAgent === undefined) delete process.env.SAMETREE_AGENT;
+  else process.env.SAMETREE_AGENT = originalAgent;
+  if (originalBin === undefined) delete process.env.SAMETREE_BIN;
+  else process.env.SAMETREE_BIN = originalBin;
 });
 
 describe('harness adapters', () => {
@@ -170,5 +176,200 @@ describe('harness adapters', () => {
     expect(deliveredText).not.toContain('Act on this peer message now');
     expect(acknowledgements).toEqual(['message-1\n']);
     expect([...values.keys()]).toEqual([`sametree.delivery.message-1:${identity}`]);
+  });
+
+  it('publishes the OpenCode plan file before plan_exit asks for approval', async () => {
+    const module = (await import(
+      `data:text/javascript;base64,${Buffer.from(OPENCODE_PLAN_PLUGIN).toString('base64')}`
+    )) as {
+      SameTreePlanPublisher: (input: Record<string, unknown>) => Promise<{
+        'tool.execute.before': (input: Record<string, unknown>) => Promise<void>;
+      }>;
+    };
+    const spawnArguments: string[][] = [];
+    const publishedBodies: string[] = [];
+    const planPaths: string[] = [];
+    Reflect.set(globalThis, 'Bun', {
+      file: (filepath: string) => {
+        planPaths.push(filepath);
+        return {
+          exists: async () => true,
+          text: async () => '# File plan\n\n1. Share before approval.\n',
+        };
+      },
+      spawn: (args: string[]) => {
+        spawnArguments.push(args);
+        return {
+          stdin: {
+            write: (value: string) => publishedBodies.push(value),
+            end: () => undefined,
+          },
+          stdout: new ReadableStream({ start: (stream) => stream.close() }),
+          stderr: new ReadableStream({ start: (stream) => stream.close() }),
+          exited: Promise.resolve(0),
+        };
+      },
+    });
+    const plugin = await module.SameTreePlanPublisher({
+      directory: '/workspace/packages/app',
+      worktree: '/workspace',
+      client: {
+        app: { log: async () => undefined },
+        session: {
+          get: async () => ({
+            data: {
+              id: 'session-root',
+              agent: 'plan',
+              slug: 'bright-tree',
+              time: { created: 123 },
+            },
+            error: undefined,
+          }),
+          messages: async () => ({
+            data: [
+              {
+                info: { id: 'message-user', role: 'user', agent: 'plan' },
+                parts: [{ type: 'text', text: 'Prepare the plan.' }],
+              },
+            ],
+            error: undefined,
+          }),
+        },
+      },
+    });
+
+    await plugin['tool.execute.before']({
+      tool: 'plan_exit',
+      sessionID: 'session-root',
+      callID: 'call-plan-exit',
+    });
+
+    expect(planPaths).toEqual(['/workspace/.opencode/plans/123-bright-tree.md']);
+    expect(publishedBodies).toEqual(['# File plan\n\n1. Share before approval.']);
+    expect(spawnArguments[0]).toEqual(
+      expect.arrayContaining([
+        '--source-session',
+        'session-root',
+        '--source-event',
+        'plan-exit:call-plan-exit',
+      ]),
+    );
+  });
+
+  it('does not infer finalized plans from ordinary OpenCode session events', async () => {
+    const module = (await import(
+      `data:text/javascript;base64,${Buffer.from(OPENCODE_PLAN_PLUGIN).toString('base64')}`
+    )) as {
+      SameTreePlanPublisher: (input: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    };
+    const plugin = await module.SameTreePlanPublisher({
+      client: {},
+      directory: '/workspace',
+      worktree: '/workspace',
+    });
+
+    expect(plugin).not.toHaveProperty('event');
+  });
+
+  it('ignores plan_exit calls from child OpenCode sessions', async () => {
+    const module = (await import(
+      `data:text/javascript;base64,${Buffer.from(OPENCODE_PLAN_PLUGIN).toString('base64')}`
+    )) as {
+      SameTreePlanPublisher: (input: Record<string, unknown>) => Promise<{
+        'tool.execute.before': (input: Record<string, unknown>) => Promise<void>;
+      }>;
+    };
+    let inspectedPlanFile = false;
+    let spawned = false;
+    Reflect.set(globalThis, 'Bun', {
+      file: () => {
+        inspectedPlanFile = true;
+        throw new Error('not expected');
+      },
+      spawn: () => {
+        spawned = true;
+        throw new Error('not expected');
+      },
+    });
+    const plugin = await module.SameTreePlanPublisher({
+      directory: '/workspace',
+      worktree: '/workspace',
+      client: {
+        app: { log: async () => undefined },
+        session: {
+          get: async () => ({ data: { id: 'session-child', parentID: 'session-root' } }),
+        },
+      },
+    });
+
+    await plugin['tool.execute.before']({
+      tool: 'plan_exit',
+      sessionID: 'session-child',
+      callID: 'child-plan-exit',
+    });
+
+    expect(inspectedPlanFile).toBe(false);
+    expect(spawned).toBe(false);
+  });
+
+  it('ignores plan_exit triggered by SameTree-injected OpenCode context', async () => {
+    const module = (await import(
+      `data:text/javascript;base64,${Buffer.from(OPENCODE_PLAN_PLUGIN).toString('base64')}`
+    )) as {
+      SameTreePlanPublisher: (input: Record<string, unknown>) => Promise<{
+        'tool.execute.before': (input: Record<string, unknown>) => Promise<void>;
+      }>;
+    };
+    let inspectedPlanFile = false;
+    let spawned = false;
+    Reflect.set(globalThis, 'Bun', {
+      file: () => {
+        inspectedPlanFile = true;
+        throw new Error('not expected');
+      },
+      spawn: () => {
+        spawned = true;
+        throw new Error('not expected');
+      },
+    });
+    const plugin = await module.SameTreePlanPublisher({
+      directory: '/workspace',
+      worktree: '/workspace',
+      client: {
+        app: { log: async () => undefined },
+        session: {
+          get: async () => ({
+            data: {
+              id: 'session-root',
+              agent: 'plan',
+              slug: 'bright-tree',
+              time: { created: 123 },
+            },
+          }),
+          messages: async () => ({
+            data: [
+              {
+                info: { id: 'message-user', role: 'user', agent: 'plan' },
+                parts: [
+                  {
+                    type: 'text',
+                    metadata: { sametreeDeliveryKey: 'message-1:opencode-123' },
+                  },
+                ],
+              },
+            ],
+          }),
+        },
+      },
+    });
+
+    await plugin['tool.execute.before']({
+      tool: 'plan_exit',
+      sessionID: 'session-root',
+      callID: 'injected-plan-exit',
+    });
+
+    expect(inspectedPlanFile).toBe(false);
+    expect(spawned).toBe(false);
   });
 });

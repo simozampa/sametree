@@ -70,9 +70,84 @@ describe('event watch', () => {
       createdAt: Date.UTC(2026, 0, 1, 14, 2, 3),
     };
 
-    expect(formatEvent(event)).toContain(
-      '14:02:03  opencode-worker      handoff.offered       handoff:handoff-1  task-1 -> claude-reviewer',
+    expect(formatEvent(event)).toBe(
+      '14:02:03  opencode-worker -> claude-reviewer: offered a handoff for task-1',
     );
+  });
+
+  it('formats proposed plan revisions without printing their bodies', () => {
+    const formatted = formatEvent(
+      event(8, {
+        kind: 'plan.revised',
+        entityType: 'plan',
+        entityId: 'plan-1',
+        payload: { revision: 2, title: 'Validation plan' },
+      }),
+    );
+
+    expect(formatted).toBe('14:02:03  watch-test: revised plan "Validation plan" (revision 2)');
+  });
+
+  it('formats current and historical claim payloads without object coercion', () => {
+    const current = formatEvent(
+      event(9, {
+        kind: 'claim.acquired',
+        entityType: 'claim',
+        entityId: 'claim-1,claim-2',
+        payload: {
+          paths: [
+            { member: 'frontend', path: 'src/api.ts' },
+            { member: 'backend', path: 'src/server.ts' },
+          ],
+        },
+      }),
+    );
+    const historical = formatEvent(
+      event(10, {
+        kind: 'claim.acquired',
+        entityType: 'claim',
+        entityId: 'claim-3',
+        payload: { paths: ['src/legacy.ts'] },
+      }),
+    );
+
+    expect(current).toBe(
+      '14:02:03  watch-test: claimed frontend:src/api.ts, backend:src/server.ts',
+    );
+    expect(historical).toBe('14:02:03  watch-test: claimed src/legacy.ts');
+    expect(current).not.toContain('[object Object]');
+  });
+
+  it('retains member context for claims in one working tree', () => {
+    expect(
+      formatEvent(
+        event(11, {
+          kind: 'claim.acquired',
+          entityType: 'claim',
+          entityId: 'claim-1,claim-2',
+          payload: {
+            paths: [
+              { member: 'frontend', path: 'src/api.ts' },
+              { member: 'frontend', path: 'test/api.test.ts' },
+            ],
+          },
+        }),
+      ),
+    ).toBe('14:02:03  watch-test: claimed frontend:src/api.ts, frontend:test/api.test.ts');
+  });
+
+  it('formats message routes without exposing addressed message bodies', () => {
+    expect(
+      formatEvent(
+        event(12, {
+          actor: 'reviewer',
+          kind: 'message.sent',
+          entityType: 'message',
+          entityId: 'message-1',
+          payload: { recipient: 'implementer' },
+        }),
+      ),
+    ).toBe('14:02:03  reviewer -> implementer: sent a message');
   });
 
   it('neutralizes terminal control characters in human-readable output', () => {
@@ -115,9 +190,41 @@ describe('event watch', () => {
     });
 
     expect(cursor).toBeGreaterThan(0);
-    expect(lines.map((line) => JSON.parse(line) as { kind: string })).toEqual(
+    const events = lines.map(
+      (line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> },
+    );
+    expect(events).toEqual(
       expect.arrayContaining([expect.objectContaining({ kind: 'task.created' })]),
     );
+    expect(events.find((event) => event.kind === 'task.created')?.payload).toMatchObject({
+      title: 'Watch this task',
+    });
+  });
+
+  it('renders workspace-visible task titles in the human stream', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const coordinator = Coordinator.open({
+      cwd: repository.root,
+      agent: 'implementer',
+      recordSessionLifecycleEvents: false,
+    });
+    coordinators.push(coordinator);
+    coordinator.createTask({ title: 'Add request validation', priority: 'high' });
+    const lines: string[] = [];
+
+    await watchEvents(coordinator, {
+      once: true,
+      write: (line) => {
+        lines.push(line);
+      },
+    });
+
+    expect(lines).toEqual([
+      expect.stringMatching(
+        /^\d{2}:\d{2}:\d{2} {2}implementer: created task "Add request validation" \(high priority\)$/u,
+      ),
+    ]);
   });
 
   it('drains every page before --once returns', async () => {

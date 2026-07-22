@@ -8,7 +8,7 @@
     {
       "name": "sametree",
       "source": "./plugins/sametree",
-      "description": "Automatic SameTree coordination and peer message delivery for Claude Code"
+      "description": "Automatic SameTree coordination, plan awareness, and peer message delivery for Claude Code"
     }
   ]
 }

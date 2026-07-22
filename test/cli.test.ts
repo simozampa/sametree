@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import Database from 'better-sqlite3';
@@ -12,6 +12,7 @@ import { createTestRepository, type TestRepository } from './helpers.js';
 
 const repositories: TestRepository[] = [];
 const cliPath = path.resolve('dist/cli.js');
+const claudePlanHookPath = path.resolve('plugins/sametree/hooks/publish-plan.mjs');
 
 interface ProcessResult {
   code: number | null;
@@ -40,6 +41,36 @@ function runCli(
       stderr += chunk;
     });
     child.stdin.end(input);
+    child.once('error', reject);
+    child.once('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function runClaudePlanHook(
+  root: string,
+  sametreeBin: string,
+  input: Record<string, unknown>,
+): Promise<ProcessResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [claudePlanHookPath], {
+      env: {
+        ...process.env,
+        CLAUDE_PROJECT_DIR: root,
+        SAMETREE_AGENT: '',
+        SAMETREE_BIN: sametreeBin,
+        SAMETREE_ROLE: 'implementer',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+    child.stdin.end(JSON.stringify(input));
     child.once('error', reject);
     child.once('close', (code) => resolve({ code, stdout, stderr }));
   });
@@ -295,6 +326,163 @@ describe('CLI', () => {
 
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain('USER_AUTHORIZATION_REQUIRED');
+  });
+
+  it('publishes plan Markdown from stdin and exposes current summaries', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const body = '# CLI plan\n\n1. Inspect the contract.\n2. Add coverage.\n';
+    const published = await runCli(
+      repository.root,
+      'planner',
+      [
+        '--harness',
+        'opencode',
+        'plan',
+        'publish',
+        '--source-session',
+        'session-one',
+        '--source-event',
+        'message-one',
+        '--body-stdin',
+      ],
+      body,
+    );
+    const plan = JSON.parse(published.stdout) as { id: string; revision: number };
+    const listed = await runCli(repository.root, 'observer', ['plan', 'list']);
+    const shown = await runCli(repository.root, 'observer', ['plan', 'show', plan.id]);
+
+    expect(published).toMatchObject({ code: 0, stderr: '' });
+    expect(plan.revision).toBe(1);
+    expect(JSON.parse(listed.stdout)).toEqual([
+      expect.objectContaining({ id: plan.id, revision: 1, title: 'CLI plan' }),
+    ]);
+    expect(JSON.parse(shown.stdout)).toMatchObject({ id: plan.id, body: body.trim() });
+  });
+
+  it('publishes an ExitPlanMode payload without writing hook output', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const result = await runCli(
+      repository.root,
+      undefined,
+      ['hook', 'claude-plan'],
+      JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        session_id: 'session-claude',
+        tool_name: 'ExitPlanMode',
+        tool_use_id: 'tool-plan-one',
+        tool_input: { plan: '# Claude plan\n\n1. Implement it.' },
+      }),
+    );
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    const plans = observer.listPlans();
+    const summary = plans[0];
+    if (!summary) throw new Error('Expected the Claude hook to publish a plan.');
+    const plan = observer.getPlan(summary.id);
+    observer.close();
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(plan).toMatchObject({
+      author: 'claude-code-session-claude',
+      body: '# Claude plan\n\n1. Implement it.',
+      sourceHarness: 'claude-code',
+      sourceEventId: 'tool-plan-one',
+      sourceSessionId: 'session-claude',
+    });
+  });
+
+  it('publishes an ExitPlanMode payload through the fail-open Claude hook', async () => {
+    const original = createTestRepository();
+    const root = `${original.root} with spaces & symbols`;
+    renameSync(original.root, root);
+    const repository = {
+      root,
+      cleanup: () => rmSync(root, { recursive: true, force: true }),
+    };
+    repositories.push(repository);
+    const result = await runClaudePlanHook(repository.root, cliPath, {
+      hook_event_name: 'PreToolUse',
+      session_id: 'session-wrapper',
+      tool_name: 'ExitPlanMode',
+      tool_use_id: 'tool-wrapper',
+      tool_input: { plan: '# Wrapper plan\n\n1. Publish without controlling Claude.' },
+    });
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    const plans = observer.listPlans();
+    observer.close();
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(plans).toEqual([
+      expect.objectContaining({
+        author: 'claude-code-session-wrapper',
+        sourceSessionId: 'session-wrapper',
+        title: 'Wrapper plan',
+      }),
+    ]);
+  });
+
+  it('fails open when the SameTree binary is missing', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    expect(
+      await runClaudePlanHook(repository.root, '/missing/sametree', {
+        hook_event_name: 'PreToolUse',
+        session_id: 'session-missing',
+        tool_name: 'ExitPlanMode',
+        tool_use_id: 'tool-missing',
+        tool_input: { plan: '# Missing binary' },
+      }),
+    ).toEqual({ code: 0, stderr: '', stdout: '' });
+  });
+
+  it('fails open when the SameTree database is locked', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const initialized = Coordinator.open({ cwd: repository.root, agent: 'initializer' });
+    initialized.close();
+    const database = new Database(resolveRepository(repository.root).databasePath);
+    database.exec('BEGIN IMMEDIATE');
+    let result: ProcessResult;
+    try {
+      result = await runClaudePlanHook(repository.root, cliPath, {
+        hook_event_name: 'PreToolUse',
+        session_id: 'session-locked',
+        tool_name: 'ExitPlanMode',
+        tool_use_id: 'tool-locked',
+        tool_input: { plan: '# Locked database' },
+      });
+    } finally {
+      database.exec('ROLLBACK');
+      database.close();
+    }
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    const plans = observer.listPlans();
+    observer.close();
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(plans).toEqual([]);
+  });
+
+  it('fails open within a bounded interval when SameTree hangs', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const hangingBin = path.join(repository.root, 'hanging-sametree.mjs');
+    writeFileSync(hangingBin, 'setInterval(() => undefined, 1_000);\n');
+    const startedAt = Date.now();
+
+    const result = await runClaudePlanHook(repository.root, hangingBin, {
+      hook_event_name: 'PreToolUse',
+      session_id: 'session-hanging',
+      tool_name: 'ExitPlanMode',
+      tool_use_id: 'tool-hanging',
+      tool_input: { plan: '# Hanging binary' },
+    });
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_800);
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
   });
 
   it('grants exactly one of two competing process claims', async () => {

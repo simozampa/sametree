@@ -401,6 +401,7 @@ function assertNoEntityCollisions(source: DatabaseType, target: DatabaseType): v
     ['agents', 'name'],
     ['sessions', 'id'],
     ['tasks', 'id'],
+    ['plans', 'id'],
     ['path_claims', 'id'],
     ['messages', 'id'],
     ['handoffs', 'id'],
@@ -416,6 +417,26 @@ function assertNoEntityCollisions(source: DatabaseType, target: DatabaseType): v
           { identity: row[key], table },
         );
       }
+    }
+  }
+  const planLookup = target.prepare(
+    `SELECT id FROM plans
+     WHERE source_harness = ? AND source_session_id = ?`,
+  );
+  for (const plan of rows(source, 'plans')) {
+    const sourceHarness = String(plan.source_harness);
+    const sourceSessionId = String(plan.source_session_id);
+    const collision = planLookup.get(sourceHarness, sourceSessionId) as { id: string } | undefined;
+    if (collision) {
+      throw new SameTreeError(
+        'WORKSPACE_ERROR',
+        `Cannot import plans: source identity '${sourceHarness}:${sourceSessionId}' already exists.`,
+        {
+          existingPlanId: collision.id,
+          sourceHarness,
+          sourceSessionId,
+        },
+      );
     }
   }
 }
@@ -447,8 +468,8 @@ function copyStandaloneState(
     return false;
   }
 
-  assertNoEntityCollisions(source, target);
   immediateTransaction(target, () => {
+    assertNoEntityCollisions(source, target);
     insertRows(
       target,
       'agents',
@@ -495,6 +516,27 @@ function copyStandaloneState(
       'task_dependencies',
       ['task_id', 'depends_on'],
       rows(source, 'task_dependencies'),
+    );
+    insertRows(
+      target,
+      'plans',
+      [
+        'id',
+        'author',
+        'task_id',
+        'source_harness',
+        'source_session_id',
+        'current_revision',
+        'created_at',
+        'updated_at',
+      ],
+      rows(source, 'plans'),
+    );
+    insertRows(
+      target,
+      'plan_revisions',
+      ['plan_id', 'revision', 'title', 'body', 'content_hash', 'source_event_id', 'created_at'],
+      rows(source, 'plan_revisions'),
     );
     insertRows(
       target,

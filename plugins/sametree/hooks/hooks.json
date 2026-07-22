@@ -1,0 +1,19 @@
+{
+  "description": "Publish proposed Claude Code plans to SameTree before approval.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/publish-plan.mjs"],
+            "timeout": 5,
+            "statusMessage": "Publishing proposed plan to SameTree"
+          }
+        ]
+      }
+    ]
+  }
+}
