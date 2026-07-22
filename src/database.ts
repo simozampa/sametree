@@ -32,7 +32,7 @@ function sqliteBindingError(error: unknown): SameTreeError | null {
   if (!/NODE_MODULE_VERSION|ERR_DLOPEN_FAILED|better_sqlite3\.node/iu.test(cause)) return null;
   return new SameTreeError(
     'DATABASE_ERROR',
-    `SameTree's SQLite binding is incompatible with ${process.version} (ABI ${process.versions.modules ?? 'unknown'}). Reinstall it with the active Node runtime, then run sametree directly instead of bunx: npm install --global sametree@latest --force`,
+    `SameTree's SQLite binding is incompatible with ${process.version} (ABI ${process.versions.modules ?? 'unknown'}). Reinstall it from your normal Node shell, then run sametree directly instead of bunx: npm install --global sametree@latest --force`,
     { cause },
   );
 }

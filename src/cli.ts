@@ -10,6 +10,7 @@ import { diagnoseRepository } from './doctor.js';
 import { errorResult, SameTreeError } from './errors.js';
 import { checkCommitMessage, checkPreCommit, installHooks } from './hooks.js';
 import { initializeProject } from './project.js';
+import { runWithInstallRuntime } from './runtime.js';
 import { setupProject } from './setup.js';
 import type { Harness, PathClaim, TaskPriority, TaskStatus } from './types.js';
 import { VERSION } from './version.js';
@@ -1146,6 +1147,9 @@ hook.command('claude-instruction').action((_options: unknown, command: Command) 
     },
   );
 });
+
+const installRuntimeExitCode = await runWithInstallRuntime();
+if (installRuntimeExitCode !== null) process.exit(installRuntimeExitCode);
 
 program.exitOverride();
 
