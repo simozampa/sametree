@@ -14,6 +14,7 @@ import {
 } from 'jsonc-parser';
 
 import { OPENCODE_PLAN_PLUGIN, OPENCODE_TUI_PLUGIN } from './adapters.js';
+import { assertDatabaseRuntimeCompatible } from './database.js';
 import { SameTreeError } from './errors.js';
 import { writeTextFileAtomic } from './files.js';
 import { resolveRepository } from './git.js';
@@ -116,7 +117,8 @@ interface FileSnapshot {
 interface ClaudePlan {
   addMcp: boolean;
   instructions: FilePlan;
-  marketplaceExists: boolean;
+  marketplaceAction: 'add' | 'existing' | 'rebind';
+  previousMarketplacePath?: string;
   pluginEnabled: boolean;
   pluginExists: boolean;
   pluginVersion?: string;
@@ -285,6 +287,46 @@ function packageRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 }
 
+function jsonFile(target: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(readFileSync(target, 'utf8'));
+    return isRecord(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function isSameTreeMarketplaceDirectory(directory: string): boolean {
+  const manifest = jsonFile(path.join(directory, '.claude-plugin', 'marketplace.json'));
+  if (manifest?.name !== 'sametree' || !Array.isArray(manifest.plugins)) return false;
+  const plugin = manifest.plugins.find(
+    (entry) =>
+      isRecord(entry) && entry.name === 'sametree' && entry.source === './plugins/sametree',
+  );
+  return (
+    isRecord(plugin) && isSameTreePluginDirectory(path.resolve(directory, String(plugin.source)))
+  );
+}
+
+function isSameTreePluginDirectory(directory: string): boolean {
+  const manifest = jsonFile(path.join(directory, '.claude-plugin', 'plugin.json'));
+  return (
+    manifest?.name === 'sametree' && manifest.repository === 'https://github.com/simozampa/sametree'
+  );
+}
+
+function marketplaceUsesPackageRoot(marketplace: Record<string, unknown>): boolean {
+  return (
+    marketplace.source === 'directory' &&
+    typeof marketplace.path === 'string' &&
+    path.resolve(marketplace.path) === packageRoot()
+  );
+}
+
+function marketplaceUsesOfficialGithub(marketplace: Record<string, unknown>): boolean {
+  return marketplace.source === 'github' && marketplace.repo === 'simozampa/sametree';
+}
+
 function preflightClaude(repositoryRoot: string, runner: ClaudeCommandRunner): ClaudePlan {
   const existing = runner(['mcp', 'get', 'sametree'], repositoryRoot);
   if (existing.status === 0 && !validClaudeServer(existing.stdout)) {
@@ -323,23 +365,44 @@ function preflightClaude(repositoryRoot: string, runner: ClaudeCommandRunner): C
     (entry) => entry.id === 'sametree@sametree' && entry.scope === 'user',
   );
   const marketplace = marketplaces.find((entry) => entry.name === 'sametree');
+  const previousMarketplacePath =
+    marketplace?.source === 'directory' && typeof marketplace.path === 'string'
+      ? path.resolve(marketplace.path)
+      : undefined;
+  const recognizedDirectory =
+    previousMarketplacePath !== undefined &&
+    [previousMarketplacePath, marketplace?.installLocation]
+      .filter((entry): entry is string => typeof entry === 'string')
+      .some(isSameTreeMarketplaceDirectory);
+  const recognizedGithub = marketplace !== undefined && marketplaceUsesOfficialGithub(marketplace);
   if (
     marketplace &&
-    !(
-      marketplace.source === 'directory' &&
-      typeof marketplace.path === 'string' &&
-      path.resolve(marketplace.path) === packageRoot()
-    )
+    !marketplaceUsesPackageRoot(marketplace) &&
+    !recognizedDirectory &&
+    !recognizedGithub
   ) {
     throw new SameTreeError(
       'INVALID_INPUT',
       'Claude Code already has an unrelated marketplace named sametree.',
+      {
+        source: marketplace.source,
+        ...(typeof marketplace.path === 'string' ? { path: marketplace.path } : {}),
+        ...(typeof marketplace.repo === 'string' ? { repo: marketplace.repo } : {}),
+      },
     );
   }
+  const marketplaceAction = !marketplace
+    ? 'add'
+    : marketplaceUsesPackageRoot(marketplace) || recognizedGithub
+      ? 'existing'
+      : 'rebind';
 
   return {
     addMcp: existing.status !== 0,
-    marketplaceExists: marketplace !== undefined,
+    marketplaceAction,
+    ...(marketplaceAction === 'rebind' && previousMarketplacePath
+      ? { previousMarketplacePath }
+      : {}),
     pluginExists: plugin !== undefined,
     pluginEnabled: plugin?.enabled === true,
     ...(typeof plugin?.version === 'string' ? { pluginVersion: plugin.version } : {}),
@@ -730,12 +793,50 @@ function configureClaudePlugin(
   runner: ClaudeCommandRunner,
 ): void {
   let enableAttempted = false;
+  let installAttempted = false;
+  let marketplaceChanged = false;
   try {
-    if (!plan.marketplaceExists) {
+    const marketplaces = commandJsonArray(
+      runner(['plugin', 'marketplace', 'list', '--json'], repositoryRoot),
+      'Claude Code marketplaces before setup',
+    );
+    const marketplace = marketplaces.find((entry) => entry.name === 'sametree');
+    const marketplaceUnchanged =
+      (plan.marketplaceAction === 'add' && marketplace === undefined) ||
+      (plan.marketplaceAction === 'existing' &&
+        marketplace !== undefined &&
+        (marketplaceUsesPackageRoot(marketplace) || marketplaceUsesOfficialGithub(marketplace))) ||
+      (plan.marketplaceAction === 'rebind' &&
+        marketplace?.source === 'directory' &&
+        typeof marketplace.path === 'string' &&
+        plan.previousMarketplacePath !== undefined &&
+        path.resolve(marketplace.path) === plan.previousMarketplacePath &&
+        isSameTreeMarketplaceDirectory(plan.previousMarketplacePath));
+    if (!marketplaceUnchanged) {
+      throw new SameTreeError(
+        'INVALID_INPUT',
+        'Claude Code marketplace state changed while SameTree setup was running.',
+      );
+    }
+    if (plan.marketplaceAction !== 'existing') {
       commandSucceeded(
         runner(['plugin', 'marketplace', 'add', '--scope', 'user', packageRoot()], repositoryRoot),
         'Could not add the SameTree Claude Code marketplace.',
       );
+      marketplaceChanged = true;
+      const configuredMarketplaces = commandJsonArray(
+        runner(['plugin', 'marketplace', 'list', '--json'], repositoryRoot),
+        'Claude Code marketplaces after setup',
+      );
+      const configuredMarketplace = configuredMarketplaces.find(
+        (entry) => entry.name === 'sametree',
+      );
+      if (!configuredMarketplace || !marketplaceUsesPackageRoot(configuredMarketplace)) {
+        throw new SameTreeError(
+          'INVALID_INPUT',
+          'The SameTree Claude Code marketplace was not registered from the current package.',
+        );
+      }
     }
 
     if (plan.pluginExists) {
@@ -753,6 +854,7 @@ function configureClaudePlugin(
         );
       }
     } else {
+      installAttempted = true;
       commandSucceeded(
         runner(['plugin', 'install', '--scope', 'user', 'sametree@sametree'], repositoryRoot),
         'Could not install the SameTree Claude Code plugin.',
@@ -820,7 +922,7 @@ function configureClaudePlugin(
         cleanupIssues.push('Claude Code plugin enablement');
       }
     }
-    if (!plan.pluginExists) {
+    if (installAttempted) {
       runner(['plugin', 'uninstall', '--scope', 'user', 'sametree@sametree'], repositoryRoot);
       const listed = runner(['plugin', 'list', '--json'], repositoryRoot);
       let stillInstalled = true;
@@ -839,8 +941,21 @@ function configureClaudePlugin(
         cleanupIssues.push('Claude Code plugin installation');
       }
     }
-    if (!plan.marketplaceExists) {
-      runner(['plugin', 'marketplace', 'remove', 'sametree'], repositoryRoot);
+    if (marketplaceChanged && plan.marketplaceAction === 'add') {
+      const beforeRemoval = runner(['plugin', 'marketplace', 'list', '--json'], repositoryRoot);
+      let ownedRegistration = false;
+      try {
+        const value: unknown = JSON.parse(beforeRemoval.stdout);
+        const current = Array.isArray(value)
+          ? value.find((entry) => isRecord(entry) && entry.name === 'sametree')
+          : undefined;
+        ownedRegistration = isRecord(current) && marketplaceUsesPackageRoot(current);
+      } catch {
+        ownedRegistration = false;
+      }
+      if (ownedRegistration) {
+        runner(['plugin', 'marketplace', 'remove', '--scope', 'user', 'sametree'], repositoryRoot);
+      }
       const listed = runner(['plugin', 'marketplace', 'list', '--json'], repositoryRoot);
       let stillRegistered = true;
       try {
@@ -851,9 +966,49 @@ function configureClaudePlugin(
       } catch {
         stillRegistered = true;
       }
-      if (stillRegistered) {
+      if (!ownedRegistration || stillRegistered) {
         cleanupIssues.push('Claude Code marketplace registration');
       }
+    }
+    if (marketplaceChanged && plan.marketplaceAction === 'rebind') {
+      const beforeRestore = runner(['plugin', 'marketplace', 'list', '--json'], repositoryRoot);
+      let ownedRegistration = false;
+      try {
+        const value: unknown = JSON.parse(beforeRestore.stdout);
+        const current = Array.isArray(value)
+          ? value.find((entry) => isRecord(entry) && entry.name === 'sametree')
+          : undefined;
+        ownedRegistration = isRecord(current) && marketplaceUsesPackageRoot(current);
+      } catch {
+        ownedRegistration = false;
+      }
+      const restored =
+        ownedRegistration && plan.previousMarketplacePath
+          ? runner(
+              ['plugin', 'marketplace', 'add', '--scope', 'user', plan.previousMarketplacePath],
+              repositoryRoot,
+            )
+          : undefined;
+      const listed = runner(['plugin', 'marketplace', 'list', '--json'], repositoryRoot);
+      let restoredPath = false;
+      try {
+        const value: unknown = JSON.parse(listed.stdout);
+        restoredPath =
+          restored?.status === 0 &&
+          Array.isArray(value) &&
+          value.some(
+            (entry) =>
+              isRecord(entry) &&
+              entry.name === 'sametree' &&
+              entry.source === 'directory' &&
+              typeof entry.path === 'string' &&
+              plan.previousMarketplacePath !== undefined &&
+              path.resolve(entry.path) === plan.previousMarketplacePath,
+          );
+      } catch {
+        restoredPath = false;
+      }
+      if (!restoredPath) cleanupIssues.push('Claude Code marketplace source');
     }
     if (cleanupIssues.length > 0) {
       throw new SameTreeError(
@@ -885,6 +1040,7 @@ export function setupProject(
     );
   }
 
+  assertDatabaseRuntimeCompatible();
   const repository = resolveRepository(cwd);
   const runner = options.claudeRunner ?? defaultClaudeRunner;
   const claudePlan = options.claude ? preflightClaude(repository.root, runner) : null;
