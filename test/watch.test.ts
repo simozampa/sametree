@@ -37,6 +37,7 @@ function message(overrides: Partial<Message> = {}): Message {
     taskId: null,
     subject: 'Test message',
     body: 'Please review this.',
+    instruction: null,
     createdAt: Date.UTC(2026, 0, 1, 14, 2, 3),
     readAt: null,
     ...overrides,
@@ -86,6 +87,21 @@ describe('event watch', () => {
     );
 
     expect(formatted).toBe('14:02:03  watch-test: revised plan "Validation plan" (revision 2)');
+  });
+
+  it('formats shared instruction events without printing instruction text', () => {
+    const formatted = formatEvent(
+      event(9, {
+        kind: 'instruction.revised',
+        entityType: 'instruction',
+        entityId: 'instruction-1',
+        payload: { revision: 2 },
+      }),
+    );
+
+    expect(formatted).toBe(
+      '14:02:03  watch-test: revised shared user instruction instruction-1 (revision 2)',
+    );
   });
 
   it('formats current and historical claim payloads without object coercion', () => {
@@ -148,6 +164,31 @@ describe('event watch', () => {
         }),
       ),
     ).toBe('14:02:03  reviewer -> implementer: sent a message');
+  });
+
+  it('renders structurally marked shared instruction notices distinctly', () => {
+    const formatted = formatMessage(
+      message({
+        instruction: {
+          id: 'instruction-1',
+          revision: 2,
+          currentRevision: 2,
+          status: 'active',
+          action: 'revised',
+          taskId: null,
+          createdBy: 'instructor',
+          recordedBy: 'instructor',
+          body: 'For all agents: Preserve exact text.',
+          isCurrent: true,
+        },
+      }),
+    );
+
+    expect(formatted).toContain('SHARED USER INSTRUCTION revised');
+    expect(formatted).toContain('[instruction-1; revision 2]');
+    expect(formatted).toContain('  For all agents: Preserve exact text.');
+    expect(formatted).toContain('retrieve the current revision through SameTree');
+    expect(formatted).not.toContain('sender -> recipient');
   });
 
   it('neutralizes terminal control characters in human-readable output', () => {
@@ -391,6 +432,43 @@ describe('message follow', () => {
     });
     expect(await followMessages(recipient, { once: true })).toBe(0);
     expect(recipient.inbox({ unreadOnly: true }).map((item) => item.id)).toContain(sent.id);
+  });
+
+  it('drops a reserved instruction notice that was superseded before output', async () => {
+    const release = vi.fn();
+    const complete = vi.fn();
+    let reserved = true;
+    const coordinator = {
+      config: { sessionTtlSeconds: 30 },
+      heartbeat: vi.fn(),
+      reserveNextMessageDelivery: () => {
+        if (!reserved) return null;
+        reserved = false;
+        return message({
+          instruction: {
+            id: 'instruction-1',
+            revision: 1,
+            currentRevision: 1,
+            status: 'active',
+            action: 'recorded',
+            taskId: null,
+            createdBy: 'sender',
+            recordedBy: 'sender',
+            body: 'For all agents: Stale text.',
+            isCurrent: true,
+          },
+        });
+      },
+      isMessageDeliveryCurrent: () => false,
+      releaseMessageDelivery: release,
+      completeMessageDelivery: complete,
+    } as unknown as Coordinator;
+    const write = vi.fn();
+
+    expect(await followMessages(coordinator, { once: true, write })).toBe(0);
+    expect(release).toHaveBeenCalledWith('message-1');
+    expect(write).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
   });
 
   it('releases a message for retry when output fails', async () => {

@@ -72,14 +72,25 @@ describe('MCP server', () => {
 
     const tools = await client.listTools();
     const response = await client.callTool({ name: 'sametree_status', arguments: {} });
+    const toolNames = tools.tools.map((tool) => tool.name);
 
-    expect(tools.tools.map((tool) => tool.name)).toEqual(
+    expect(toolNames).toEqual(
       expect.arrayContaining([
         'sametree_claim_acquire',
+        'sametree_instruction_ack',
+        'sametree_instruction_get',
+        'sametree_instruction_list',
         'sametree_plan_publish',
         'sametree_task_force_takeover',
       ]),
     );
+    for (const mutation of [
+      'sametree_instruction_record',
+      'sametree_instruction_revise',
+      'sametree_instruction_revoke',
+    ]) {
+      expect(toolNames).not.toContain(mutation);
+    }
     expect(response.isError).not.toBe(true);
     expect(response.structuredContent).toMatchObject({
       result: {
@@ -131,6 +142,60 @@ describe('MCP server', () => {
     });
     expect(shown.structuredContent).toMatchObject({
       result: { id: plan.result.id, body: expect.stringContaining('Review this proposal.') },
+    });
+  });
+
+  it('reads and acknowledges shared user instructions over MCP', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const author = Coordinator.open({ cwd: repository.root, agent: 'user-recorder' });
+    const instruction = author.recordSharedInstruction({
+      body: 'For all agents: Keep changes narrowly scoped.',
+      reason: 'The user explicitly shared this instruction.',
+      sourceSessionId: 'native-session',
+      sourceEventId: 'native-event',
+      userAuthorized: true,
+    });
+    author.close();
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [mcpPath],
+      cwd: repository.root,
+      env: {
+        ...getDefaultEnvironment(),
+        SAMETREE_AGENT: 'mcp-reader',
+        SAMETREE_HARNESS: 'opencode',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'sametree-test', version: '1.0.0' });
+    clients.push(client);
+    await client.connect(transport);
+
+    const shown = await client.callTool({
+      name: 'sametree_instruction_get',
+      arguments: { instructionId: instruction.id },
+    });
+    const listed = await client.callTool({
+      name: 'sametree_instruction_list',
+      arguments: {},
+    });
+    const acknowledged = await client.callTool({
+      name: 'sametree_instruction_ack',
+      arguments: { instructionId: instruction.id, revision: 1 },
+    });
+
+    expect(shown.structuredContent).toMatchObject({
+      result: {
+        id: instruction.id,
+        body: 'For all agents: Keep changes narrowly scoped.',
+      },
+    });
+    expect(listed.structuredContent).toMatchObject({
+      result: [expect.objectContaining({ id: instruction.id, revision: 1 })],
+    });
+    expect(acknowledged.structuredContent).toMatchObject({
+      result: { instructionId: instruction.id, revision: 1 },
     });
   });
 

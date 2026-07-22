@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node.js 22+](https://img.shields.io/badge/node-%3E%3D22.12-339933.svg)](package.json)
 
-SameTree gives coding agents shared tasks, proposed plans, path claims, messages, handoffs, and policy. It runs locally through MCP, with no daemon, cloud service, or external database service.
+SameTree gives coding agents shared tasks, explicit user instructions, proposed plans, path claims, messages, handoffs, and policy. It runs locally through MCP, with no daemon, cloud service, or external database service.
 
 <p align="center">
   <img src="docs/demo.svg" alt="SameTree setup, task and path ownership, conflict prevention, and agent messaging" width="100%">
@@ -15,6 +15,7 @@ SameTree gives coding agents shared tasks, proposed plans, path claims, messages
 ## Why SameTree
 
 - Keep user-assigned work and agent activity visible in one place.
+- Share an explicit user instruction with active and future agents without copying ordinary prompts.
 - Surface conflicting path claims before cooperative agents edit the same files.
 - Share proposed plans automatically before implementation starts.
 - Deliver peer messages directly to active Claude Code and OpenCode sessions.
@@ -35,7 +36,7 @@ This installs the `sametree` CLI and `sametree-mcp` server.
 
 ## Quick Start
 
-Run setup in every working tree that will launch a harness. Setup installs or updates integrations that inject peer messages and automatically publish proposed Claude Code and OpenCode plans.
+Run setup in every working tree that will launch a harness. Setup installs or updates integrations that inject peer messages, share explicitly prefixed user instructions, and automatically publish proposed Claude Code and OpenCode plans.
 
 ```bash
 cd /path/to/your/project
@@ -45,6 +46,20 @@ git diff
 ```
 
 Review the setup result, the contents of newly created files shown by Git status, and tracked-file diffs before launching agents. Omit `--claude` or `--opencode` when unused. If every agent shares this working tree, skip the optional workspace section.
+
+## Share An Instruction
+
+Begin a Claude Code or OpenCode user prompt with this exact, case-sensitive prefix:
+
+```text
+For all agents: Keep the public API stable while completing assigned work.
+```
+
+SameTree preserves the complete prompt text and shares it as a structurally marked user instruction. Existing agents receive the current revision directly; agents that start later discover it in status and retrieve the exact text. Ordinary prompts, leading-whitespace variants, and differently cased prefixes remain local.
+
+Shared instructions are immutable, revisioned, and acknowledged per agent and revision. Recording, revising, or revoking one requires direct user authorization. An instruction can constrain existing work, but it does not create a task, assign new work, or expand an agent's scope.
+
+Agents can retrieve, list, and acknowledge instructions through MCP. SameTree deliberately does not expose fleet-wide instruction mutation as an MCP tool; use the native exact-prefix flow to record one, or the user-facing CLI/library to record, revise, or revoke one.
 
 ## Optional Workspaces
 
@@ -84,6 +99,7 @@ Automatic OpenCode delivery requires a local TUI process. Attach mode reports th
 ## Coordination Model
 
 - Tasks record work already assigned by the user; they are not a peer-managed queue.
+- Shared instructions are direct user context for existing work; they are distinct from repository policy and never create tasks.
 - Plans are revisioned shared context; publishing one does not assign review or implementation work.
 - Claims identify files an agent intends to edit and reject hard conflicts in the same working tree.
 - Messages and handoffs carry context but never change an agent's scope without user authorization.
@@ -125,7 +141,7 @@ No. Agents can coordinate in the same live checkout when their work is intertwin
 
 ### How do coding agents share context across sessions?
 
-SameTree stores tasks, proposed plans, messages, handoffs, claims, and policy acknowledgements in local SQLite. Its Claude Code and OpenCode adapters publish plans and deliver addressed messages to active sessions.
+SameTree stores tasks, shared user instructions, proposed plans, messages, handoffs, claims, and policy acknowledgements in local SQLite. Its Claude Code and OpenCode adapters capture only exactly prefixed instructions, publish plans, and deliver structured updates to active sessions.
 
 ### Is SameTree a Conductor alternative?
 

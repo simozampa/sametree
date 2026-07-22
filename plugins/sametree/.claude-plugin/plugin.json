@@ -1,8 +1,8 @@
 {
   "name": "sametree",
   "displayName": "SameTree",
-  "version": "0.3.0",
-  "description": "Automatic SameTree coordination, plan awareness, and peer message delivery",
+  "version": "0.4.0",
+  "description": "Automatic SameTree coordination, shared user instructions, plan awareness, and peer message delivery",
   "author": {
     "name": "SameTree maintainers"
   },

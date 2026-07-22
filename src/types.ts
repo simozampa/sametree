@@ -3,6 +3,8 @@ export type TaskStatus = 'ready' | 'in_progress' | 'blocked' | 'done' | 'cancell
 export type TaskPriority = 'low' | 'normal' | 'high' | 'urgent';
 export type ClaimKind = 'exact' | 'tree';
 export type HandoffStatus = 'offered' | 'accepted' | 'rejected' | 'cancelled' | 'expired';
+export type SharedInstructionAction = 'recorded' | 'revised' | 'revoked';
+export type SharedInstructionStatus = 'active' | 'revoked';
 
 export interface Agent {
   name: string;
@@ -77,6 +79,63 @@ export interface Message {
   taskId: string | null;
   createdAt: number;
   readAt: number | null;
+  instruction: SharedInstructionNotice | null;
+}
+
+export interface SharedInstructionNotice {
+  id: string;
+  revision: number;
+  currentRevision: number;
+  status: SharedInstructionStatus;
+  action: SharedInstructionAction;
+  taskId: string | null;
+  createdBy: string;
+  recordedBy: string;
+  body: string | null;
+  isCurrent: boolean;
+}
+
+export interface SharedInstruction {
+  id: string;
+  createdBy: string;
+  taskId: string | null;
+  sourceHarness: Harness;
+  sourceSessionId: string;
+  sourceEventId: string;
+  revision: number;
+  status: SharedInstructionStatus;
+  action: SharedInstructionAction;
+  body: string | null;
+  contentHash: string | null;
+  recordedBy: string;
+  authorizationReason: string;
+  createdAt: number;
+  updatedAt: number;
+  revisionCreatedAt: number;
+  acknowledgedAt: number | null;
+}
+
+export interface SharedInstructionSummary {
+  id: string;
+  createdBy: string;
+  taskId: string | null;
+  sourceHarness: Harness;
+  sourceSessionId: string;
+  revision: number;
+  status: SharedInstructionStatus;
+  action: SharedInstructionAction;
+  recordedBy: string;
+  createdAt: number;
+  updatedAt: number;
+  revisionCreatedAt: number;
+  acknowledgedAt: number | null;
+}
+
+export interface SharedInstructionAcknowledgement {
+  instructionId: string;
+  revision: number;
+  acknowledgedAt: number;
+  newlyAcknowledged: boolean;
 }
 
 export interface Plan {
@@ -186,8 +245,10 @@ export interface CoordinationSnapshot {
   agents: Agent[];
   tasks: Task[];
   plans: PlanSummary[];
+  instructions: SharedInstructionSummary[];
   claims: PathClaim[];
   unreadMessages: number;
+  unacknowledgedInstructions: number;
   pendingHandoffs: number;
   warnings: CoordinationWarning[];
   lastEventSequence: number;

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { Command, Option } from 'commander';
@@ -240,14 +241,21 @@ program
   .description('Show live Git state, active agents, current work, claims, and unread state.')
   .option('--all-agents', 'include inactive registered agents')
   .option('--all-tasks', 'include done and cancelled tasks')
-  .action((options: { allAgents?: boolean; allTasks?: boolean }, command: Command) => {
-    runWithCoordinator(command, (coordinator) =>
-      coordinator.snapshot({
-        includeInactiveAgents: options.allAgents ?? false,
-        includeTerminalTasks: options.allTasks ?? false,
-      }),
-    );
-  });
+  .option('--include-revoked-instructions', 'include revoked shared user instructions')
+  .action(
+    (
+      options: { allAgents?: boolean; allTasks?: boolean; includeRevokedInstructions?: boolean },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.snapshot({
+          includeInactiveAgents: options.allAgents ?? false,
+          includeRevokedInstructions: options.includeRevokedInstructions ?? false,
+          includeTerminalTasks: options.allTasks ?? false,
+        }),
+      );
+    },
+  );
 
 program
   .command('doctor')
@@ -639,6 +647,151 @@ plan
     },
   );
 
+const instruction = program
+  .command('instruction')
+  .description('Record and acknowledge explicit shared user instructions.');
+
+instruction
+  .command('record')
+  .requiredOption('--reason <text>', 'why this operation is directly user-authorized')
+  .requiredOption('--user-authorized', 'confirm direct user authorization')
+  .option('--task <id>', 'related SameTree task scope')
+  .option('--source-session <id>', 'native harness session')
+  .option('--source-event <id>', 'idempotent native event')
+  .option('--body <text>', 'exact instruction text')
+  .option('--body-stdin', 'read exact instruction text from stdin')
+  .action(
+    (
+      options: {
+        body?: string;
+        bodyStdin?: boolean;
+        reason: string;
+        sourceEvent?: string;
+        sourceSession?: string;
+        task?: string;
+        userAuthorized: true;
+      },
+      command: Command,
+    ) => {
+      if ((options.body !== undefined) === Boolean(options.bodyStdin)) {
+        throw new SameTreeError('INVALID_INPUT', 'Provide exactly one of --body or --body-stdin.');
+      }
+      if ((options.sourceSession === undefined) !== (options.sourceEvent === undefined)) {
+        throw new SameTreeError(
+          'INVALID_INPUT',
+          'Provide both --source-session and --source-event, or neither.',
+        );
+      }
+      const body = options.bodyStdin ? readFileSync(0, 'utf8') : (options.body ?? '');
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.recordSharedInstruction({
+          body,
+          reason: options.reason,
+          userAuthorized: options.userAuthorized,
+          ...(options.task !== undefined ? { taskId: options.task } : {}),
+          ...(options.sourceSession !== undefined
+            ? { sourceSessionId: options.sourceSession, sourceEventId: options.sourceEvent }
+            : {}),
+        }),
+      );
+    },
+  );
+
+instruction
+  .command('revise <instruction-id>')
+  .requiredOption('--revision <number>', 'expected current revision', integer)
+  .requiredOption('--reason <text>', 'why this operation is directly user-authorized')
+  .requiredOption('--user-authorized', 'confirm direct user authorization')
+  .option('--body <text>', 'exact replacement instruction text')
+  .option('--body-stdin', 'read exact replacement instruction text from stdin')
+  .action(
+    (
+      instructionId: string,
+      options: {
+        body?: string;
+        bodyStdin?: boolean;
+        reason: string;
+        revision: number;
+        userAuthorized: true;
+      },
+      command: Command,
+    ) => {
+      if ((options.body !== undefined) === Boolean(options.bodyStdin)) {
+        throw new SameTreeError('INVALID_INPUT', 'Provide exactly one of --body or --body-stdin.');
+      }
+      const body = options.bodyStdin ? readFileSync(0, 'utf8') : (options.body ?? '');
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.reviseSharedInstruction(instructionId, {
+          body,
+          expectedRevision: options.revision,
+          reason: options.reason,
+          userAuthorized: options.userAuthorized,
+        }),
+      );
+    },
+  );
+
+instruction
+  .command('revoke <instruction-id>')
+  .requiredOption('--revision <number>', 'expected current revision', integer)
+  .requiredOption('--reason <text>', 'why this operation is directly user-authorized')
+  .requiredOption('--user-authorized', 'confirm direct user authorization')
+  .action(
+    (
+      instructionId: string,
+      options: { reason: string; revision: number; userAuthorized: true },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.revokeSharedInstruction(instructionId, {
+          expectedRevision: options.revision,
+          reason: options.reason,
+          userAuthorized: options.userAuthorized,
+        }),
+      );
+    },
+  );
+
+instruction
+  .command('show <instruction-id>')
+  .option('--revision <number>', 'specific immutable revision', integer)
+  .action((instructionId: string, options: { revision?: number }, command: Command) => {
+    runWithCoordinator(command, (coordinator) =>
+      coordinator.getSharedInstruction(instructionId, options.revision),
+    );
+  });
+
+instruction
+  .command('list')
+  .option('--task <id>', 'filter by related task scope')
+  .option('--after <instruction-id>', 'continue after this instruction cursor')
+  .option('--limit <number>', 'maximum instructions', integer, 25)
+  .option('--include-revoked', 'include revoked instructions')
+  .action(
+    (
+      options: { after?: string; includeRevoked?: boolean; limit: number; task?: string },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.listSharedInstructions({
+          ...(options.after !== undefined ? { after: options.after } : {}),
+          ...(options.task !== undefined ? { taskId: options.task } : {}),
+          includeRevoked: options.includeRevoked ?? false,
+          limit: options.limit,
+        }),
+      );
+    },
+  );
+
+instruction
+  .command('ack <instruction-id>')
+  .requiredOption('--revision <number>', 'exact instruction revision', integer)
+  .action((instructionId: string, options: { revision: number }, command: Command) => {
+    runWithCoordinator(command, (coordinator) =>
+      coordinator.acknowledgeSharedInstruction(instructionId, options.revision),
+    );
+  });
+
 const claim = program.command('claim').description('Coordinate cooperative path leases.');
 
 claim
@@ -947,6 +1100,41 @@ hook.command('claude-plan').action((_options: unknown, command: Command) => {
         body: Reflect.get(toolInput, 'plan'),
         sourceSessionId: sessionId,
         sourceEventId,
+      }),
+    {
+      identity: {
+        agent,
+        harness: 'claude-code',
+        role: process.env.SAMETREE_ROLE ?? 'implementer',
+      },
+      printResult: false,
+    },
+  );
+});
+hook.command('claude-instruction').action((_options: unknown, command: Command) => {
+  const input = objectJson(readFileSync(0, 'utf8'));
+  const prompt = input.prompt;
+  const sessionId = input.session_id;
+  if (
+    input.hook_event_name !== 'UserPromptSubmit' ||
+    typeof prompt !== 'string' ||
+    typeof sessionId !== 'string'
+  ) {
+    throw new SameTreeError('INVALID_INPUT', 'Expected a Claude UserPromptSubmit hook payload.');
+  }
+  if (!prompt.startsWith('For all agents:')) return;
+  const suffix = sessionId.replace(/[^A-Za-z0-9._-]/gu, '-').replace(/^-+|-+$/gu, '');
+  const agent = process.env.SAMETREE_AGENT || `claude-code-${suffix || process.pid}`.slice(0, 80);
+  const sourceEventId = `prompt:${randomUUID()}`;
+  runWithCoordinator(
+    command,
+    (coordinator) =>
+      coordinator.recordSharedInstruction({
+        body: prompt,
+        reason: 'The user used the exact For all agents: prefix in a Claude Code prompt.',
+        sourceSessionId: sessionId,
+        sourceEventId,
+        userAuthorized: true,
       }),
     {
       identity: {

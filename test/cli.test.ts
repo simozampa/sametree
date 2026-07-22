@@ -13,6 +13,9 @@ import { createTestRepository, type TestRepository } from './helpers.js';
 const repositories: TestRepository[] = [];
 const cliPath = path.resolve('dist/cli.js');
 const claudePlanHookPath = path.resolve('plugins/sametree/hooks/publish-plan.mjs');
+const claudeInstructionHookPath = path.resolve(
+  'plugins/sametree/hooks/capture-shared-instruction.mjs',
+);
 
 interface ProcessResult {
   code: number | null;
@@ -53,6 +56,36 @@ function runClaudePlanHook(
 ): Promise<ProcessResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [claudePlanHookPath], {
+      env: {
+        ...process.env,
+        CLAUDE_PROJECT_DIR: root,
+        SAMETREE_AGENT: '',
+        SAMETREE_BIN: sametreeBin,
+        SAMETREE_ROLE: 'implementer',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+    child.stdin.end(JSON.stringify(input));
+    child.once('error', reject);
+    child.once('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function runClaudeInstructionHook(
+  root: string,
+  sametreeBin: string,
+  input: Record<string, unknown>,
+): Promise<ProcessResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [claudeInstructionHookPath], {
       env: {
         ...process.env,
         CLAUDE_PROJECT_DIR: root,
@@ -358,6 +391,224 @@ describe('CLI', () => {
       expect.objectContaining({ id: plan.id, revision: 1, title: 'CLI plan' }),
     ]);
     expect(JSON.parse(shown.stdout)).toMatchObject({ id: plan.id, body: body.trim() });
+  });
+
+  it('records, acknowledges, revises, and revokes shared user instructions', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const body = 'For all agents: Preserve exact whitespace.\n  Including indentation.\n';
+    const recorded = await runCli(
+      repository.root,
+      'instructor',
+      [
+        '--harness',
+        'opencode',
+        'instruction',
+        'record',
+        '--reason',
+        'The user used the explicit shared-instruction prefix.',
+        '--user-authorized',
+        '--source-session',
+        'session-one',
+        '--source-event',
+        'message-one',
+        '--body-stdin',
+      ],
+      body,
+    );
+    const instruction = JSON.parse(recorded.stdout) as { id: string; revision: number };
+    const listed = await runCli(repository.root, 'observer', ['instruction', 'list']);
+    const shown = await runCli(repository.root, 'observer', [
+      'instruction',
+      'show',
+      instruction.id,
+    ]);
+    const acknowledged = await runCli(repository.root, 'observer', [
+      'instruction',
+      'ack',
+      instruction.id,
+      '--revision',
+      '1',
+    ]);
+    const revised = await runCli(repository.root, 'instructor', [
+      'instruction',
+      'revise',
+      instruction.id,
+      '--revision',
+      '1',
+      '--reason',
+      'The user replaced the instruction.',
+      '--user-authorized',
+      '--body',
+      'For all agents: Preserve behavior.',
+    ]);
+    const revoked = await runCli(repository.root, 'instructor', [
+      'instruction',
+      'revoke',
+      instruction.id,
+      '--revision',
+      '2',
+      '--reason',
+      'The user revoked the instruction.',
+      '--user-authorized',
+    ]);
+    const defaultStatus = await runCli(repository.root, 'observer', ['status']);
+    const historicalStatus = await runCli(repository.root, 'observer', [
+      'status',
+      '--include-revoked-instructions',
+    ]);
+
+    expect(recorded).toMatchObject({ code: 0, stderr: '' });
+    expect(instruction.revision).toBe(1);
+    expect(JSON.parse(listed.stdout)).toEqual([
+      expect.objectContaining({ id: instruction.id, acknowledgedAt: null, revision: 1 }),
+    ]);
+    expect(JSON.parse(shown.stdout)).toMatchObject({ id: instruction.id, body });
+    expect(JSON.parse(acknowledged.stdout)).toMatchObject({ newlyAcknowledged: true, revision: 1 });
+    expect(JSON.parse(revised.stdout)).toMatchObject({ revision: 2, status: 'active' });
+    expect(JSON.parse(revoked.stdout)).toMatchObject({ revision: 3, status: 'revoked' });
+    expect(JSON.parse(defaultStatus.stdout).instructions).toEqual([]);
+    expect(JSON.parse(historicalStatus.stdout).instructions).toEqual([
+      expect.objectContaining({ id: instruction.id, revision: 3, status: 'revoked' }),
+    ]);
+  });
+
+  it('requires the explicit authorization flag to record an instruction', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const result = await runCli(repository.root, 'instructor', [
+      'instruction',
+      'record',
+      '--reason',
+      'Missing confirmation.',
+      '--body',
+      'For all agents: Do not record this.',
+    ]);
+
+    expect(result.code).not.toBe(0);
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    expect(observer.listSharedInstructions()).toEqual([]);
+    observer.close();
+  });
+
+  it('captures only exactly prefixed Claude user prompts and preserves their text', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const ordinary = await runCli(
+      repository.root,
+      undefined,
+      ['hook', 'claude-instruction'],
+      JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'session-claude',
+        prompt: 'for all agents: This lowercase prefix must not be captured.',
+      }),
+    );
+    const body = 'For all agents: Run focused tests.\n  Keep this indentation.\n';
+    const explicit = await runCli(
+      repository.root,
+      undefined,
+      ['hook', 'claude-instruction'],
+      JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'session-claude',
+        prompt: body,
+      }),
+    );
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    const instructions = observer.listSharedInstructions();
+    const summary = instructions[0];
+    if (!summary) throw new Error('Expected the Claude hook to record an instruction.');
+    const instruction = observer.getSharedInstruction(summary.id);
+    observer.close();
+
+    expect(ordinary).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(explicit).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(instructions).toHaveLength(1);
+    expect(instruction).toMatchObject({
+      body,
+      createdBy: 'claude-code-session-claude',
+      sourceHarness: 'claude-code',
+      sourceSessionId: 'session-claude',
+    });
+  });
+
+  it('captures an explicit prompt through the fail-open Claude instruction hook', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const result = await runClaudeInstructionHook(repository.root, cliPath, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-wrapper',
+      prompt: 'For all agents: Keep public APIs stable.',
+    });
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    const instructions = observer.listSharedInstructions();
+    observer.close();
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(instructions).toEqual([
+      expect.objectContaining({
+        createdBy: 'claude-code-session-wrapper',
+        sourceSessionId: 'session-wrapper',
+      }),
+    ]);
+  });
+
+  it('fails open for instruction capture when the SameTree binary is missing', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    expect(
+      await runClaudeInstructionHook(repository.root, '/missing/sametree', {
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'session-missing',
+        prompt: 'For all agents: Keep going.',
+      }),
+    ).toEqual({ code: 0, stderr: '', stdout: '' });
+  });
+
+  it('fails open for instruction capture when the SameTree database is locked', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const initialized = Coordinator.open({ cwd: repository.root, agent: 'initializer' });
+    initialized.close();
+    const database = new Database(resolveRepository(repository.root).databasePath);
+    database.exec('BEGIN IMMEDIATE');
+    let result: ProcessResult;
+    try {
+      result = await runClaudeInstructionHook(repository.root, cliPath, {
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'session-locked',
+        prompt: 'For all agents: Keep accepting prompts.',
+      });
+    } finally {
+      database.exec('ROLLBACK');
+      database.close();
+    }
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    const instructions = observer.listSharedInstructions();
+    observer.close();
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(instructions).toEqual([]);
+  });
+
+  it('bounds fail-open instruction capture when SameTree hangs', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const hangingBin = path.join(repository.root, 'hanging-instruction-sametree.mjs');
+    writeFileSync(hangingBin, 'setInterval(() => undefined, 1_000);\n');
+    const startedAt = Date.now();
+
+    const result = await runClaudeInstructionHook(repository.root, hangingBin, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-hanging',
+      prompt: 'For all agents: Keep accepting prompts.',
+    });
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_800);
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
   });
 
   it('publishes an ExitPlanMode payload without writing hook output', async () => {

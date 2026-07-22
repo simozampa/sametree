@@ -77,18 +77,20 @@ server.registerTool(
   {
     title: 'SameTree status',
     description:
-      'Read live Git worktree state, active agents, nonterminal tasks, claims, unread messages, handoffs, and the event cursor. Historical rows are opt-in.',
+      'Read live Git worktree state, active agents, nonterminal tasks, shared user instructions, claims, unread messages, handoffs, and the event cursor. Historical rows are opt-in.',
     inputSchema: {
       includeInactiveAgents: z.boolean().optional(),
+      includeRevokedInstructions: z.boolean().optional(),
       includeTerminalTasks: z.boolean().optional(),
     },
     outputSchema,
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
-  ({ includeInactiveAgents, includeTerminalTasks }) =>
+  ({ includeInactiveAgents, includeRevokedInstructions, includeTerminalTasks }) =>
     execute(() =>
       coordinator.snapshot({
         ...(includeInactiveAgents !== undefined ? { includeInactiveAgents } : {}),
+        ...(includeRevokedInstructions !== undefined ? { includeRevokedInstructions } : {}),
         ...(includeTerminalTasks !== undefined ? { includeTerminalTasks } : {}),
       }),
     ),
@@ -306,6 +308,63 @@ server.registerTool(
         ...(taskId !== undefined ? { taskId } : {}),
       }),
     ),
+);
+
+server.registerTool(
+  'sametree_instruction_get',
+  {
+    title: 'Read a shared user instruction',
+    description: 'Read the current or a specific immutable shared-instruction revision.',
+    inputSchema: {
+      instructionId: z.string(),
+      revision: z.number().int().positive().optional(),
+    },
+    outputSchema,
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  ({ instructionId, revision }) =>
+    execute(() => coordinator.getSharedInstruction(instructionId, revision)),
+);
+
+server.registerTool(
+  'sametree_instruction_list',
+  {
+    title: 'List shared user instructions',
+    description: 'List current active instruction revisions without their full text by default.',
+    inputSchema: {
+      after: z.string().optional(),
+      includeRevoked: z.boolean().optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+      taskId: z.string().optional(),
+    },
+    outputSchema,
+    annotations: { readOnlyHint: true, idempotentHint: true },
+  },
+  ({ after, includeRevoked, limit, taskId }) =>
+    execute(() =>
+      coordinator.listSharedInstructions({
+        ...(after !== undefined ? { after } : {}),
+        ...(includeRevoked !== undefined ? { includeRevoked } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+        ...(taskId !== undefined ? { taskId } : {}),
+      }),
+    ),
+);
+
+server.registerTool(
+  'sametree_instruction_ack',
+  {
+    title: 'Acknowledge a shared user instruction',
+    description: 'Acknowledge that this agent received the exact current instruction revision.',
+    inputSchema: {
+      instructionId: z.string(),
+      revision: z.number().int().positive(),
+    },
+    outputSchema,
+    annotations: { idempotentHint: true },
+  },
+  ({ instructionId, revision }) =>
+    execute(() => coordinator.acknowledgeSharedInstruction(instructionId, revision)),
 );
 
 server.registerTool(

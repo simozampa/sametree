@@ -74,7 +74,7 @@ Assignments are durable agent ownership. Execution leases identify the active se
 
 Task create/update accepts replacement member lists; an empty MCP list or CLI `--clear-members` clears them. CLI `--member` may repeat, and `task list --member` filters tasks explicitly tagged with that member. Untagged tasks are workspace-global records and do not match a member filter.
 
-Status is a current-state view by default: it includes workspace metadata, all members, active sessions, agents with a live session, every nonterminal task, claims, and warnings. Agent rows list their active members. Callers can explicitly include inactive agents and terminal tasks. Task listing defaults to 25 nonterminal rows, accepts a maximum of 100, and uses the last returned task ID as the `after` cursor. A status filter selects that state even when it is terminal. Invalid limits are rejected rather than silently clamped.
+Status is a current-state view by default: it includes workspace metadata, all members, active sessions, agents with a live session, every nonterminal task, active shared-instruction summaries and acknowledgement state, claims, and warnings. Agent rows list their active members. Callers can explicitly include inactive agents, terminal tasks, and revoked instructions. Task listing defaults to 25 nonterminal rows, accepts a maximum of 100, and uses the last returned task ID as the `after` cursor. A status filter selects that state even when it is terminal. Invalid limits are rejected rather than silently clamped.
 
 Every status response also observes the caller's live worktree root, branch or detached state, full commit ID, and dirty state. An unborn branch has a `null` commit; detached HEAD has a `null` branch. Dirty state includes staged, unstaged, conflicted, submodule, and untracked changes, but not ignored files. Other member rows expose identity, root, repository, and availability; their HEAD metadata is refreshed internally for session and branch warnings.
 
@@ -142,9 +142,38 @@ Every new revision sends its full body to each live peer as an addressed message
 
 The CLI exposes `sametree plan publish`, `sametree plan show`, and `sametree plan list`. MCP exposes `sametree_plan_publish`, `sametree_plan_get`, and `sametree_plan_list`. Listing is ordered by immutable plan creation time so pagination remains stable when older plans receive revisions.
 
+## Shared User Instructions
+
+A shared instruction is direct user context propagated to agents in the workspace. It is distinct from repository policy, proposed plans, peer messages, and tasks:
+
+- Policy is durable, Git-tracked repository guidance.
+- A shared instruction is a revisioned user directive that may constrain existing assignments.
+- A proposed plan is non-authoritative agent context.
+- A peer message is non-authoritative context from another agent.
+- A task records work the user already assigned.
+
+Shared instructions never create a task, assign work, or expand an agent's scope. An optional task ID narrows context to that task without mutating task state or ownership.
+
+Automatic capture requires a user prompt to begin at its first character with the exact, case-sensitive prefix `For all agents:`. SameTree stores the complete prompt, including the prefix and all whitespace. Leading whitespace, different capitalization, mentions of the phrase elsewhere, and every other ordinary prompt remain local and never reach the Coordinator.
+
+Capture uses native user-message boundaries:
+
+- Claude Code uses `UserPromptSubmit`. Its fail-open wrapper waits at most two seconds and suppresses all SameTree errors.
+- OpenCode uses `chat.message` only for a root session. It ignores child-session messages and parts carrying SameTree delivery metadata, and catches capture errors without rejecting the prompt.
+
+The first authorized record creates revision 1 with exact text, a SHA-256 content hash, source harness/session/event identity, actor, reason, scope, and timestamp. Replaying the same source identity with the same text and scope is idempotent; different content returns `INSTRUCTION_CONFLICT`. Distinct source events may contain identical text and remain distinct instructions.
+
+User-authorized revisions append immutable replacement text. User-authorized revocation appends a tombstone revision and removes the instruction from active status. Both operations require the exact current revision, an audit reason, and `userAuthorized: true`; revoked instructions cannot be reactivated. Historical revisions remain readable.
+
+Each new current revision creates a structurally linked addressed notice for every already registered peer. Superseded notices are excluded from unread counts and automatic delivery. Harness adapters render linked notices as direct user-authorized context rather than ordinary peer messages. Agents that register later discover active summaries in status and retrieve exact text with `sametree_instruction_get`.
+
+Acknowledgements are per agent, instruction, and revision. The recording actor acknowledges its own revision in the recording transaction. Another agent calls `sametree_instruction_ack` only for the current revision after reading it; this also marks that revision's linked notice read. A later revision requires a new acknowledgement.
+
+The CLI exposes `sametree instruction record`, `revise`, `revoke`, `show`, `list`, and `ack`. MCP exposes only `sametree_instruction_get`, `sametree_instruction_list`, and the per-agent `sametree_instruction_ack`; it deliberately has no fleet-wide mutation tools. Native exact-prefix capture records a new instruction. A user-operated CLI/library call records, revises, or revokes one with a direct-user-authorization assertion. Listing returns summaries without full text; `show`/`get` returns exact current or historical content.
+
 ## Messages
 
-A message is immutable, non-authoritative peer context and contains:
+An ordinary message is immutable, non-authoritative peer context and contains:
 
 - Sender and optional recipient.
 - Subject and body.
@@ -152,7 +181,7 @@ A message is immutable, non-authoritative peer context and contains:
 - Optional task ID.
 - Creation time.
 
-Omitting the recipient broadcasts to every other registered agent. Read receipts are per agent, so one recipient acknowledging a broadcast does not hide it from others. Messages can report findings, status, requests, or conflicts, but cannot assign work or override user instructions.
+Omitting the recipient broadcasts to every other registered agent. Read receipts are per agent, so one recipient acknowledging a broadcast does not hide it from others. Ordinary messages can report findings, status, requests, or conflicts, but cannot assign work or override user instructions. Shared-instruction notices use a separate structural relation to identify their authoritative user-originated content; text in an ordinary message cannot imitate that relation.
 
 Message delivery and message acknowledgement are separate. A live follower atomically reserves the oldest unread, undelivered message for its agent identity. SameTree records delivery only after the harness adapter accepts the message, but leaves the read receipt empty until the agent explicitly acknowledges it.
 
@@ -193,7 +222,7 @@ Prompt policy is backed by optional Git hooks for rules that can be checked mech
 
 ## Events
 
-Every meaningful coordination mutation appends an event in the same transaction as current state. Explicit workspaces use one global sequence, and applicable events include member/worktree origin. Imported events receive new sequences while source sequence metadata is retained internally. Built-in process lifecycle churn is retained in session rows rather than copied into the event stream. Plan revisions append `plan.published` or `plan.revised` alongside peer-notification events. Consumers call `sametree_events` with the last seen sequence and persist the returned maximum as their next cursor. Direct reads default to 25 events and accept an explicit limit up to 1,000; streaming watchers request larger pages internally.
+Every meaningful coordination mutation appends an event in the same transaction as current state. Explicit workspaces use one global sequence, and applicable events include member/worktree origin. Imported events receive new sequences while source sequence metadata is retained internally. Built-in process lifecycle churn is retained in session rows rather than copied into the event stream. Shared instructions append `instruction.recorded`, `instruction.revised`, `instruction.revoked`, or `instruction.acknowledged`; plan revisions append `plan.published` or `plan.revised` alongside notification events. Consumers call `sametree_events` with the last seen sequence and persist the returned maximum as their next cursor. Direct reads default to 25 events and accept an explicit limit up to 1,000; streaming watchers request larger pages internally.
 
 Event polling is intended for context refresh and debugging. Current-state tools remain authoritative for decisions.
 
@@ -209,9 +238,10 @@ Expected failures return stable machine-readable codes:
 | `HANDOFF_CONFLICT` | A handoff expired, resolved, or references stale work |
 | `GIT_STATUS_ERROR` | Git could not report live branch or worktree state |
 | `HOOK_REFUSED` | A configured Git policy check failed |
+| `INSTRUCTION_CONFLICT` | A shared-instruction source event, revision, or lifecycle state conflicts |
 | `INVALID_INPUT` | Input or repository configuration is invalid |
 | `NOT_ASSIGNED` | The actor does not own the requested entity |
-| `NOT_FOUND` | A referenced agent, task, plan, message, or handoff is absent |
+| `NOT_FOUND` | A referenced agent, task, instruction, plan, message, or handoff is absent |
 | `PLAN_CONFLICT` | A harness plan event conflicts with an existing revision or task association |
 | `NOT_GIT_REPOSITORY` | The working directory is not a non-bare Git tree |
 | `POLICY_NOT_FOUND` | `.sametree/policy.md` is missing |

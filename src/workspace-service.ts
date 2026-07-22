@@ -402,6 +402,7 @@ function assertNoEntityCollisions(source: DatabaseType, target: DatabaseType): v
     ['sessions', 'id'],
     ['tasks', 'id'],
     ['plans', 'id'],
+    ['shared_instructions', 'id'],
     ['path_claims', 'id'],
     ['messages', 'id'],
     ['handoffs', 'id'],
@@ -433,6 +434,30 @@ function assertNoEntityCollisions(source: DatabaseType, target: DatabaseType): v
         `Cannot import plans: source identity '${sourceHarness}:${sourceSessionId}' already exists.`,
         {
           existingPlanId: collision.id,
+          sourceHarness,
+          sourceSessionId,
+        },
+      );
+    }
+  }
+  const instructionLookup = target.prepare(
+    `SELECT id FROM shared_instructions
+     WHERE source_harness = ? AND source_session_id = ? AND source_event_id = ?`,
+  );
+  for (const instruction of rows(source, 'shared_instructions')) {
+    const sourceHarness = String(instruction.source_harness);
+    const sourceSessionId = String(instruction.source_session_id);
+    const sourceEventId = String(instruction.source_event_id);
+    const collision = instructionLookup.get(sourceHarness, sourceSessionId, sourceEventId) as
+      | { id: string }
+      | undefined;
+    if (collision) {
+      throw new SameTreeError(
+        'WORKSPACE_ERROR',
+        `Cannot import shared instructions: source identity '${sourceHarness}:${sourceSessionId}:${sourceEventId}' already exists.`,
+        {
+          existingInstructionId: collision.id,
+          sourceEventId,
           sourceHarness,
           sourceSessionId,
         },
@@ -540,6 +565,44 @@ function copyStandaloneState(
     );
     insertRows(
       target,
+      'shared_instructions',
+      [
+        'id',
+        'created_by',
+        'task_id',
+        'source_harness',
+        'source_session_id',
+        'source_event_id',
+        'current_revision',
+        'status',
+        'created_at',
+        'updated_at',
+      ],
+      rows(source, 'shared_instructions'),
+    );
+    insertRows(
+      target,
+      'shared_instruction_revisions',
+      [
+        'instruction_id',
+        'revision',
+        'action',
+        'body',
+        'content_hash',
+        'recorded_by',
+        'authorization_reason',
+        'created_at',
+      ],
+      rows(source, 'shared_instruction_revisions'),
+    );
+    insertRows(
+      target,
+      'shared_instruction_acks',
+      ['instruction_id', 'revision', 'agent_name', 'acknowledged_at'],
+      rows(source, 'shared_instruction_acks'),
+    );
+    insertRows(
+      target,
       'path_claims',
       [
         'id',
@@ -577,6 +640,12 @@ function copyStandaloneState(
       'message_deliveries',
       ['message_id', 'agent_name', 'reserved_by_session', 'reserved_at', 'delivered_at'],
       rows(source, 'message_deliveries'),
+    );
+    insertRows(
+      target,
+      'shared_instruction_notifications',
+      ['message_id', 'instruction_id', 'revision'],
+      rows(source, 'shared_instruction_notifications'),
     );
     insertRows(
       target,
