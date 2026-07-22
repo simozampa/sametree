@@ -32,9 +32,15 @@ const PACKAGE_ROOT = path.resolve('.');
 const repositories: TestRepository[] = [];
 
 function claudePluginCommands(
-  options: { installVersion?: string; pluginVersion?: string; updateVersion?: boolean } = {},
+  options: {
+    installVersion?: string;
+    marketplacePath?: string;
+    pluginVersion?: string;
+    updateVersion?: boolean;
+  } = {},
 ) {
-  let marketplace = options.pluginVersion !== undefined;
+  let marketplace = options.pluginVersion !== undefined || options.marketplacePath !== undefined;
+  let marketplacePath = options.marketplacePath ?? PACKAGE_ROOT;
   let plugin = options.pluginVersion !== undefined;
   let enabled = options.pluginVersion !== undefined;
   let pluginVersion = options.pluginVersion;
@@ -43,7 +49,7 @@ function claudePluginCommands(
       return {
         status: 0,
         stdout: JSON.stringify(
-          marketplace ? [{ name: 'sametree', source: 'directory', path: PACKAGE_ROOT }] : [],
+          marketplace ? [{ name: 'sametree', source: 'directory', path: marketplacePath }] : [],
         ),
         stderr: '',
       };
@@ -53,14 +59,24 @@ function claudePluginCommands(
         status: 0,
         stdout: JSON.stringify(
           plugin
-            ? [{ id: 'sametree@sametree', scope: 'user', enabled, version: pluginVersion }]
+            ? [
+                {
+                  id: 'sametree@sametree',
+                  scope: 'user',
+                  enabled,
+                  version: pluginVersion,
+                },
+              ]
             : [],
         ),
         stderr: '',
       };
     }
     if (args[0] !== 'plugin') return null;
-    if (args[1] === 'marketplace' && args[2] === 'add') marketplace = true;
+    if (args[1] === 'marketplace' && args[2] === 'add') {
+      marketplace = true;
+      marketplacePath = args.at(-1) ?? marketplacePath;
+    }
     if (args[1] === 'marketplace' && args[2] === 'remove') marketplace = false;
     if (args[1] === 'install') {
       plugin = true;
@@ -82,6 +98,26 @@ function setup(): TestRepository {
   const repository = createTestRepository({ initialize: false });
   repositories.push(repository);
   return repository;
+}
+
+function writeSameTreeMarketplace(root: string): void {
+  mkdirSync(path.join(root, '.claude-plugin'), { recursive: true });
+  mkdirSync(path.join(root, 'plugins', 'sametree', '.claude-plugin'), { recursive: true });
+  writeFileSync(
+    path.join(root, '.claude-plugin', 'marketplace.json'),
+    JSON.stringify({
+      name: 'sametree',
+      owner: { name: 'SameTree maintainers' },
+      plugins: [{ name: 'sametree', source: './plugins/sametree' }],
+    }),
+  );
+  writeFileSync(
+    path.join(root, 'plugins', 'sametree', '.claude-plugin', 'plugin.json'),
+    JSON.stringify({
+      name: 'sametree',
+      repository: 'https://github.com/simozampa/sametree',
+    }),
+  );
 }
 
 afterEach(() => {
@@ -529,14 +565,28 @@ Use SameTree before editing: check status, inbox, policy state, and active claim
 
   it('rejects an unrelated Claude marketplace with the SameTree name', () => {
     const repository = setup();
+    const unrelated = path.join(repository.root, 'unrelated-marketplace');
+    mkdirSync(path.join(unrelated, '.claude-plugin'), { recursive: true });
+    mkdirSync(path.join(unrelated, 'plugins', 'sametree', '.claude-plugin'), {
+      recursive: true,
+    });
+    writeFileSync(
+      path.join(unrelated, '.claude-plugin', 'marketplace.json'),
+      JSON.stringify({
+        name: 'sametree',
+        plugins: [{ name: 'sametree', source: './plugins/sametree' }],
+      }),
+    );
+    writeFileSync(
+      path.join(unrelated, 'plugins', 'sametree', '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'sametree', repository: 'https://example.com/unrelated' }),
+    );
     const runner: ClaudeCommandRunner = (args) => {
       if (args[0] === 'mcp') return { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
       if (args.join(' ') === 'plugin marketplace list --json') {
         return {
           status: 0,
-          stdout: JSON.stringify([
-            { name: 'sametree', source: 'directory', path: '/tmp/unrelated' },
-          ]),
+          stdout: JSON.stringify([{ name: 'sametree', source: 'directory', path: unrelated }]),
           stderr: '',
         };
       }
@@ -550,6 +600,100 @@ Use SameTree before editing: check status, inbox, policy state, and active claim
       /unrelated marketplace/u,
     );
     expect(existsSync(path.join(repository.root, '.sametree'))).toBe(false);
+  });
+
+  it('refuses to overwrite marketplace state changed after preflight', () => {
+    const repository = setup();
+    const previousPackage = path.join(repository.root, 'previous-sametree-package');
+    writeSameTreeMarketplace(previousPackage);
+    const calls: string[][] = [];
+    const plugins = claudePluginCommands({
+      marketplacePath: previousPackage,
+      pluginVersion: '0.3.0',
+    });
+    let marketplaceReads = 0;
+    const runner: ClaudeCommandRunner = (args) => {
+      calls.push(args);
+      if (args.join(' ') === 'plugin marketplace list --json') {
+        marketplaceReads += 1;
+        if (marketplaceReads === 2) {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              { name: 'sametree', source: 'directory', path: '/tmp/concurrent-change' },
+            ]),
+            stderr: '',
+          };
+        }
+      }
+      return plugins(args) ?? { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
+    };
+
+    expect(() => setupProject(repository.root, { claude: true, claudeRunner: runner })).toThrow(
+      /marketplace state changed/u,
+    );
+    expect(calls.some((args) => args[1] === 'marketplace' && args[2] === 'add')).toBe(false);
+    expect(existsSync(path.join(repository.root, '.sametree'))).toBe(false);
+  });
+
+  it('does not uninstall a concurrently installed plugin before its own install attempt', () => {
+    const repository = setup();
+    const calls: string[][] = [];
+    let marketplaceReads = 0;
+    const runner: ClaudeCommandRunner = (args) => {
+      calls.push(args);
+      if (args.join(' ') === 'plugin marketplace list --json') {
+        marketplaceReads += 1;
+        return {
+          status: 0,
+          stdout:
+            marketplaceReads === 1
+              ? '[]'
+              : JSON.stringify([
+                  { name: 'sametree', source: 'directory', path: '/tmp/concurrent-change' },
+                ]),
+          stderr: '',
+        };
+      }
+      if (args.join(' ') === 'plugin list --json') {
+        return { status: 0, stdout: '[]', stderr: '' };
+      }
+      return { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
+    };
+
+    expect(() => setupProject(repository.root, { claude: true, claudeRunner: runner })).toThrow(
+      /marketplace state changed/u,
+    );
+    expect(calls.some((args) => args[1] === 'uninstall')).toBe(false);
+    expect(existsSync(path.join(repository.root, '.sametree'))).toBe(false);
+  });
+
+  it('rebinds a genuine SameTree marketplace from an earlier package path', () => {
+    const repository = setup();
+    const previousPackage = path.join(repository.root, 'previous-sametree-package');
+    writeSameTreeMarketplace(previousPackage);
+    const calls: string[][] = [];
+    const plugins = claudePluginCommands({
+      marketplacePath: previousPackage,
+      pluginVersion: '0.3.0',
+    });
+    const runner: ClaudeCommandRunner = (args) => {
+      calls.push(args);
+      return plugins(args) ?? { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
+    };
+
+    expect(setupProject(repository.root, { claude: true, claudeRunner: runner }).claude).toEqual({
+      mcp: 'existing',
+      instructions: 'added',
+      plugin: 'updated',
+    });
+    expect(calls).toContainEqual(['plugin', 'marketplace', 'add', '--scope', 'user', PACKAGE_ROOT]);
+    expect(calls.some((args) => args[2] === 'remove')).toBe(false);
+    expect(setupProject(repository.root, { claude: true, claudeRunner: runner }).claude).toEqual({
+      mcp: 'existing',
+      instructions: 'existing',
+      plugin: 'existing',
+    });
   });
 
   it('removes a newly added Claude marketplace when plugin installation fails', () => {
@@ -590,8 +734,45 @@ Use SameTree before editing: check status, inbox, policy state, and active claim
     expect(() => setupProject(repository.root, { claude: true, claudeRunner: runner })).toThrow(
       /install the SameTree/u,
     );
-    expect(calls).toContainEqual(['plugin', 'marketplace', 'remove', 'sametree']);
+    expect(calls).toContainEqual([
+      'plugin',
+      'marketplace',
+      'remove',
+      '--scope',
+      'user',
+      'sametree',
+    ]);
     expect(marketplace).toBe(false);
+    expect(existsSync(path.join(repository.root, '.sametree'))).toBe(false);
+  });
+
+  it('restores the earlier marketplace source when a rebound plugin update fails', () => {
+    const repository = setup();
+    const previousPackage = path.join(repository.root, 'previous-sametree-package');
+    writeSameTreeMarketplace(previousPackage);
+    const calls: string[][] = [];
+    const plugins = claudePluginCommands({
+      marketplacePath: previousPackage,
+      pluginVersion: '0.3.0',
+      updateVersion: false,
+    });
+    const runner: ClaudeCommandRunner = (args) => {
+      calls.push(args);
+      return plugins(args) ?? { status: 0, stdout: VALID_CLAUDE_SERVER, stderr: '' };
+    };
+
+    expect(() => setupProject(repository.root, { claude: true, claudeRunner: runner })).toThrow(
+      /expected SameTree Claude Code plugin version/u,
+    );
+    expect(calls).toContainEqual(['plugin', 'marketplace', 'add', '--scope', 'user', PACKAGE_ROOT]);
+    expect(calls).toContainEqual([
+      'plugin',
+      'marketplace',
+      'add',
+      '--scope',
+      'user',
+      previousPackage,
+    ]);
     expect(existsSync(path.join(repository.root, '.sametree'))).toBe(false);
   });
 

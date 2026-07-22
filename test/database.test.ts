@@ -5,7 +5,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { openDatabase } from '../src/database.js';
+import { assertDatabaseRuntimeCompatible, openDatabase } from '../src/database.js';
 import { resolveRepository } from '../src/git.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
@@ -16,6 +16,10 @@ afterEach(() => {
 });
 
 describe('database workspace migration', () => {
+  it('loads the SQLite native binding under the active Node runtime', () => {
+    expect(() => assertDatabaseRuntimeCompatible()).not.toThrow();
+  });
+
   it('bounds implicit names for valid repositories with long basenames', () => {
     const parent = createTestRepository({ initialize: false });
     repositories.push(parent);

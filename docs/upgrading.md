@@ -1,5 +1,11 @@
 # Upgrading SameTree
 
+## Upgrade To 0.4.1
+
+Version 0.4.1 fixes Claude Code setup when a genuine SameTree marketplace was registered from another project, package-manager cache, or development checkout. Setup now verifies SameTree marketplace/plugin metadata and safely rebinds that user-global marketplace to the current package path. An unrelated marketplace that merely uses the `sametree` name is still rejected. Setup also checks the SQLite native binding before writing harness configuration and reports an actionable npm reinstall command when the active Node ABI does not match.
+
+There is no database schema change from 0.4.0. Install `sametree@0.4.1` with npm under the Node.js runtime used by Claude Code and OpenCode, then rerun `sametree setup --claude --opencode` directly in each worktree that launches a harness. Do not use `bunx` for SameTree because its native dependency may be installed for a different Node ABI.
+
 ## Upgrade To 0.4.0
 
 Version 0.4.0 adds explicit shared user instructions, immutable revisions and revocation, per-agent revision acknowledgements, structured delivery, and exact-prefix capture for Claude Code and OpenCode. It upgrades coordination databases from schema 5 to schema 6. SameTree 0.3.x cannot read schema 6, so prepare rollback backups before any 0.4 command opens existing state.

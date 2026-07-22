@@ -27,6 +27,32 @@ export interface OpenDatabaseOptions {
   now?: number;
 }
 
+function sqliteBindingError(error: unknown): SameTreeError | null {
+  const cause = error instanceof Error ? error.message : String(error);
+  if (!/NODE_MODULE_VERSION|ERR_DLOPEN_FAILED|better_sqlite3\.node/iu.test(cause)) return null;
+  return new SameTreeError(
+    'DATABASE_ERROR',
+    `SameTree's SQLite binding is incompatible with ${process.version} (ABI ${process.versions.modules ?? 'unknown'}). Reinstall it with the active Node runtime, then run sametree directly instead of bunx: npm install --global sametree@latest --force`,
+    { cause },
+  );
+}
+
+export function assertDatabaseRuntimeCompatible(): void {
+  let database: DatabaseType | undefined;
+  try {
+    database = new Database(':memory:');
+  } catch (error) {
+    throw (
+      sqliteBindingError(error) ??
+      new SameTreeError('DATABASE_ERROR', 'SameTree could not load its SQLite binding.', {
+        cause: error instanceof Error ? error.message : String(error),
+      })
+    );
+  } finally {
+    database?.close();
+  }
+}
+
 function assertNoSymlinkComponents(target: string): void {
   const absolute = path.resolve(target);
   const { root } = path.parse(absolute);
@@ -792,7 +818,12 @@ export function openDatabase(
   mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
   assertDatabasePathSafe(databasePath);
 
-  const database = new Database(databasePath, { timeout: 2_500 });
+  let database: DatabaseType;
+  try {
+    database = new Database(databasePath, { timeout: 2_500 });
+  } catch (error) {
+    throw sqliteBindingError(error) ?? error;
+  }
   try {
     if (databasePath !== ':memory:') chmodSync(databasePath, 0o600);
 
