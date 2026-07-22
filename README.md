@@ -32,7 +32,7 @@ npm install --global sametree
 
 This installs the `sametree` CLI and `sametree-mcp` server.
 
-Use npm under the same Node.js runtime that launches your harnesses. Do not install or run SameTree through `bunx`: SameTree uses a native SQLite binding, and Bun can install a binary for a different Node ABI.
+Use npm from your normal shell under a supported Node.js runtime. SameTree records that exact install runtime and pins its global entrypoints to it so harness-bundled Node versions cannot load the native SQLite binding with a different ABI. Do not install or run SameTree through `bunx`.
 
 > SameTree is pre-1.0 alpha software. Back up important coordination state before upgrades. Stop active agents and read the [upgrade guide](docs/upgrading.md) before opening existing state with a newer SameTree release.
 

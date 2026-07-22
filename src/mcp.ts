@@ -8,8 +8,12 @@ import { z } from 'zod';
 
 import { Coordinator } from './coordinator.js';
 import { errorResult } from './errors.js';
+import { runWithInstallRuntime } from './runtime.js';
 import type { Harness, PathClaim, TaskPriority, TaskStatus } from './types.js';
 import { VERSION } from './version.js';
+
+const installRuntimeExitCode = await runWithInstallRuntime();
+if (installRuntimeExitCode !== null) process.exit(installRuntimeExitCode);
 
 const harness = (process.env.SAMETREE_HARNESS ?? 'other') as Harness;
 const nativeSession =

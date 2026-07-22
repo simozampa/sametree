@@ -1,5 +1,11 @@
 # Upgrading SameTree
 
+## Upgrade To 0.4.2
+
+Version 0.4.2 fixes native SQLite crashes when a harness launches globally installed SameTree with a different Node.js runtime than the one that installed it. This can happen when Claude Code or OpenCode changes `PATH`: the npm bin path still resolves `sametree`, but its `#!/usr/bin/env node` shebang selects the harness runtime. SameTree now records the exact Node executable during npm installation and relaunches both CLI and MCP entrypoints with it before opening SQLite.
+
+There is no database schema change from 0.4.1. From your normal shell, run `npm install --global sametree@0.4.2 --force`, then rerun `sametree setup --claude --opencode` in each worktree and restart the harnesses. Do not run `npm rebuild better-sqlite3` from inside a harness with a different Node runtime: that rewrites the shared global native binding for the harness ABI and breaks other clients.
+
 ## Upgrade To 0.4.1
 
 Version 0.4.1 fixes Claude Code setup when a genuine SameTree marketplace was registered from another project, package-manager cache, or development checkout. Setup now verifies SameTree marketplace/plugin metadata and safely rebinds that user-global marketplace to the current package path. An unrelated marketplace that merely uses the `sametree` name is still rejected. Setup also checks the SQLite native binding before writing harness configuration and reports an actionable npm reinstall command when the active Node ABI does not match.
