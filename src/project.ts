@@ -14,6 +14,7 @@ import {
   LEGACY_INTEGRATION_TEMPLATE,
   LEGACY_POLICY_TEMPLATE,
   LEGACY_REVIEWER_ROLE_TEMPLATE,
+  PLAN_INTEGRATION_TEMPLATE,
   POLICY_TEMPLATE,
   REVIEWER_ROLE_TEMPLATE,
 } from './templates.js';
@@ -39,7 +40,11 @@ export const PROJECT_FILE_TEMPLATES: ReadonlyArray<{
   {
     relativePath: path.join(CONFIG_DIRECTORY, 'coordination.md'),
     content: INTEGRATION_TEMPLATE,
-    legacyContent: [LEGACY_INTEGRATION_TEMPLATE, AWARENESS_INTEGRATION_TEMPLATE],
+    legacyContent: [
+      LEGACY_INTEGRATION_TEMPLATE,
+      AWARENESS_INTEGRATION_TEMPLATE,
+      PLAN_INTEGRATION_TEMPLATE,
+    ],
   },
   {
     relativePath: path.join(CONFIG_DIRECTORY, 'roles', 'implementer.md'),

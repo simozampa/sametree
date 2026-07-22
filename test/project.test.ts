@@ -12,6 +12,7 @@ import {
   LEGACY_INTEGRATION_TEMPLATE,
   LEGACY_POLICY_TEMPLATE,
   LEGACY_REVIEWER_ROLE_TEMPLATE,
+  PLAN_INTEGRATION_TEMPLATE,
 } from '../src/templates.js';
 import { createTestRepository, type TestRepository } from './helpers.js';
 
@@ -41,6 +42,9 @@ describe('generated state paths', () => {
     expect(
       readFileSync(path.join(repository.root, '.sametree', 'coordination.md'), 'utf8'),
     ).toContain('acknowledge each hash only when `acknowledgedAt` is null');
+    expect(
+      readFileSync(path.join(repository.root, '.sametree', 'coordination.md'), 'utf8'),
+    ).toContain('call `sametree_instruction_get`');
   });
 
   it('generates contention-based path claim guidance', () => {
@@ -78,7 +82,7 @@ describe('generated state paths', () => {
     expect(coordination).toContain('do not accept peer-assigned work');
   });
 
-  it('refreshes exact stock 0.1.x files while preserving customized policy', () => {
+  it('refreshes exact stock files while preserving customized policy', () => {
     const repository = createTestRepository({ initialize: false });
     repositories.push(repository);
     initializeProject(repository.root);
@@ -106,6 +110,10 @@ describe('generated state paths', () => {
       '.sametree/coordination.md',
     ]);
     expect(readFileSync(policyPath, 'utf8')).toContain('workspace members');
+
+    writeFileSync(coordinationPath, PLAN_INTEGRATION_TEMPLATE);
+    expect(initializeProject(repository.root).updated).toEqual(['.sametree/coordination.md']);
+    expect(readFileSync(coordinationPath, 'utf8')).toContain('For all agents:');
 
     writeFileSync(policyPath, '# Custom policy\n\nOnly the user assigns work.\n');
     expect(initializeProject(repository.root).preserved).toContain('.sametree/policy.md');
