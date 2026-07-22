@@ -13,6 +13,9 @@ import { createTestRepository, type TestRepository } from './helpers.js';
 const repositories: TestRepository[] = [];
 const cliPath = path.resolve('dist/cli.js');
 const claudePlanHookPath = path.resolve('plugins/sametree/hooks/publish-plan.mjs');
+const claudeInstructionHookPath = path.resolve(
+  'plugins/sametree/hooks/capture-shared-instruction.mjs',
+);
 
 interface ProcessResult {
   code: number | null;
@@ -53,6 +56,36 @@ function runClaudePlanHook(
 ): Promise<ProcessResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [claudePlanHookPath], {
+      env: {
+        ...process.env,
+        CLAUDE_PROJECT_DIR: root,
+        SAMETREE_AGENT: '',
+        SAMETREE_BIN: sametreeBin,
+        SAMETREE_ROLE: 'implementer',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+    child.stdin.end(JSON.stringify(input));
+    child.once('error', reject);
+    child.once('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function runClaudeInstructionHook(
+  root: string,
+  sametreeBin: string,
+  input: Record<string, unknown>,
+): Promise<ProcessResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [claudeInstructionHookPath], {
       env: {
         ...process.env,
         CLAUDE_PROJECT_DIR: root,
@@ -447,6 +480,82 @@ describe('CLI', () => {
     const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
     expect(observer.listSharedInstructions()).toEqual([]);
     observer.close();
+  });
+
+  it('captures only exactly prefixed Claude user prompts and preserves their text', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const ordinary = await runCli(
+      repository.root,
+      undefined,
+      ['hook', 'claude-instruction'],
+      JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'session-claude',
+        prompt: 'for all agents: This lowercase prefix must not be captured.',
+      }),
+    );
+    const body = 'For all agents: Run focused tests.\n  Keep this indentation.\n';
+    const explicit = await runCli(
+      repository.root,
+      undefined,
+      ['hook', 'claude-instruction'],
+      JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'session-claude',
+        prompt: body,
+      }),
+    );
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    const instructions = observer.listSharedInstructions();
+    const summary = instructions[0];
+    if (!summary) throw new Error('Expected the Claude hook to record an instruction.');
+    const instruction = observer.getSharedInstruction(summary.id);
+    observer.close();
+
+    expect(ordinary).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(explicit).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(instructions).toHaveLength(1);
+    expect(instruction).toMatchObject({
+      body,
+      createdBy: 'claude-code-session-claude',
+      sourceHarness: 'claude-code',
+      sourceSessionId: 'session-claude',
+    });
+  });
+
+  it('captures an explicit prompt through the fail-open Claude instruction hook', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const result = await runClaudeInstructionHook(repository.root, cliPath, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-wrapper',
+      prompt: 'For all agents: Keep public APIs stable.',
+    });
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    const instructions = observer.listSharedInstructions();
+    observer.close();
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(instructions).toEqual([
+      expect.objectContaining({
+        createdBy: 'claude-code-session-wrapper',
+        sourceSessionId: 'session-wrapper',
+      }),
+    ]);
+  });
+
+  it('fails open for instruction capture when the SameTree binary is missing', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+
+    expect(
+      await runClaudeInstructionHook(repository.root, '/missing/sametree', {
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'session-missing',
+        prompt: 'For all agents: Keep going.',
+      }),
+    ).toEqual({ code: 0, stderr: '', stdout: '' });
   });
 
   it('publishes an ExitPlanMode payload without writing hook output', async () => {

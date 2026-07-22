@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { Command, Option } from 'commander';
@@ -1092,6 +1093,41 @@ hook.command('claude-plan').action((_options: unknown, command: Command) => {
         body: Reflect.get(toolInput, 'plan'),
         sourceSessionId: sessionId,
         sourceEventId,
+      }),
+    {
+      identity: {
+        agent,
+        harness: 'claude-code',
+        role: process.env.SAMETREE_ROLE ?? 'implementer',
+      },
+      printResult: false,
+    },
+  );
+});
+hook.command('claude-instruction').action((_options: unknown, command: Command) => {
+  const input = objectJson(readFileSync(0, 'utf8'));
+  const prompt = input.prompt;
+  const sessionId = input.session_id;
+  if (
+    input.hook_event_name !== 'UserPromptSubmit' ||
+    typeof prompt !== 'string' ||
+    typeof sessionId !== 'string'
+  ) {
+    throw new SameTreeError('INVALID_INPUT', 'Expected a Claude UserPromptSubmit hook payload.');
+  }
+  if (!prompt.startsWith('For all agents:')) return;
+  const suffix = sessionId.replace(/[^A-Za-z0-9._-]/gu, '-').replace(/^-+|-+$/gu, '');
+  const agent = process.env.SAMETREE_AGENT || `claude-code-${suffix || process.pid}`.slice(0, 80);
+  const sourceEventId = `prompt:${randomUUID()}`;
+  runWithCoordinator(
+    command,
+    (coordinator) =>
+      coordinator.recordSharedInstruction({
+        body: prompt,
+        reason: 'The user used the exact For all agents: prefix in a Claude Code prompt.',
+        sourceSessionId: sessionId,
+        sourceEventId,
+        userAuthorized: true,
       }),
     {
       identity: {

@@ -1,6 +1,19 @@
 {
-  "description": "Publish proposed Claude Code plans to SameTree before approval.",
+  "description": "Share explicit user instructions and proposed Claude Code plans through SameTree.",
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/capture-shared-instruction.mjs"],
+            "timeout": 5,
+            "statusMessage": "Sharing explicit instruction through SameTree"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "ExitPlanMode",

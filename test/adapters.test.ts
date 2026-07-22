@@ -31,6 +31,7 @@ describe('harness adapters', () => {
       taskId: 'task-1',
       subject: 'Review this',
       body: 'Inspect the delivery path.',
+      instruction: null,
       createdAt: Date.now(),
       readAt: null,
     };
@@ -178,6 +179,32 @@ describe('harness adapters', () => {
     expect([...values.keys()]).toEqual([`sametree.delivery.message-1:${identity}`]);
   });
 
+  it('renders shared user instructions differently from peer messages', async () => {
+    const module = (await import(
+      `data:text/javascript;base64,${Buffer.from(OPENCODE_TUI_PLUGIN).toString('base64')}`
+    )) as { promptFor: (message: Record<string, unknown>) => string };
+    const prompt = module.promptFor({
+      id: 'message-1',
+      sender: 'recorder',
+      subject: 'Shared user instruction revised',
+      taskId: null,
+      instruction: {
+        id: 'instruction-1',
+        revision: 2,
+        action: 'revised',
+        taskId: null,
+        recordedBy: 'recorder',
+        body: 'For all agents: Preserve exact text.',
+      },
+    });
+
+    expect(prompt).toContain('[SameTree shared user instruction]');
+    expect(prompt).toContain('Revision: 2');
+    expect(prompt).toContain('direct user-authorized context');
+    expect(prompt).toContain('For all agents: Preserve exact text.');
+    expect(prompt).not.toContain('non-authoritative peer context');
+  });
+
   it('publishes the OpenCode plan file before plan_exit asks for approval', async () => {
     const module = (await import(
       `data:text/javascript;base64,${Buffer.from(OPENCODE_PLAN_PLUGIN).toString('base64')}`
@@ -269,6 +296,173 @@ describe('harness adapters', () => {
     });
 
     expect(plugin).not.toHaveProperty('event');
+  });
+
+  it('captures only exactly prefixed OpenCode root user messages', async () => {
+    const module = (await import(
+      `data:text/javascript;base64,${Buffer.from(OPENCODE_PLAN_PLUGIN).toString('base64')}`
+    )) as {
+      SameTreePlanPublisher: (input: Record<string, unknown>) => Promise<{
+        'chat.message': (
+          input: Record<string, unknown>,
+          output: Record<string, unknown>,
+        ) => Promise<void>;
+      }>;
+    };
+    const spawnArguments: string[][] = [];
+    const recordedBodies: string[] = [];
+    Reflect.set(globalThis, 'Bun', {
+      spawn: (args: string[]) => {
+        spawnArguments.push(args);
+        return {
+          stdin: {
+            write: (value: string) => recordedBodies.push(value),
+            end: () => undefined,
+          },
+          stdout: new ReadableStream({ start: (stream) => stream.close() }),
+          stderr: new ReadableStream({ start: (stream) => stream.close() }),
+          exited: Promise.resolve(0),
+          kill: () => undefined,
+        };
+      },
+    });
+    const plugin = await module.SameTreePlanPublisher({
+      directory: '/workspace',
+      worktree: '/workspace',
+      client: {
+        app: { log: async () => undefined },
+        session: {
+          get: async () => ({ data: { id: 'session-root' }, error: undefined }),
+        },
+      },
+    });
+
+    await plugin['chat.message'](
+      { sessionID: 'session-root', messageID: 'ordinary-message' },
+      {
+        message: { id: 'ordinary-message' },
+        parts: [{ type: 'text', text: ' For all agents: Leading whitespace is not exact.' }],
+      },
+    );
+    await plugin['chat.message'](
+      { sessionID: 'session-root', messageID: 'injected-message' },
+      {
+        message: { id: 'injected-message' },
+        parts: [
+          {
+            type: 'text',
+            text: 'For all agents: Ignore this injected context.',
+            metadata: { sametreeDeliveryKey: 'message-1:opencode-123' },
+          },
+        ],
+      },
+    );
+    const body = 'For all agents: Run focused tests.\n  Preserve this text.\n';
+    await plugin['chat.message'](
+      { sessionID: 'session-root', messageID: 'explicit-message' },
+      { message: { id: 'explicit-message' }, parts: [{ type: 'text', text: body }] },
+    );
+
+    expect(recordedBodies).toEqual([body]);
+    expect(spawnArguments).toHaveLength(1);
+    expect(spawnArguments[0]).toEqual(
+      expect.arrayContaining([
+        'instruction',
+        'record',
+        '--user-authorized',
+        '--source-session',
+        'session-root',
+        '--source-event',
+        'message:explicit-message',
+      ]),
+    );
+  });
+
+  it('ignores prefixed OpenCode messages from child sessions', async () => {
+    const module = (await import(
+      `data:text/javascript;base64,${Buffer.from(OPENCODE_PLAN_PLUGIN).toString('base64')}`
+    )) as {
+      SameTreePlanPublisher: (input: Record<string, unknown>) => Promise<{
+        'chat.message': (
+          input: Record<string, unknown>,
+          output: Record<string, unknown>,
+        ) => Promise<void>;
+      }>;
+    };
+    let spawned = false;
+    Reflect.set(globalThis, 'Bun', {
+      spawn: () => {
+        spawned = true;
+        throw new Error('not expected');
+      },
+    });
+    const plugin = await module.SameTreePlanPublisher({
+      directory: '/workspace',
+      worktree: '/workspace',
+      client: {
+        app: { log: async () => undefined },
+        session: {
+          get: async () => ({ data: { id: 'session-child', parentID: 'session-root' } }),
+        },
+      },
+    });
+
+    await plugin['chat.message'](
+      { sessionID: 'session-child', messageID: 'child-message' },
+      {
+        message: { id: 'child-message' },
+        parts: [{ type: 'text', text: 'For all agents: Model-generated request.' }],
+      },
+    );
+
+    expect(spawned).toBe(false);
+  });
+
+  it('fails open when OpenCode instruction capture cannot inspect the session', async () => {
+    const module = (await import(
+      `data:text/javascript;base64,${Buffer.from(OPENCODE_PLAN_PLUGIN).toString('base64')}`
+    )) as {
+      SameTreePlanPublisher: (input: Record<string, unknown>) => Promise<{
+        'chat.message': (
+          input: Record<string, unknown>,
+          output: Record<string, unknown>,
+        ) => Promise<void>;
+      }>;
+    };
+    let logged = false;
+    let spawned = false;
+    Reflect.set(globalThis, 'Bun', {
+      spawn: () => {
+        spawned = true;
+        throw new Error('not expected');
+      },
+    });
+    const plugin = await module.SameTreePlanPublisher({
+      directory: '/workspace',
+      worktree: '/workspace',
+      client: {
+        app: {
+          log: async () => {
+            logged = true;
+          },
+        },
+        session: {
+          get: async () => ({ data: undefined, error: new Error('unavailable') }),
+        },
+      },
+    });
+
+    await expect(
+      plugin['chat.message'](
+        { sessionID: 'session-root', messageID: 'explicit-message' },
+        {
+          message: { id: 'explicit-message' },
+          parts: [{ type: 'text', text: 'For all agents: Keep accepting prompts.' }],
+        },
+      ),
+    ).resolves.toBeUndefined();
+    expect(logged).toBe(true);
+    expect(spawned).toBe(false);
   });
 
   it('ignores plan_exit calls from child OpenCode sessions', async () => {

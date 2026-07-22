@@ -41,8 +41,22 @@ function delay(milliseconds, signal) {
   })
 }
 
-function promptFor(message) {
+export function promptFor(message) {
   const task = message.taskId ? \`Task: \${message.taskId}\\n\` : ""
+  if (message.instruction) {
+    const instruction = message.instruction
+    const scope = instruction.taskId ? \`Task scope: \${instruction.taskId}\\n\` : "Scope: workspace\\n"
+    const text = instruction.body || "This shared user instruction was revoked."
+    return \`[SameTree shared user instruction]
+Instruction: \${instruction.id}
+Revision: \${instruction.revision}
+Action: \${instruction.action}
+\${scope}Recorded by: \${instruction.recordedBy}
+
+\${text}
+
+This is structurally marked direct user-authorized context, not a peer request. It does not create new work or expand your assigned scope. Acknowledge this exact revision through SameTree after reading it.\`
+  }
   return \`[SameTree message received]
 From: \${message.sender}
 Subject: \${message.subject}
@@ -357,6 +371,72 @@ export const SameTreePlanPublisher = async ({ client, directory, worktree }) => 
     }
   }
 
+  async function recordInstruction(body, sessionID, sourceEventID) {
+    const executable = process.env.SAMETREE_BIN || "sametree"
+    const child = Bun.spawn(
+      [
+        executable,
+        "--cwd",
+        directory,
+        "--agent",
+        agentIdentity(),
+        "--harness",
+        "opencode",
+        "--role",
+        process.env.SAMETREE_ROLE || "implementer",
+        "instruction",
+        "record",
+        "--reason",
+        "The user used the exact For all agents: prefix in an OpenCode prompt.",
+        "--user-authorized",
+        "--source-session",
+        sessionID,
+        "--source-event",
+        "message:" + sourceEventID,
+        "--body-stdin",
+      ],
+      {
+        cwd: directory,
+        env: process.env,
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    )
+    child.stdin.write(body)
+    child.stdin.end()
+    const timer = setTimeout(() => child.kill(), 2_000)
+    const [status, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stderr).text(),
+      new Response(child.stdout).text(),
+    ])
+    clearTimeout(timer)
+    if (status !== 0) {
+      throw new Error(stderr.trim() || "SameTree rejected the shared OpenCode instruction")
+    }
+  }
+
+  async function captureInstruction(input, output) {
+    if (deliveredBySameTree(output.parts || [])) return
+    const body = (output.parts || [])
+      .filter((part) => part.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("")
+    if (!body.startsWith("For all agents:")) return
+    try {
+      const session = await rootSession(input.sessionID)
+      if (!session) return
+      const sourceEventID = input.messageID || output.message?.id
+      if (typeof sourceEventID !== "string") {
+        throw new Error("OpenCode returned no user message ID")
+      }
+      await recordInstruction(body, input.sessionID, sourceEventID)
+    } catch (error) {
+      await logError(error)
+    }
+  }
+
   async function publishPlanFile(sessionID, callID) {
     const session = await rootSession(sessionID)
     if (!session || session.agent !== "plan") return
@@ -398,6 +478,7 @@ export const SameTreePlanPublisher = async ({ client, directory, worktree }) => 
   }
 
   return {
+    "chat.message": captureInstruction,
     "tool.execute.before": async ({ tool, sessionID, callID }) => {
       if (tool !== "plan_exit") return
       await schedule(sessionID, () => publishPlanFile(sessionID, callID))
