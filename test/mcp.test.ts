@@ -76,6 +76,7 @@ describe('MCP server', () => {
     expect(tools.tools.map((tool) => tool.name)).toEqual(
       expect.arrayContaining([
         'sametree_claim_acquire',
+        'sametree_instruction_record',
         'sametree_plan_publish',
         'sametree_task_force_takeover',
       ]),
@@ -131,6 +132,63 @@ describe('MCP server', () => {
     });
     expect(shown.structuredContent).toMatchObject({
       result: { id: plan.result.id, body: expect.stringContaining('Review this proposal.') },
+    });
+  });
+
+  it('manages explicit shared user instructions over MCP', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [mcpPath],
+      cwd: repository.root,
+      env: {
+        ...getDefaultEnvironment(),
+        SAMETREE_AGENT: 'mcp-instructor',
+        SAMETREE_HARNESS: 'opencode',
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'sametree-test', version: '1.0.0' });
+    clients.push(client);
+    await client.connect(transport);
+
+    const recorded = await client.callTool({
+      name: 'sametree_instruction_record',
+      arguments: {
+        body: 'For all agents: Keep changes narrowly scoped.',
+        reason: 'The user explicitly shared this instruction.',
+        userAuthorized: true,
+        sourceSessionId: 'native-session',
+        sourceEventId: 'native-event',
+      },
+    });
+    const instruction = recorded.structuredContent as { result: { id: string } };
+    const shown = await client.callTool({
+      name: 'sametree_instruction_get',
+      arguments: { instructionId: instruction.result.id },
+    });
+    const listed = await client.callTool({
+      name: 'sametree_instruction_list',
+      arguments: {},
+    });
+    const acknowledged = await client.callTool({
+      name: 'sametree_instruction_ack',
+      arguments: { instructionId: instruction.result.id, revision: 1 },
+    });
+
+    expect(recorded.isError).not.toBe(true);
+    expect(shown.structuredContent).toMatchObject({
+      result: {
+        id: instruction.result.id,
+        body: 'For all agents: Keep changes narrowly scoped.',
+      },
+    });
+    expect(listed.structuredContent).toMatchObject({
+      result: [expect.objectContaining({ id: instruction.result.id, revision: 1 })],
+    });
+    expect(acknowledged.structuredContent).toMatchObject({
+      result: { instructionId: instruction.result.id, revision: 1 },
     });
   });
 

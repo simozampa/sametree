@@ -89,6 +89,21 @@ describe('event watch', () => {
     expect(formatted).toBe('14:02:03  watch-test: revised plan "Validation plan" (revision 2)');
   });
 
+  it('formats shared instruction events without printing instruction text', () => {
+    const formatted = formatEvent(
+      event(9, {
+        kind: 'instruction.revised',
+        entityType: 'instruction',
+        entityId: 'instruction-1',
+        payload: { revision: 2 },
+      }),
+    );
+
+    expect(formatted).toBe(
+      '14:02:03  watch-test: revised shared user instruction instruction-1 (revision 2)',
+    );
+  });
+
   it('formats current and historical claim payloads without object coercion', () => {
     const current = formatEvent(
       event(9, {
@@ -149,6 +164,30 @@ describe('event watch', () => {
         }),
       ),
     ).toBe('14:02:03  reviewer -> implementer: sent a message');
+  });
+
+  it('renders structurally marked shared instruction notices distinctly', () => {
+    const formatted = formatMessage(
+      message({
+        instruction: {
+          id: 'instruction-1',
+          revision: 2,
+          currentRevision: 2,
+          status: 'active',
+          action: 'revised',
+          taskId: null,
+          createdBy: 'instructor',
+          recordedBy: 'instructor',
+          body: 'For all agents: Preserve exact text.',
+          isCurrent: true,
+        },
+      }),
+    );
+
+    expect(formatted).toContain('SHARED USER INSTRUCTION revised');
+    expect(formatted).toContain('[instruction-1; revision 2]');
+    expect(formatted).toContain('  For all agents: Preserve exact text.');
+    expect(formatted).not.toContain('sender -> recipient');
   });
 
   it('neutralizes terminal control characters in human-readable output', () => {

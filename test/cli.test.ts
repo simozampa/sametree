@@ -360,6 +360,95 @@ describe('CLI', () => {
     expect(JSON.parse(shown.stdout)).toMatchObject({ id: plan.id, body: body.trim() });
   });
 
+  it('records, acknowledges, revises, and revokes shared user instructions', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const body = 'For all agents: Preserve exact whitespace.\n  Including indentation.\n';
+    const recorded = await runCli(
+      repository.root,
+      'instructor',
+      [
+        '--harness',
+        'opencode',
+        'instruction',
+        'record',
+        '--reason',
+        'The user used the explicit shared-instruction prefix.',
+        '--user-authorized',
+        '--source-session',
+        'session-one',
+        '--source-event',
+        'message-one',
+        '--body-stdin',
+      ],
+      body,
+    );
+    const instruction = JSON.parse(recorded.stdout) as { id: string; revision: number };
+    const listed = await runCli(repository.root, 'observer', ['instruction', 'list']);
+    const shown = await runCli(repository.root, 'observer', [
+      'instruction',
+      'show',
+      instruction.id,
+    ]);
+    const acknowledged = await runCli(repository.root, 'observer', [
+      'instruction',
+      'ack',
+      instruction.id,
+      '--revision',
+      '1',
+    ]);
+    const revised = await runCli(repository.root, 'instructor', [
+      'instruction',
+      'revise',
+      instruction.id,
+      '--revision',
+      '1',
+      '--reason',
+      'The user replaced the instruction.',
+      '--user-authorized',
+      '--body',
+      'For all agents: Preserve behavior.',
+    ]);
+    const revoked = await runCli(repository.root, 'instructor', [
+      'instruction',
+      'revoke',
+      instruction.id,
+      '--revision',
+      '2',
+      '--reason',
+      'The user revoked the instruction.',
+      '--user-authorized',
+    ]);
+
+    expect(recorded).toMatchObject({ code: 0, stderr: '' });
+    expect(instruction.revision).toBe(1);
+    expect(JSON.parse(listed.stdout)).toEqual([
+      expect.objectContaining({ id: instruction.id, acknowledgedAt: null, revision: 1 }),
+    ]);
+    expect(JSON.parse(shown.stdout)).toMatchObject({ id: instruction.id, body });
+    expect(JSON.parse(acknowledged.stdout)).toMatchObject({ newlyAcknowledged: true, revision: 1 });
+    expect(JSON.parse(revised.stdout)).toMatchObject({ revision: 2, status: 'active' });
+    expect(JSON.parse(revoked.stdout)).toMatchObject({ revision: 3, status: 'revoked' });
+  });
+
+  it('requires the explicit authorization flag to record an instruction', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const result = await runCli(repository.root, 'instructor', [
+      'instruction',
+      'record',
+      '--reason',
+      'Missing confirmation.',
+      '--body',
+      'For all agents: Do not record this.',
+    ]);
+
+    expect(result.code).not.toBe(0);
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    expect(observer.listSharedInstructions()).toEqual([]);
+    observer.close();
+  });
+
   it('publishes an ExitPlanMode payload without writing hook output', async () => {
     const repository = createTestRepository();
     repositories.push(repository);

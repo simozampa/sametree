@@ -128,6 +128,14 @@ function eventDescription(event: CoordinationEvent): string {
       return `${event.actor}: published plan "${text(payload.title) || event.entityId}" (revision ${String(payload.revision ?? '')})`;
     case 'plan.revised':
       return `${event.actor}: revised plan "${text(payload.title) || event.entityId}" (revision ${String(payload.revision ?? '')})`;
+    case 'instruction.recorded':
+      return `${event.actor}: recorded shared user instruction ${event.entityId} (revision ${String(payload.revision ?? '')})`;
+    case 'instruction.revised':
+      return `${event.actor}: revised shared user instruction ${event.entityId} (revision ${String(payload.revision ?? '')})`;
+    case 'instruction.revoked':
+      return `${event.actor}: revoked shared user instruction ${event.entityId} (revision ${String(payload.revision ?? '')})`;
+    case 'instruction.acknowledged':
+      return `${event.actor}: acknowledged shared user instruction ${event.entityId} (revision ${String(payload.revision ?? '')})`;
     case 'task.created': {
       const priority = text(payload.priority);
       return `${event.actor}: created task ${taskName(event)}${priority ? ` (${priority} priority)` : ''}`;
@@ -162,6 +170,16 @@ export function formatMessage(message: Message): string {
   const time = new Date(message.createdAt).toISOString();
   const recipient = message.recipient ?? 'broadcast';
   const task = message.taskId ? `; task ${message.taskId}` : '';
+  if (message.instruction) {
+    const instruction = message.instruction;
+    const header = `${time}  SHARED USER INSTRUCTION ${instruction.action}  [${instruction.id}; revision ${instruction.revision}${task}]`;
+    const text = instruction.body ?? 'This shared user instruction was revoked.';
+    const body = text
+      .split('\n')
+      .map((line) => `  ${terminalSafe(line)}`)
+      .join('\n');
+    return `${terminalSafe(header)}\n${body}`;
+  }
   const header = `${time}  ${message.sender} -> ${recipient}  ${message.subject}  [${message.id}; thread ${message.threadId}${task}]`;
   const body = message.body
     .split('\n')
