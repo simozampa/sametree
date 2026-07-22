@@ -59,6 +59,8 @@ SameTree preserves the complete prompt text and shares it as a structurally mark
 
 Shared instructions are immutable, revisioned, and acknowledged per agent and revision. Recording, revising, or revoking one requires direct user authorization. An instruction can constrain existing work, but it does not create a task, assign new work, or expand an agent's scope.
 
+Agents can retrieve, list, and acknowledge instructions through MCP. SameTree deliberately does not expose fleet-wide instruction mutation as an MCP tool; use the native exact-prefix flow to record one, or the user-facing CLI/library to record, revise, or revoke one.
+
 ## Optional Workspaces
 
 Repositories and linked worktrees are isolated by default. To share coordination across them, create a workspace from one member and add the others by workspace name or ID:

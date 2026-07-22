@@ -43,18 +43,6 @@ const coordinator = openCoordinator();
 
 const server = new McpServer({ name: 'sametree', version: VERSION });
 const outputSchema = { result: z.unknown() };
-const instructionRecordSchema = z.object({
-  body: z.string().min(1),
-  reason: z.string().min(1).max(2_000),
-  userAuthorized: z.literal(true),
-  taskId: z.string().optional(),
-  source: z
-    .object({
-      sessionId: z.string().min(1).max(200),
-      eventId: z.string().min(1).max(200),
-    })
-    .optional(),
-});
 
 function result(value: unknown) {
   const structuredContent = { result: value };
@@ -318,79 +306,6 @@ server.registerTool(
         ...(author !== undefined ? { author } : {}),
         ...(limit !== undefined ? { limit } : {}),
         ...(taskId !== undefined ? { taskId } : {}),
-      }),
-    ),
-);
-
-server.registerTool(
-  'sametree_instruction_record',
-  {
-    title: 'Record a shared user instruction',
-    description:
-      'Record exact instruction text only when the user directly authorizes sharing it. This never creates work or expands task scope.',
-    inputSchema: instructionRecordSchema,
-    outputSchema,
-  },
-  ({ body, reason, userAuthorized, taskId, source }) =>
-    execute(() =>
-      coordinator.recordSharedInstruction({
-        body,
-        reason,
-        userAuthorized,
-        ...(taskId !== undefined ? { taskId } : {}),
-        ...(source !== undefined
-          ? { sourceSessionId: source.sessionId, sourceEventId: source.eventId }
-          : {}),
-      }),
-    ),
-);
-
-server.registerTool(
-  'sametree_instruction_revise',
-  {
-    title: 'Revise a shared user instruction',
-    description:
-      'Create an immutable replacement revision only when the user directly authorizes the change.',
-    inputSchema: {
-      instructionId: z.string(),
-      body: z.string().min(1),
-      expectedRevision: z.number().int().positive(),
-      reason: z.string().min(1).max(2_000),
-      userAuthorized: z.literal(true),
-    },
-    outputSchema,
-  },
-  ({ instructionId, body, expectedRevision, reason, userAuthorized }) =>
-    execute(() =>
-      coordinator.reviseSharedInstruction(instructionId, {
-        body,
-        expectedRevision,
-        reason,
-        userAuthorized,
-      }),
-    ),
-);
-
-server.registerTool(
-  'sametree_instruction_revoke',
-  {
-    title: 'Revoke a shared user instruction',
-    description: 'Revoke the current revision only when the user directly authorizes revocation.',
-    inputSchema: {
-      instructionId: z.string(),
-      expectedRevision: z.number().int().positive(),
-      reason: z.string().min(1).max(2_000),
-      userAuthorized: z.literal(true),
-    },
-    outputSchema,
-    annotations: { destructiveHint: true },
-  },
-  ({ instructionId, expectedRevision, reason, userAuthorized }) =>
-    execute(() =>
-      coordinator.revokeSharedInstruction(instructionId, {
-        expectedRevision,
-        reason,
-        userAuthorized,
       }),
     ),
 );

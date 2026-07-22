@@ -169,7 +169,7 @@ Each new current revision creates a structurally linked addressed notice for eve
 
 Acknowledgements are per agent, instruction, and revision. The recording actor acknowledges its own revision in the recording transaction. Another agent calls `sametree_instruction_ack` only for the current revision after reading it; this also marks that revision's linked notice read. A later revision requires a new acknowledgement.
 
-The CLI exposes `sametree instruction record`, `revise`, `revoke`, `show`, `list`, and `ack`. MCP exposes corresponding `sametree_instruction_*` tools. Record, revise, and revoke require an explicit direct-user-authorization assertion. Listing returns summaries without full text; `show`/`get` returns exact current or historical content.
+The CLI exposes `sametree instruction record`, `revise`, `revoke`, `show`, `list`, and `ack`. MCP exposes only `sametree_instruction_get`, `sametree_instruction_list`, and the per-agent `sametree_instruction_ack`; it deliberately has no fleet-wide mutation tools. Native exact-prefix capture records a new instruction. A user-operated CLI/library call records, revises, or revokes one with a direct-user-authorization assertion. Listing returns summaries without full text; `show`/`get` returns exact current or historical content.
 
 ## Messages
 

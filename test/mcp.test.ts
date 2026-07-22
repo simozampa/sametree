@@ -72,25 +72,25 @@ describe('MCP server', () => {
 
     const tools = await client.listTools();
     const response = await client.callTool({ name: 'sametree_status', arguments: {} });
+    const toolNames = tools.tools.map((tool) => tool.name);
 
-    expect(tools.tools.map((tool) => tool.name)).toEqual(
+    expect(toolNames).toEqual(
       expect.arrayContaining([
         'sametree_claim_acquire',
-        'sametree_instruction_record',
+        'sametree_instruction_ack',
+        'sametree_instruction_get',
+        'sametree_instruction_list',
         'sametree_plan_publish',
         'sametree_task_force_takeover',
       ]),
     );
-    expect(
-      tools.tools.find((tool) => tool.name === 'sametree_instruction_record')?.inputSchema,
-    ).toMatchObject({
-      properties: {
-        source: {
-          properties: { eventId: expect.any(Object), sessionId: expect.any(Object) },
-          required: expect.arrayContaining(['eventId', 'sessionId']),
-        },
-      },
-    });
+    for (const mutation of [
+      'sametree_instruction_record',
+      'sametree_instruction_revise',
+      'sametree_instruction_revoke',
+    ]) {
+      expect(toolNames).not.toContain(mutation);
+    }
     expect(response.isError).not.toBe(true);
     expect(response.structuredContent).toMatchObject({
       result: {
@@ -145,16 +145,25 @@ describe('MCP server', () => {
     });
   });
 
-  it('manages explicit shared user instructions over MCP', async () => {
+  it('reads and acknowledges shared user instructions over MCP', async () => {
     const repository = createTestRepository();
     repositories.push(repository);
+    const author = Coordinator.open({ cwd: repository.root, agent: 'user-recorder' });
+    const instruction = author.recordSharedInstruction({
+      body: 'For all agents: Keep changes narrowly scoped.',
+      reason: 'The user explicitly shared this instruction.',
+      sourceSessionId: 'native-session',
+      sourceEventId: 'native-event',
+      userAuthorized: true,
+    });
+    author.close();
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [mcpPath],
       cwd: repository.root,
       env: {
         ...getDefaultEnvironment(),
-        SAMETREE_AGENT: 'mcp-instructor',
+        SAMETREE_AGENT: 'mcp-reader',
         SAMETREE_HARNESS: 'opencode',
       },
       stderr: 'pipe',
@@ -163,19 +172,9 @@ describe('MCP server', () => {
     clients.push(client);
     await client.connect(transport);
 
-    const recorded = await client.callTool({
-      name: 'sametree_instruction_record',
-      arguments: {
-        body: 'For all agents: Keep changes narrowly scoped.',
-        reason: 'The user explicitly shared this instruction.',
-        userAuthorized: true,
-        source: { sessionId: 'native-session', eventId: 'native-event' },
-      },
-    });
-    const instruction = recorded.structuredContent as { result: { id: string } };
     const shown = await client.callTool({
       name: 'sametree_instruction_get',
-      arguments: { instructionId: instruction.result.id },
+      arguments: { instructionId: instruction.id },
     });
     const listed = await client.callTool({
       name: 'sametree_instruction_list',
@@ -183,44 +182,21 @@ describe('MCP server', () => {
     });
     const acknowledged = await client.callTool({
       name: 'sametree_instruction_ack',
-      arguments: { instructionId: instruction.result.id, revision: 1 },
-    });
-    const incompleteSourceIdentity = await client.callTool({
-      name: 'sametree_instruction_record',
-      arguments: {
-        body: 'Do not record an incomplete source identity.',
-        reason: 'Testing source validation.',
-        userAuthorized: true,
-        source: { sessionId: 'native-session-only' },
-      },
-    });
-    const unicodeBoundary = await client.callTool({
-      name: 'sametree_instruction_record',
-      arguments: {
-        body: '😀'.repeat(24_001),
-        reason: 'Testing Unicode scalar validation.',
-        userAuthorized: true,
-      },
+      arguments: { instructionId: instruction.id, revision: 1 },
     });
 
-    expect(recorded.isError).not.toBe(true);
     expect(shown.structuredContent).toMatchObject({
       result: {
-        id: instruction.result.id,
+        id: instruction.id,
         body: 'For all agents: Keep changes narrowly scoped.',
       },
     });
     expect(listed.structuredContent).toMatchObject({
-      result: [expect.objectContaining({ id: instruction.result.id, revision: 1 })],
+      result: [expect.objectContaining({ id: instruction.id, revision: 1 })],
     });
     expect(acknowledged.structuredContent).toMatchObject({
-      result: { instructionId: instruction.result.id, revision: 1 },
+      result: { instructionId: instruction.id, revision: 1 },
     });
-    expect(incompleteSourceIdentity.isError).toBe(true);
-    expect(incompleteSourceIdentity.content).toEqual([
-      expect.objectContaining({ text: expect.stringContaining('eventId') }),
-    ]);
-    expect(unicodeBoundary.isError).not.toBe(true);
   });
 
   it('resolves a shared workspace and home member with a custom registry', async () => {

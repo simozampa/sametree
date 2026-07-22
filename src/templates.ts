@@ -144,7 +144,7 @@ Prefer exact files or the smallest practical tree; broad tree claims can block u
 Harness adapters deliver new messages automatically; do not start a manual inbox polling loop.
 `;
 
-export const INTEGRATION_TEMPLATE = `## SameTree Coordination
+export const INSTRUCTION_MCP_INTEGRATION_TEMPLATE = `## SameTree Coordination
 
 This repository uses SameTree for coordination in a local workspace. The workspace may contain one physical worktree or multiple repository and linked-worktree members.
 
@@ -168,6 +168,11 @@ SameTree claims are cooperative. They do not prevent direct writes, so following
 Prefer exact files or the smallest practical tree; broad tree claims can block unrelated work.
 Harness adapters deliver new messages and shared instructions automatically; do not start a manual inbox polling loop.
 `;
+
+export const INTEGRATION_TEMPLATE = INSTRUCTION_MCP_INTEGRATION_TEMPLATE.replace(
+  '3. Record, revise, or revoke a shared instruction only with direct user authorization. Harnesses automatically record only prompts beginning exactly with the case-sensitive prefix `For all agents:`; ordinary prompts remain local.',
+  '3. MCP is read/list/ack only for shared instructions. Harnesses automatically record a new instruction only from prompts beginning exactly with the case-sensitive prefix `For all agents:`; ordinary prompts remain local. Use a user-operated CLI/library call with direct authorization to revise or revoke one.',
+);
 
 // Exact 0.1.1 defaults allow setup to refresh stock files without overwriting user customizations.
 export const LEGACY_POLICY_TEMPLATE = `# SameTree Collaboration Policy

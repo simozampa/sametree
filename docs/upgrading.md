@@ -12,7 +12,7 @@ Version 0.4.0 adds explicit shared user instructions, immutable revisions and re
 
 Do not run 0.3.x and 0.4 processes against the same database. Schema 6 adds shared instruction, immutable revision, acknowledgement, and structural-notification tables; all schema-5 coordination state and IDs are preserved. Existing workspace imports copy instruction state and reject source-identity or entity-ID collisions.
 
-Automatic capture is deliberately narrow. Only a prompt beginning at its first character with the exact, case-sensitive prefix `For all agents:` is recorded, and the complete prompt text is preserved. Ordinary prompts and near matches remain local. Recording, revising, or revoking through CLI or MCP requires an explicit direct-user-authorization assertion and never creates tasks or expands scope.
+Automatic capture is deliberately narrow. Only a prompt beginning at its first character with the exact, case-sensitive prefix `For all agents:` is recorded, and the complete prompt text is preserved. Ordinary prompts and near matches remain local. MCP exposes only instruction reads and per-agent acknowledgements. User-facing CLI/library mutation requires an explicit direct-user-authorization assertion and never creates tasks or expands scope.
 
 For rollback, stop every 0.4 process, remove the complete schema-6 database set, and restore the exact coherent schema-5 backup before reinstalling 0.3.x. There is no automatic schema downgrade. Rerun the older setup so Claude Code and OpenCode integrations match the restored package; instructions recorded after upgrading are absent from the schema-5 backup.
 

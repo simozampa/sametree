@@ -9,6 +9,7 @@ import { initializeProject } from '../src/project.js';
 import {
   AWARENESS_INTEGRATION_TEMPLATE,
   AWARENESS_POLICY_TEMPLATE,
+  INSTRUCTION_MCP_INTEGRATION_TEMPLATE,
   LEGACY_INTEGRATION_TEMPLATE,
   LEGACY_POLICY_TEMPLATE,
   LEGACY_REVIEWER_ROLE_TEMPLATE,
@@ -45,6 +46,9 @@ describe('generated state paths', () => {
     expect(
       readFileSync(path.join(repository.root, '.sametree', 'coordination.md'), 'utf8'),
     ).toContain('call `sametree_instruction_get`');
+    expect(
+      readFileSync(path.join(repository.root, '.sametree', 'coordination.md'), 'utf8'),
+    ).toContain('MCP is read/list/ack only');
   });
 
   it('generates contention-based path claim guidance', () => {
@@ -114,6 +118,10 @@ describe('generated state paths', () => {
     writeFileSync(coordinationPath, PLAN_INTEGRATION_TEMPLATE);
     expect(initializeProject(repository.root).updated).toEqual(['.sametree/coordination.md']);
     expect(readFileSync(coordinationPath, 'utf8')).toContain('For all agents:');
+
+    writeFileSync(coordinationPath, INSTRUCTION_MCP_INTEGRATION_TEMPLATE);
+    expect(initializeProject(repository.root).updated).toEqual(['.sametree/coordination.md']);
+    expect(readFileSync(coordinationPath, 'utf8')).toContain('MCP is read/list/ack only');
 
     writeFileSync(policyPath, '# Custom policy\n\nOnly the user assigns work.\n');
     expect(initializeProject(repository.root).preserved).toContain('.sametree/policy.md');
