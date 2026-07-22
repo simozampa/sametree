@@ -925,7 +925,7 @@ export class Coordinator {
       .all(this.agentName) as Row[];
     const subject = `Shared user instruction ${action}: ${instructionId}`.slice(0, 200);
     const scope = taskId ? `Task scope: ${taskId}\n` : 'Scope: workspace\n';
-    const notice = `[SameTree shared user instruction]\nInstruction: ${instructionId}\nRevision: ${revision}\nAction: ${action}\n${scope}Recorded by: ${this.agentName}\n\n${body ?? 'This instruction was revoked.'}\n\nThe recording agent asserts direct user authorization. This instruction does not create work or expand your assigned scope.`;
+    const notice = `[SameTree shared user instruction]\nInstruction: ${instructionId}\nRevision: ${revision}\nAction: ${action}\n${scope}Recorded by: ${this.agentName}\n\n${body ?? 'This instruction was revoked.'}\n\nThe recording agent asserts direct user authorization. This instruction does not create work or expand your assigned scope. Before applying this notice, retrieve the current revision through SameTree and ignore this text if the revision is no longer current.`;
     for (const recipientRow of recipients) {
       const recipient = stringValue(recipientRow, 'name');
       const messageId = createId('message');
@@ -2467,6 +2467,12 @@ export class Coordinator {
       ) {
         throw new SameTreeError('NOT_ASSIGNED', `Broadcast '${messageId}' was not sent to you.`);
       }
+      if (nullableString(row, 'instruction_id')) {
+        throw new SameTreeError(
+          'INVALID_INPUT',
+          'Acknowledge a shared-instruction notice with instruction ack and its exact revision.',
+        );
+      }
 
       const readAt = this.#clock();
       this.#database
@@ -2479,6 +2485,21 @@ export class Coordinator {
       this.#recordEvent('message.acknowledged', 'message', messageId);
       return { ...mapMessage(row), readAt };
     });
+  }
+
+  isMessageDeliveryCurrent(messageId: string): boolean {
+    const row = this.#database
+      .prepare(
+        `SELECT notice.revision, instruction.current_revision
+         FROM messages message
+         LEFT JOIN shared_instruction_notifications notice ON notice.message_id = message.id
+         LEFT JOIN shared_instructions instruction ON instruction.id = notice.instruction_id
+         WHERE message.id = ?`,
+      )
+      .get(messageId) as Row | undefined;
+    if (!row) throw new SameTreeError('NOT_FOUND', `Message '${messageId}' does not exist.`);
+    const revision = nullableNumber(row, 'revision');
+    return revision === null || revision === nullableNumber(row, 'current_revision');
   }
 
   offerHandoff(input: {

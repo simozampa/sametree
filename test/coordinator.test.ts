@@ -619,13 +619,19 @@ describe('Coordinator', () => {
     });
     const notice = recipient.inbox({ unreadOnly: true });
     expect(notice).toHaveLength(1);
-    expect(notice[0]?.instruction).toMatchObject({
+    const noticeMessage = notice[0];
+    if (!noticeMessage) throw new Error('Expected instruction notice.');
+    expect(noticeMessage.instruction).toMatchObject({
       id: instruction.id,
       action: 'recorded',
       body,
       isCurrent: true,
       revision: 1,
     });
+    expect(recipient.isMessageDeliveryCurrent(noticeMessage.id)).toBe(true);
+    expect(() => recipient.acknowledgeMessage(noticeMessage.id)).toThrowError(
+      expect.objectContaining({ code: 'INVALID_INPUT' }),
+    );
     expect(recipient.acknowledgeSharedInstruction(instruction.id, 1)).toMatchObject({
       newlyAcknowledged: true,
       revision: 1,
@@ -649,6 +655,8 @@ describe('Coordinator', () => {
       reason: 'Direct user instruction.',
       userAuthorized: true,
     });
+    const originalNotice = recipient.inbox({ unreadOnly: true })[0];
+    if (!originalNotice) throw new Error('Expected original instruction notice.');
     now = 2_000;
     const revised = author.reviseSharedInstruction(instruction.id, {
       body: 'Commit every completed logical change.',
@@ -658,6 +666,7 @@ describe('Coordinator', () => {
     });
 
     expect(revised).toMatchObject({ action: 'revised', revision: 2, status: 'active' });
+    expect(recipient.isMessageDeliveryCurrent(originalNotice.id)).toBe(false);
     expect(author.getSharedInstruction(instruction.id, 1)).toMatchObject({
       action: 'recorded',
       body: 'Commit every completed change.',

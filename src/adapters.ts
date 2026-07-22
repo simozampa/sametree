@@ -55,7 +55,7 @@ Action: \${instruction.action}
 
 \${text}
 
-This is structurally marked direct user-authorized context, not a peer request. It does not create new work or expand your assigned scope. Acknowledge this exact revision through SameTree after reading it.\`
+This is structurally marked direct user-authorized context, not a peer request. It does not create new work or expand your assigned scope. Before applying it, retrieve the current revision through SameTree; acknowledge that exact revision after reading it.\`
   }
   return \`[SameTree message received]
 From: \${message.sender}
@@ -92,6 +92,9 @@ export default {
     }
     const signal = api.lifecycle.signal
     const directory = api.state.path.directory || process.cwd()
+    const executable = process.env.SAMETREE_BIN || "sametree"
+    const identity = process.env.SAMETREE_AGENT ||
+      \`opencode-\${process.env.OPENCODE_PID || process.pid}\`
     let child
 
     api.lifecycle.onDispose(() => {
@@ -225,10 +228,46 @@ export default {
       throw new Error("OpenCode stopped before the SameTree message was persisted")
     }
 
+    async function instructionIsCurrent(message) {
+      if (!message.instruction) return true
+      const check = Bun.spawn(
+        [
+          executable,
+          "--cwd",
+          directory,
+          "--agent",
+          identity,
+          "--harness",
+          "opencode",
+          "instruction",
+          "show",
+          message.instruction.id,
+        ],
+        {
+          cwd: directory,
+          env: process.env,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      )
+      const [status, stdout, stderr] = await Promise.all([
+        check.exited,
+        new Response(check.stdout).text(),
+        new Response(check.stderr).text(),
+      ])
+      if (status !== 0) {
+        throw new Error(stderr.trim() || "Could not validate the SameTree instruction revision")
+      }
+      const current = JSON.parse(stdout)
+      return (
+        current.id === message.instruction.id &&
+        current.revision === message.instruction.revision &&
+        current.status === message.instruction.status
+      )
+    }
+
     async function follow() {
-      const executable = process.env.SAMETREE_BIN || "sametree"
-      const identity = process.env.SAMETREE_AGENT ||
-        \`opencode-\${process.env.OPENCODE_PID || process.pid}\`
       while (!signal.aborted) {
         try {
           child = Bun.spawn(
@@ -263,6 +302,11 @@ export default {
             for (const line of lines) {
               if (!line) continue
               const message = JSON.parse(line)
+              if (!(await instructionIsCurrent(message))) {
+                child.stdin.write(\`\${message.id}\\n\`)
+                await child.stdin.flush()
+                continue
+              }
               await inject(message, \`\${message.id}:\${identity}\`)
               child.stdin.write(\`\${message.id}\\n\`)
               await child.stdin.flush()
@@ -405,22 +449,35 @@ export const SameTreePlanPublisher = async ({ client, directory, worktree }) => 
     )
     child.stdin.write(body)
     child.stdin.end()
-    const timer = setTimeout(() => child.kill(), 2_000)
-    const [status, stderr] = await Promise.all([
+    let timer
+    const completed = Promise.all([
       child.exited,
       new Response(child.stderr).text(),
       new Response(child.stdout).text(),
-    ])
+    ]).then(([status, stderr]) => ({ status, stderr }))
+    const timedOut = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        try {
+          child.kill()
+        } catch {}
+        resolve(null)
+      }, 2_000)
+    })
+    const result = await Promise.race([completed, timedOut])
     clearTimeout(timer)
-    if (status !== 0) {
-      throw new Error(stderr.trim() || "SameTree rejected the shared OpenCode instruction")
+    if (!result) return
+    if (result.status !== 0) {
+      throw new Error(result.stderr.trim() || "SameTree rejected the shared OpenCode instruction")
     }
   }
 
   async function captureInstruction(input, output) {
     if (deliveredBySameTree(output.parts || [])) return
     const body = (output.parts || [])
-      .filter((part) => part.type === "text" && typeof part.text === "string")
+      .filter(
+        (part) =>
+          part.type === "text" && typeof part.text === "string" && part.synthetic !== true,
+      )
       .map((part) => part.text)
       .join("")
     if (!body.startsWith("For all agents:")) return
@@ -433,7 +490,7 @@ export const SameTreePlanPublisher = async ({ client, directory, worktree }) => 
       }
       await recordInstruction(body, input.sessionID, sourceEventID)
     } catch (error) {
-      await logError(error)
+      void logError(error)
     }
   }
 

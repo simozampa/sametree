@@ -241,14 +241,21 @@ program
   .description('Show live Git state, active agents, current work, claims, and unread state.')
   .option('--all-agents', 'include inactive registered agents')
   .option('--all-tasks', 'include done and cancelled tasks')
-  .action((options: { allAgents?: boolean; allTasks?: boolean }, command: Command) => {
-    runWithCoordinator(command, (coordinator) =>
-      coordinator.snapshot({
-        includeInactiveAgents: options.allAgents ?? false,
-        includeTerminalTasks: options.allTasks ?? false,
-      }),
-    );
-  });
+  .option('--include-revoked-instructions', 'include revoked shared user instructions')
+  .action(
+    (
+      options: { allAgents?: boolean; allTasks?: boolean; includeRevokedInstructions?: boolean },
+      command: Command,
+    ) => {
+      runWithCoordinator(command, (coordinator) =>
+        coordinator.snapshot({
+          includeInactiveAgents: options.allAgents ?? false,
+          includeRevokedInstructions: options.includeRevokedInstructions ?? false,
+          includeTerminalTasks: options.allTasks ?? false,
+        }),
+      );
+    },
+  );
 
 program
   .command('doctor')

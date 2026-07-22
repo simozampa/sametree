@@ -178,7 +178,10 @@ export function formatMessage(message: Message): string {
       .split('\n')
       .map((line) => `  ${terminalSafe(line)}`)
       .join('\n');
-    return `${terminalSafe(header)}\n${body}`;
+    const warning = terminalSafe(
+      '  Before applying this notice, retrieve the current revision through SameTree and ignore this text if the revision is no longer current.',
+    );
+    return `${terminalSafe(header)}\n${body}\n${warning}`;
   }
   const header = `${time}  ${message.sender} -> ${recipient}  ${message.subject}  [${message.id}; thread ${message.threadId}${task}]`;
   const body = message.body
@@ -306,6 +309,11 @@ export async function followMessages(
       reserved = coordinator.reserveNextMessageDelivery();
       if (reserved) {
         const message = reserved;
+        if (!coordinator.isMessageDeliveryCurrent(message.id)) {
+          coordinator.releaseMessageDelivery(message.id);
+          reserved = null;
+          continue;
+        }
         try {
           const result = await Promise.race([
             Promise.resolve()

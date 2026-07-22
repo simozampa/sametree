@@ -452,6 +452,11 @@ describe('CLI', () => {
       'The user revoked the instruction.',
       '--user-authorized',
     ]);
+    const defaultStatus = await runCli(repository.root, 'observer', ['status']);
+    const historicalStatus = await runCli(repository.root, 'observer', [
+      'status',
+      '--include-revoked-instructions',
+    ]);
 
     expect(recorded).toMatchObject({ code: 0, stderr: '' });
     expect(instruction.revision).toBe(1);
@@ -462,6 +467,10 @@ describe('CLI', () => {
     expect(JSON.parse(acknowledged.stdout)).toMatchObject({ newlyAcknowledged: true, revision: 1 });
     expect(JSON.parse(revised.stdout)).toMatchObject({ revision: 2, status: 'active' });
     expect(JSON.parse(revoked.stdout)).toMatchObject({ revision: 3, status: 'revoked' });
+    expect(JSON.parse(defaultStatus.stdout).instructions).toEqual([]);
+    expect(JSON.parse(historicalStatus.stdout).instructions).toEqual([
+      expect.objectContaining({ id: instruction.id, revision: 3, status: 'revoked' }),
+    ]);
   });
 
   it('requires the explicit authorization flag to record an instruction', async () => {
@@ -556,6 +565,50 @@ describe('CLI', () => {
         prompt: 'For all agents: Keep going.',
       }),
     ).toEqual({ code: 0, stderr: '', stdout: '' });
+  });
+
+  it('fails open for instruction capture when the SameTree database is locked', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const initialized = Coordinator.open({ cwd: repository.root, agent: 'initializer' });
+    initialized.close();
+    const database = new Database(resolveRepository(repository.root).databasePath);
+    database.exec('BEGIN IMMEDIATE');
+    let result: ProcessResult;
+    try {
+      result = await runClaudeInstructionHook(repository.root, cliPath, {
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'session-locked',
+        prompt: 'For all agents: Keep accepting prompts.',
+      });
+    } finally {
+      database.exec('ROLLBACK');
+      database.close();
+    }
+    const observer = Coordinator.open({ cwd: repository.root, agent: 'observer' });
+    const instructions = observer.listSharedInstructions();
+    observer.close();
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(instructions).toEqual([]);
+  });
+
+  it('bounds fail-open instruction capture when SameTree hangs', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const hangingBin = path.join(repository.root, 'hanging-instruction-sametree.mjs');
+    writeFileSync(hangingBin, 'setInterval(() => undefined, 1_000);\n');
+    const startedAt = Date.now();
+
+    const result = await runClaudeInstructionHook(repository.root, hangingBin, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'session-hanging',
+      prompt: 'For all agents: Keep accepting prompts.',
+    });
+
+    expect(result).toEqual({ code: 0, stderr: '', stdout: '' });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_800);
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
   });
 
   it('publishes an ExitPlanMode payload without writing hook output', async () => {

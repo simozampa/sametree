@@ -81,6 +81,16 @@ describe('MCP server', () => {
         'sametree_task_force_takeover',
       ]),
     );
+    expect(
+      tools.tools.find((tool) => tool.name === 'sametree_instruction_record')?.inputSchema,
+    ).toMatchObject({
+      properties: {
+        source: {
+          properties: { eventId: expect.any(Object), sessionId: expect.any(Object) },
+          required: expect.arrayContaining(['eventId', 'sessionId']),
+        },
+      },
+    });
     expect(response.isError).not.toBe(true);
     expect(response.structuredContent).toMatchObject({
       result: {
@@ -159,8 +169,7 @@ describe('MCP server', () => {
         body: 'For all agents: Keep changes narrowly scoped.',
         reason: 'The user explicitly shared this instruction.',
         userAuthorized: true,
-        sourceSessionId: 'native-session',
-        sourceEventId: 'native-event',
+        source: { sessionId: 'native-session', eventId: 'native-event' },
       },
     });
     const instruction = recorded.structuredContent as { result: { id: string } };
@@ -176,6 +185,23 @@ describe('MCP server', () => {
       name: 'sametree_instruction_ack',
       arguments: { instructionId: instruction.result.id, revision: 1 },
     });
+    const incompleteSourceIdentity = await client.callTool({
+      name: 'sametree_instruction_record',
+      arguments: {
+        body: 'Do not record an incomplete source identity.',
+        reason: 'Testing source validation.',
+        userAuthorized: true,
+        source: { sessionId: 'native-session-only' },
+      },
+    });
+    const unicodeBoundary = await client.callTool({
+      name: 'sametree_instruction_record',
+      arguments: {
+        body: '😀'.repeat(24_001),
+        reason: 'Testing Unicode scalar validation.',
+        userAuthorized: true,
+      },
+    });
 
     expect(recorded.isError).not.toBe(true);
     expect(shown.structuredContent).toMatchObject({
@@ -190,6 +216,11 @@ describe('MCP server', () => {
     expect(acknowledged.structuredContent).toMatchObject({
       result: { instructionId: instruction.result.id, revision: 1 },
     });
+    expect(incompleteSourceIdentity.isError).toBe(true);
+    expect(incompleteSourceIdentity.content).toEqual([
+      expect.objectContaining({ text: expect.stringContaining('eventId') }),
+    ]);
+    expect(unicodeBoundary.isError).not.toBe(true);
   });
 
   it('resolves a shared workspace and home member with a custom registry', async () => {

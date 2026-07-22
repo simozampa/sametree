@@ -187,6 +187,7 @@ describe('event watch', () => {
     expect(formatted).toContain('SHARED USER INSTRUCTION revised');
     expect(formatted).toContain('[instruction-1; revision 2]');
     expect(formatted).toContain('  For all agents: Preserve exact text.');
+    expect(formatted).toContain('retrieve the current revision through SameTree');
     expect(formatted).not.toContain('sender -> recipient');
   });
 
@@ -431,6 +432,43 @@ describe('message follow', () => {
     });
     expect(await followMessages(recipient, { once: true })).toBe(0);
     expect(recipient.inbox({ unreadOnly: true }).map((item) => item.id)).toContain(sent.id);
+  });
+
+  it('drops a reserved instruction notice that was superseded before output', async () => {
+    const release = vi.fn();
+    const complete = vi.fn();
+    let reserved = true;
+    const coordinator = {
+      config: { sessionTtlSeconds: 30 },
+      heartbeat: vi.fn(),
+      reserveNextMessageDelivery: () => {
+        if (!reserved) return null;
+        reserved = false;
+        return message({
+          instruction: {
+            id: 'instruction-1',
+            revision: 1,
+            currentRevision: 1,
+            status: 'active',
+            action: 'recorded',
+            taskId: null,
+            createdBy: 'sender',
+            recordedBy: 'sender',
+            body: 'For all agents: Stale text.',
+            isCurrent: true,
+          },
+        });
+      },
+      isMessageDeliveryCurrent: () => false,
+      releaseMessageDelivery: release,
+      completeMessageDelivery: complete,
+    } as unknown as Coordinator;
+    const write = vi.fn();
+
+    expect(await followMessages(coordinator, { once: true, write })).toBe(0);
+    expect(release).toHaveBeenCalledWith('message-1');
+    expect(write).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
   });
 
   it('releases a message for retry when output fails', async () => {
