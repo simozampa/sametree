@@ -8,6 +8,7 @@ import { SameTreeError } from './errors.js';
 import type { RepositoryContext } from './git.js';
 
 const MINIMUM_SQLITE_VERSION = '3.51.3';
+export const DATABASE_BUSY_TIMEOUT_MS = 10_000;
 const WAL_RETRY_ATTEMPTS = 20;
 const WAL_RETRY_DELAY_MS = 25;
 
@@ -379,7 +380,23 @@ function compareVersions(left: string, right: string): number {
 
 function isBusy(error: unknown): boolean {
   const code = error instanceof Error ? Reflect.get(error, 'code') : undefined;
-  return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED';
+  return (
+    typeof code === 'string' &&
+    (code === 'SQLITE_BUSY' ||
+      code.startsWith('SQLITE_BUSY_') ||
+      code === 'SQLITE_LOCKED' ||
+      code.startsWith('SQLITE_LOCKED_'))
+  );
+}
+
+function databaseContentionError(error: unknown): SameTreeError | null {
+  return isBusy(error)
+    ? new SameTreeError(
+        'DATABASE_ERROR',
+        'SameTree database remained locked while waiting for another writer.',
+        { cause: error instanceof Error ? error.message : String(error) },
+      )
+    : null;
 }
 
 function sleep(milliseconds: number): void {
@@ -737,7 +754,7 @@ function migrate(
   now: number,
   member?: DatabaseMemberContext,
 ): void {
-  database.exec('BEGIN IMMEDIATE');
+  beginImmediate(database);
   try {
     database.exec(
       'CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT',
@@ -820,7 +837,7 @@ export function openDatabase(
 
   let database: DatabaseType;
   try {
-    database = new Database(databasePath, { timeout: 2_500 });
+    database = new Database(databasePath, { timeout: DATABASE_BUSY_TIMEOUT_MS });
   } catch (error) {
     throw sqliteBindingError(error) ?? error;
   }
@@ -831,7 +848,7 @@ export function openDatabase(
     database.pragma('busy_timeout = 100');
     database.pragma('foreign_keys = ON');
     if (persistentDatabase) enableWal(database);
-    database.pragma('busy_timeout = 2500');
+    database.pragma(`busy_timeout = ${DATABASE_BUSY_TIMEOUT_MS}`);
     database.pragma('synchronous = FULL');
     database.pragma('trusted_schema = OFF');
     database.pragma('cell_size_check = ON');
@@ -854,7 +871,7 @@ export function openDatabase(
     return database;
   } catch (error) {
     database.close();
-    throw error;
+    throw databaseContentionError(error) ?? error;
   }
 }
 
@@ -875,5 +892,17 @@ export function databaseWorktreeId(database: DatabaseType, repository: Repositor
 }
 
 export function immediateTransaction<T>(database: DatabaseType, operation: () => T): T {
-  return database.transaction(operation).immediate();
+  try {
+    return database.transaction(operation).immediate();
+  } catch (error) {
+    throw databaseContentionError(error) ?? error;
+  }
+}
+
+export function beginImmediate(database: DatabaseType): void {
+  try {
+    database.exec('BEGIN IMMEDIATE');
+  } catch (error) {
+    throw databaseContentionError(error) ?? error;
+  }
 }

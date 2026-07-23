@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 
@@ -19,6 +19,60 @@ describe('database workspace migration', () => {
   it('loads the SQLite native binding under the active Node runtime', () => {
     expect(() => assertDatabaseRuntimeCompatible()).not.toThrow();
   });
+
+  it('waits for transient writer contention beyond the former busy timeout', async () => {
+    const repository = createTestRepository();
+    repositories.push(repository);
+    const context = resolveRepository(repository.root);
+    openDatabase(context).close();
+    const lockHolder = spawn(
+      process.execPath,
+      [
+        '--input-type=module',
+        '--eval',
+        `import Database from 'better-sqlite3';
+const database = new Database(process.argv[1]);
+database.exec('BEGIN IMMEDIATE');
+process.stdout.write('locked\\n');
+process.stdin.once('data', () => setTimeout(() => {
+  database.exec('ROLLBACK');
+  database.close();
+}, Number(process.argv[2])));`,
+        context.databasePath,
+        '3000',
+      ],
+      { cwd: path.resolve('.'), stdio: ['pipe', 'pipe', 'inherit'] },
+    );
+    const closed = new Promise<void>((resolve, reject) => {
+      lockHolder.once('error', reject);
+      lockHolder.once('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`Lock holder exited with code ${code}.`));
+      });
+    });
+    void closed.catch(() => undefined);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        lockHolder.stdout.once('data', resolve);
+        lockHolder.once('error', reject);
+        lockHolder.once('exit', (code) => {
+          if (code !== null) reject(new Error(`Lock holder exited early with code ${code}.`));
+        });
+      });
+      const startedAt = Date.now();
+      lockHolder.stdin.end('release\n');
+      const database = openDatabase(context);
+      database.close();
+
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(2_800);
+      await closed;
+    } finally {
+      if (lockHolder.exitCode === null) {
+        lockHolder.kill('SIGTERM');
+        await closed.catch(() => undefined);
+      }
+    }
+  }, 10_000);
 
   it('bounds implicit names for valid repositories with long basenames', () => {
     const parent = createTestRepository({ initialize: false });

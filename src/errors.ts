@@ -45,6 +45,24 @@ export function errorResult(error: unknown): {
     };
   }
 
+  const sqliteCode = error instanceof Error ? Reflect.get(error, 'code') : undefined;
+  if (
+    typeof sqliteCode === 'string' &&
+    (sqliteCode === 'SQLITE_BUSY' ||
+      sqliteCode.startsWith('SQLITE_BUSY_') ||
+      sqliteCode === 'SQLITE_LOCKED' ||
+      sqliteCode.startsWith('SQLITE_LOCKED_'))
+  ) {
+    return {
+      ok: false,
+      error: {
+        code: 'DATABASE_ERROR',
+        message: 'SameTree database remained locked while waiting for another writer.',
+        details: { cause: error instanceof Error ? error.message : String(error) },
+      },
+    };
+  }
+
   return {
     ok: false,
     error: {
