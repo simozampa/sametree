@@ -104,7 +104,7 @@ Every persistent database connection configures:
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = FULL;
 PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 2500;
+PRAGMA busy_timeout = 10000;
 PRAGMA trusted_schema = OFF;
 PRAGMA cell_size_check = ON;
 PRAGMA wal_autocheckpoint = 1000;

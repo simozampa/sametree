@@ -1,5 +1,11 @@
 # Upgrading SameTree
 
+## Upgrade To 0.4.3
+
+Version 0.4.3 tolerates transient SQLite writer contention from concurrent MCP servers, monitors, and CLI commands for up to 10 seconds instead of returning a raw `INTERNAL_ERROR` after 2.5 seconds. Exhausted standard and extended SQLite busy/locked results are now reported as `DATABASE_ERROR`. Setup also raises OpenCode's managed MCP request timeout to 15 seconds so the client does not abort while SameTree is legitimately waiting for a writer.
+
+There is no database schema change from 0.4.2. Run `npm install --global sametree@0.4.3 --force`, rerun `sametree setup --claude --opencode` in each worktree to update the OpenCode timeout, and restart the harnesses. Do not run additional manual message followers alongside the managed Claude and OpenCode integrations.
+
 ## Upgrade To 0.4.2
 
 Version 0.4.2 fixes native SQLite crashes when a harness launches globally installed SameTree with a different Node.js runtime than the one that installed it. This can happen when Claude Code or OpenCode changes `PATH`: the npm bin path still resolves `sametree`, but its `#!/usr/bin/env node` shebang selects the harness runtime. SameTree now records the exact Node executable during npm installation and relaunches both CLI and MCP entrypoints with it before opening SQLite.

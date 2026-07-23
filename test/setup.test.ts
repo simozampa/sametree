@@ -131,7 +131,9 @@ describe('project setup', () => {
     const configPath = path.join(repository.root, 'opencode.json');
     const firstConfig = readFileSync(configPath, 'utf8');
     const config = JSON.parse(firstConfig) as {
-      mcp: { sametree: { command: string[]; environment: Record<string, string> } };
+      mcp: {
+        sametree: { command: string[]; environment: Record<string, string>; timeout: number };
+      };
     };
 
     expect(first.initialization.created).toContain('.sametree/config.json');
@@ -146,6 +148,7 @@ describe('project setup', () => {
     expect(config.mcp.sametree).toMatchObject({
       command: ['sametree-mcp'],
       environment: { SAMETREE_HARNESS: 'opencode' },
+      timeout: 15_000,
     });
 
     expect(setupProject(repository.root, { opencode: true }).opencode).toMatchObject({
@@ -175,6 +178,35 @@ describe('project setup', () => {
     expect(
       JSON.parse(readFileSync(path.join(repository.root, '.opencode', 'tui.json'), 'utf8')),
     ).toMatchObject({ plugin: ['./sametree-tui.ts'] });
+  });
+
+  it('adds the safe startup timeout to an existing managed OpenCode server', () => {
+    const repository = setup();
+    const configPath = path.join(repository.root, 'opencode.json');
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({
+        mcp: {
+          sametree: {
+            type: 'local',
+            command: ['sametree-mcp'],
+            environment: { SAMETREE_HARNESS: 'opencode', CUSTOM: 'preserved' },
+            enabled: true,
+          },
+        },
+      })}\n`,
+    );
+
+    expect(setupProject(repository.root, { opencode: true }).opencode?.mcp).toBe('updated');
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({
+      mcp: {
+        sametree: {
+          environment: { SAMETREE_HARNESS: 'opencode', CUSTOM: 'preserved' },
+          timeout: 15_000,
+        },
+      },
+    });
+    expect(setupProject(repository.root, { opencode: true }).opencode?.mcp).toBe('existing');
   });
 
   it('preserves JSONC comments and existing MCP servers', () => {

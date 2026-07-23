@@ -399,7 +399,7 @@ describe('workspace operations', () => {
     });
     open(server.root, 'recovered-agent', registry);
     expect(readPendingWorkspaceJoin(serverContext)).toBeNull();
-  }, 10_000);
+  }, 20_000);
 
   it('recovers an inserted linked-worktree member after its root moves', () => {
     const main = repository();

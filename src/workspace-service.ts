@@ -6,6 +6,8 @@ import Database, { type Database as DatabaseType } from 'better-sqlite3';
 
 import {
   assertDatabasePathSafe,
+  beginImmediate,
+  DATABASE_BUSY_TIMEOUT_MS,
   type DatabaseMemberContext,
   immediateTransaction,
   openDatabase,
@@ -156,7 +158,7 @@ function openExistingDatabase(
   options: { fileMustExist?: boolean; readonly?: boolean } = {},
 ): DatabaseType {
   assertDatabasePathSafe(databasePath);
-  return new Database(databasePath, options);
+  return new Database(databasePath, { timeout: DATABASE_BUSY_TIMEOUT_MS, ...options });
 }
 
 function rows(database: DatabaseType, table: string): Row[] {
@@ -1014,7 +1016,7 @@ function joinWorkspace(
     try {
       if (mode === 'import-current') {
         source = openDatabase(repository, { now });
-        source.exec('BEGIN IMMEDIATE');
+        beginImmediate(source);
         assertNoActiveSessions(source, now, repository.databasePath);
         identity = sourceIdentity(source, repository);
       }
